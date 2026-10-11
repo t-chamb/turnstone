@@ -6,6 +6,7 @@ from io import BytesIO
 
 import pytest
 
+from tests._pdf_helpers import pdf_worker_skip
 from turnstone.core.thumbnails import make_thumbnail
 
 PNG_1x1 = (
@@ -113,6 +114,7 @@ class TestMakeThumbnail:
         assert scaled == [(600, 400)]
         assert pil.open(BytesIO(out)).size == (160, 107)
 
+    @pdf_worker_skip
     def test_pdf_thumbnail_is_png(self) -> None:
         out = make_thumbnail(_minimal_pdf(), "pdf")
         assert out is not None and out[:8] == _PNG_MAGIC
