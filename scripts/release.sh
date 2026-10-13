@@ -112,13 +112,17 @@ if [ "$CURRENT_APP_VERSION" != "$CHART_APP_VERSION" ]; then
 fi
 
 # Detect current version
-CURRENT=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)
+CURRENT=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml)
+if [ -z "$CURRENT" ]; then
+    echo "error: pyproject.toml has no version line" >&2
+    exit 1
+fi
 echo "Bumping $CURRENT → $VERSION (chart $NEW_CHART_VERSION, appVersion $CHART_APP_VERSION)"
 
 # GNU and BSD sed disagree on a bare -i; both accept an attached backup suffix.
 sed_in_place() {
     sed -i.release-bak "$1" "$2"
-    rm "$2.release-bak"
+    rm -f "$2.release-bak"
 }
 
 # Update the version in the package files and the chart

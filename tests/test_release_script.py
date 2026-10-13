@@ -168,6 +168,21 @@ def test_release_script_requires_a_plain_chart_version(tmp_path: Path) -> None:
     assert _git(repo, "status", "--porcelain").stdout == ""
 
 
+def test_release_script_requires_a_package_version_line(tmp_path: Path) -> None:
+    repo, env = _release_repo(tmp_path, "main")
+    (repo / "pyproject.toml").write_text("[project]\nversion = '1.8.0'\n")
+    _git(repo, "commit", "-am", "single-quoted version")
+    before = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    result = _run_release(repo, env, "1.8.1")
+
+    assert result.returncode == 1
+    assert "pyproject.toml has no version line" in result.stderr
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == before
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _git(repo, "tag").stdout == ""
+
+
 def test_release_script_pre_release_requires_a_stable_tag(tmp_path: Path) -> None:
     repo, env = _release_repo(tmp_path, "dev", tags=("v1.9.0a1",))
     before = _git(repo, "rev-parse", "HEAD").stdout.strip()
