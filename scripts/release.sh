@@ -112,14 +112,24 @@ if [ "$CURRENT_APP_VERSION" != "$CHART_APP_VERSION" ]; then
 fi
 
 # Detect current version
-CURRENT=$(grep -oP '(?<=^version = ")[^"]+' pyproject.toml)
+CURRENT=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml)
+if [ -z "$CURRENT" ]; then
+    echo "error: pyproject.toml has no version line" >&2
+    exit 1
+fi
 echo "Bumping $CURRENT → $VERSION (chart $NEW_CHART_VERSION, appVersion $CHART_APP_VERSION)"
 
+# GNU and BSD sed disagree on a bare -i; both accept an attached backup suffix.
+sed_in_place() {
+    sed -i.release-bak "$1" "$2"
+    rm -f "$2.release-bak"
+}
+
 # Update the version in the package files and the chart
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
-sed -i "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" turnstone/__init__.py
-sed -i "s/^appVersion: .*/appVersion: \"$CHART_APP_VERSION\"/" "$CHART"
-sed -i "s/^version: .*/version: $NEW_CHART_VERSION/" "$CHART"
+sed_in_place "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+sed_in_place "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" turnstone/__init__.py
+sed_in_place "s/^appVersion: .*/appVersion: \"$CHART_APP_VERSION\"/" "$CHART"
+sed_in_place "s/^version: .*/version: $NEW_CHART_VERSION/" "$CHART"
 
 # Regenerate lockfile
 echo "Regenerating uv.lock..."
