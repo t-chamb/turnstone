@@ -227,8 +227,9 @@ Execute a bash command and return stdout + stderr.
 | `command` | string | yes      | The bash command to execute. |
 | `timeout` | integer | no      | Timeout in seconds (1-600). Omit to use the global `tools.timeout` setting (typically 120s). |
 | `stop_on_error` | boolean | no | Enable `set -e` so the script exits on the first command failure. Default false. |
+| `run_in_background` | boolean | no | Start the command as a detached background shell and return its shell id (e.g. `bash_1`) at once. Read its new output with `bash_output`, stop it with `kill_shell`; `timeout` does not apply. Default false. |
 
-- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.).
+- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.). Stdin never takes input from the CLI's terminal: a command gets `/dev/null`, so one that reads it gets end-of-file at once. A background shell (`run_in_background`) gets `/dev/null` too, unless the process's own stdin is a terminal (the CLI): then it gets a pseudo-terminal of its own that nothing is typed into, so a long-running program keeps running, and one that waits for input waits until `kill_shell` stops it.
 - **Output format**: Stdout is returned directly. Stderr lines are prefixed with `[stderr]` so the model can distinguish them. When the command itself redirects stderr to stdout (`2>&1`), no prefix is added. Output exceeding 256KB is truncated (head + tail preserved, middle replaced with a truncation notice).
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: `task_agent` only.
@@ -343,19 +344,19 @@ Fetch a web page or PDF and extract specific information from it.
   the tool returns an explicit error instead of asking the model to infer from
   an empty document. Local PDF rendering and text extraction run in a one-shot
   child under memory, CPU, wall-time, and output limits; exceeding that shared
-  attachment safety envelope fails the fetch explicitly. Decoded HTML/plain
-  text and locally extracted PDF text use at most half the active model lane's
-  calibrated context after prompt, response, and safety reserves; the final
-  request is checked again before provider I/O. If no document allowance
-  remains, the tool returns an error instead of invoking extraction without
-  source content. The fixed worker output envelope is an additional PDF-only
-  host-safety ceiling. Rasterization supplies at most ten pages and explicitly
-  tells the model when later pages were omitted; that notice survives the
-  perception cache. Fetched PDFs are request-local and are not added to
-  conversation history or attachment storage. Every hop, the URL itself
-  included, is SSRF-screened before it is requested, and a hostname is looked
-  up only once its call is approved, so a denied call makes no DNS query.
-  Private/internal addresses are refused by default; enable
+  attachment safety envelope fails the fetch explicitly, and so does a host that
+  can't run that child. Decoded HTML/plain text and locally extracted PDF text
+  use at most half the active model lane's calibrated context after prompt,
+  response, and safety reserves; the final request is checked again before
+  provider I/O. If no document allowance remains, the tool returns an error
+  instead of invoking extraction without source content. The fixed worker output
+  envelope is an additional PDF-only host-safety ceiling. Rasterization supplies
+  at most ten pages and explicitly tells the model when later pages were
+  omitted; that notice survives the perception cache. Fetched PDFs are
+  request-local and are not added to conversation history or attachment storage.
+  Every hop, the URL itself included, is SSRF-screened before it is requested,
+  and a hostname is looked up only once its call is approved, so a denied call
+  makes no DNS query. Private/internal addresses are refused by default; enable
   `tools.allow_private_network` (console Settings → Tools) to make them
   approvable for self-hosted setups whose services live on the local network.
   The approval prompt marks such requests. A private IP address is marked from
@@ -404,7 +405,11 @@ Fetch a web page or PDF and extract specific information from it.
   so venv, system-site, and ordinary default user-site dependencies work, but
   dependencies reachable only through a custom `PYTHONUSERBASE` do not. Install
   Turnstone and its PDF dependencies into the same venv or a standard site
-  directory instead. Models receiving PDFs natively do not start this worker.
+  directory instead. A host that can't create the temporary directory, start the
+  child process or apply its resource limits, such as macOS, which refuses a
+  finite address-space limit, cannot run the worker; there, models without
+  native PDF input are told that local PDF processing isn't available. Models
+  receiving PDFs natively do not start this worker.
 - **Auto-approve**: No -- requires user confirmation (makes network requests).
 - **Agent availability**: `task_agent`.
 

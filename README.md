@@ -19,9 +19,10 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 <p align="center">
   <a href="https://media.githubusercontent.com/media/turnstonelabs/turnstone/main/docs/diagrams/harness.png">
-    <img src="https://media.githubusercontent.com/media/turnstonelabs/turnstone/main/docs/diagrams/harness.png" alt="ℋ : s_{n+1} ~ T(s_n) for n < τ_H — the whole controlled loop: π lowers state to context, M_W proposes a readout, γ authorizes it, Q_E acts on the world, ρ verifies and folds back" width="960"/>
+    <img src="https://media.githubusercontent.com/media/turnstonelabs/turnstone/main/docs/diagrams/harness.png" alt="ℋ : s_{n+1} ~ T(s_n) for n < τ_H — the whole controlled loop: π filters and lowers state to context, M_W proposes a readout across a trust boundary, γ authorizes it or records a no-op, Q_E acts on the world, ρ verifies and folds back; only the trusted principal writes authority" width="960"/>
   </a>
 </p>
+<p align="center"><sub><em>One controlled loop. The owner is the only writer of authority; the model is reached across a trust boundary; a refusal is a recorded no-op. Composition and the judge-as-harness recursion are left to <a href="HYPOTHESIS.md">the text</a>.</em></sub></p>
 
 ```
 ℋ :  s_{n+1} ~ T(s_n)   for n < τ_H
@@ -205,6 +206,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | Intent validation (judge) | [docs/judge.md](docs/judge.md) |
 | Governance & RBAC | [docs/governance.md](docs/governance.md) |
 | OIDC SSO | [docs/oidc.md](docs/oidc.md) |
+| Security, tokens & secret references | [docs/security.md](docs/security.md) |
 | TLS / mTLS | [docs/tls.md](docs/tls.md) |
 | Channel integrations | [docs/channels.md](docs/channels.md) |
 | Console dashboard | [docs/console.md](docs/console.md) |

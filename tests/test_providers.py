@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -40,6 +40,9 @@ from turnstone.core.providers._protocol import (
     request_uses_native_tools,
     serialized_tool_chars,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Prepared request facts
@@ -2894,8 +2897,9 @@ class TestAnthropicHelpers:
         assert caps.supports_mid_conversation_system is True
 
     def test_capabilities_opus_5_dated(self) -> None:
-        """A dated snapshot resolves via longest-prefix match, and must NOT
-        fall back to _ANTHROPIC_DEFAULT (which has no effort support)."""
+        """A dated snapshot resolves via longest-prefix match onto its row, and
+        must NOT fall back to _ANTHROPIC_DEFAULT (200K context, no native
+        mid-conversation system messages)."""
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         provider = AnthropicProvider()
@@ -2990,6 +2994,26 @@ class TestAnthropicHelpers:
         assert caps.supports_mid_conversation_system is True
         assert caps.thinking_prefix_bound is True
 
+    def test_capabilities_haiku_5_5(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-haiku-5-5")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high", "xhigh", "max")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.supports_mid_conversation_system is True
+        assert caps.thinking_prefix_bound is True
+
     def test_capabilities_opus_4_8(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
 
@@ -3044,14 +3068,29 @@ class TestAnthropicHelpers:
         assert caps.thinking_display == "summarized"
 
     def test_capabilities_lookup_unknown(self) -> None:
+        """#1366: an id with no row gets the default, shaped to what every
+        adaptive Claude model accepts.  Limits stay conservative and the
+        features some models lack stay off."""
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         provider = AnthropicProvider()
         caps = provider.get_capabilities("unknown-model-xyz")
-        # Falls back to default
         assert caps.context_window == 200000
-        assert caps.thinking_mode == "manual"
+        assert caps.max_output_tokens == 64000
         assert caps.token_param == "max_tokens"
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert caps.effort_levels == ("low", "medium", "high")
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_vision is True
+        assert caps.supports_pdf is True
+        assert caps.supports_reasoning_replay is True
+        assert caps.server_parses_reasoning is True
+        assert caps.supports_tool_search is False
+        assert caps.supports_mid_conversation_system is False
+        assert caps.thinking_prefix_bound is False
 
 
 # ===========================================================================
@@ -3059,8 +3098,34 @@ class TestAnthropicHelpers:
 # ===========================================================================
 
 
+_SDK_KEY_VARIABLES = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES = (
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_SCOPE",
+)
+_OPENAI_LANES = ("openai", "openai-compatible", "google", "xai")
+_ANTHROPIC_LANES = ("anthropic", "anthropic-compatible")
+_LANE_URL = {
+    "openai-compatible": "http://llm.example.com/v1",
+    "anthropic-compatible": "http://llm.example.com",
+}
+_LF = chr(10)
+_UNFIT = "bad" + chr(1)
+
+
 class TestProviderFactory:
     """Tests for create_provider and create_client factory functions."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sdk_key_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # With no key passed, create_client reads the SDKs' own variables; tests set what they use.
+        for name in _SDK_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
 
     def test_create_provider_openai(self) -> None:
         from turnstone.core.providers import OpenAIResponsesProvider, create_provider
@@ -3121,6 +3186,104 @@ class TestProviderFactory:
 
         create_client("anthropic", base_url="", api_key="")
         mock_anthropic_cls.assert_called_once_with()
+
+    @pytest.fixture
+    def real_sdk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Keep the Anthropic SDK off this machine's profiles and other credential sources.
+
+        An empty home, not ANTHROPIC_CONFIG_DIR, which the SDK reads as a chosen profile.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        for name in (*_ANTHROPIC_OTHER_CREDENTIAL_VARIABLES, "ANTHROPIC_CONFIG_DIR"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "headers"),
+        [
+            # The other SDK's variables, unfit, are never read on these lanes.
+            *[
+                (
+                    lane,
+                    {"OPENAI_API_KEY": "sk" + _LF, "ANTHROPIC_API_KEY": _UNFIT},
+                    {"Authorization": "Bearer sk"},
+                )
+                for lane in _OPENAI_LANES
+            ],
+            # Once one variable is passed, the SDK reads neither, so both go, cleaned.
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk" + _LF, "ANTHROPIC_AUTH_TOKEN": "tok"},
+                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": "tok" + _LF},
+                    {"X-Api-Key": "sk", "Authorization": "Bearer tok"},
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+            ("anthropic", {"ANTHROPIC_AUTH_TOKEN": "tok" + _LF}, {"Authorization": "Bearer tok"}),
+            # No ANTHROPIC_API_KEY: the placeholder goes, and the SDK never reads the token.
+            ("anthropic-compatible", {"ANTHROPIC_AUTH_TOKEN": _UNFIT}, {"X-Api-Key": "dummy"}),
+        ],
+    )
+    def test_create_client_sends_the_sdk_variables_cleaned(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        headers: dict[str, str],
+    ) -> None:
+        """Through the real SDK clients (building one sends nothing): a variable read from a file
+        keeps its line break, which the SDK would send as it is."""
+        from turnstone.core.providers import create_client
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        client = create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+        assert client.auth_headers == headers
+
+    @pytest.mark.parametrize(
+        ("lane", "env", "variable"),
+        [
+            *[(lane, {"OPENAI_API_KEY": _UNFIT}, "OPENAI_API_KEY") for lane in _OPENAI_LANES],
+            # Empty once the line break is dropped, it would no longer be the variable's key.
+            ("openai", {"OPENAI_API_KEY": _LF}, "OPENAI_API_KEY"),
+            *[
+                (lane, {"ANTHROPIC_API_KEY": _UNFIT}, "ANTHROPIC_API_KEY")
+                for lane in _ANTHROPIC_LANES
+            ],
+            *[
+                (
+                    lane,
+                    {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": _UNFIT},
+                    "ANTHROPIC_AUTH_TOKEN",
+                )
+                for lane in _ANTHROPIC_LANES
+            ],
+        ],
+    )
+    def test_create_client_refuses_an_sdk_variable_it_would_send(
+        self,
+        real_sdk: None,
+        monkeypatch: pytest.MonkeyPatch,
+        lane: str,
+        env: dict[str, str],
+        variable: str,
+    ) -> None:
+        from turnstone.core.http_headers import UNFIT_HEADER_VALUE, HeaderValueError
+        from turnstone.core.providers import create_client
+
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(HeaderValueError) as excinfo:
+            create_client(lane, base_url=_LANE_URL.get(lane, ""), api_key="")
+        assert str(excinfo.value) == f"{variable} is {UNFIT_HEADER_VALUE}"
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_create_client_anthropic_nonempty_api_key_passes_kwarg(
@@ -5662,6 +5825,133 @@ class TestAnthropicPromptCaching:
         assert "temperature" not in kwargs
         assert "extra_body" not in kwargs
 
+    def test_haiku_5_5_sends_adaptive_thinking_and_no_temperature(self) -> None:
+        """#1362: with no row of its own, Haiku 5.5 took the manual default row,
+        so an effort sent ``thinking.type="enabled"`` with a budget, and with no
+        effort set a configured temperature reached the wire; the model rejects
+        both with a 400.  The row sends adaptive thinking, and no temperature
+        even when one is configured."""
+        caps = self.provider.get_capabilities("claude-haiku-5-5")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.7,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-haiku-5-5",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["output_config"] == {"effort": "high"}
+        assert "temperature" not in kwargs
+        assert "extra_body" not in kwargs
+
+    def test_unlisted_id_sends_adaptive_thinking_and_no_temperature(self) -> None:
+        """#1366: an id with no row took a default that sent a thinking budget
+        for any configured effort and, with no effort set, a configured
+        temperature; adaptive-only models reject both with a 400.  The default
+        sends adaptive thinking with or without a knob (unset: no
+        ``output_config``; ``max`` rides ``high``) and never a temperature, a
+        configured one included."""
+        caps = self.provider.get_capabilities("claude-unknown-9")
+        for knob, effort in ((None, None), ("max", "high")):
+            kwargs = self.provider._build_thinking_and_kwargs(
+                caps=caps,
+                reasoning_effort=knob,
+                extra_params=None,
+                max_tokens=8192,
+                temperature=0.7,
+                converted_msgs=[{"role": "user", "content": "hi"}],
+                system_prompt="",
+                model="claude-unknown-9",
+                tools=None,
+            )
+            assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}, knob
+            assert kwargs.get("output_config") == ({"effort": effort} if effort else None), knob
+            assert "temperature" not in kwargs, knob
+            assert "extra_body" not in kwargs, knob
+            assert "extra_headers" not in kwargs, knob
+
+    def test_budget_models_keep_their_manual_rows(self) -> None:
+        """#1366: the default row thinks adaptively, so the models that take a
+        thinking budget must reach their own rows, bare and dated, or a request
+        with an effort would send adaptive thinking, which they reject."""
+        for model in (
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-5",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-20250929",
+        ):
+            kwargs = self.provider._build_thinking_and_kwargs(
+                caps=self.provider.get_capabilities(model),
+                reasoning_effort="high",
+                extra_params=None,
+                max_tokens=32768,
+                temperature=None,
+                converted_msgs=[{"role": "user", "content": "hi"}],
+                system_prompt="",
+                model=model,
+                tools=None,
+            )
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16384}, model
+
+    def test_documented_override_reproduces_each_budget_row(self) -> None:
+        """#1366: a budget model under a name no row matches, such as a gateway's,
+        takes the adaptive default.  The capabilities override the CHANGELOG and
+        docs/architecture.md give for it must build the request its own row
+        builds, for every knob, with and without a configured temperature."""
+        from turnstone.core.model_turn import apply_capability_overrides
+        from turnstone.core.providers._anthropic import _ANTHROPIC_DEFAULT
+
+        manual = {"thinking_mode": "manual", "supports_temperature": True}
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "t",
+                    "description": "d",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        for model, override in (
+            ("claude-haiku-4-5", {**manual, "supports_effort": False}),
+            ("claude-sonnet-4-5", {**manual, "supports_effort": False}),
+            ("claude-opus-4-5", manual),
+        ):
+            gateway_name = "gateway/" + model.replace("-4-5", "-4.5")
+            assert self.provider.get_capabilities(gateway_name) is _ANTHROPIC_DEFAULT
+            fixed = apply_capability_overrides(_ANTHROPIC_DEFAULT, override)
+            for knob in (None, "none", "minimal", "low", "medium", "high", "xhigh", "max"):
+                for temperature in (None, 0.7):
+                    requests = []
+                    for caps, name in (
+                        (self.provider.get_capabilities(model), model),
+                        (fixed, gateway_name),
+                    ):
+                        kwargs = self.provider._build_thinking_and_kwargs(
+                            caps=caps,
+                            reasoning_effort=knob,
+                            extra_params=None,
+                            max_tokens=32768,
+                            temperature=temperature,
+                            converted_msgs=[{"role": "user", "content": "hi"}],
+                            system_prompt="",
+                            model=name,
+                            tools=tools,
+                        )
+                        kwargs.pop("model")
+                        requests.append(kwargs)
+                    assert requests[0] == requests[1], (model, knob, temperature)
+
     def test_xhigh_effort_snaps_to_max_on_opus_4_6(self) -> None:
         """Opus 4.6 declares (low, medium, high, max) — a knob of xhigh
         rounds up to max instead of silently dropping output_config."""
@@ -7731,6 +8021,15 @@ class TestAnthropicThinkingPrefixBinding:
         kwargs = self._kwargs("claude-sonnet-5")
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert "extra_headers" not in kwargs
+
+    def test_haiku_5_5_sends_drop_block_and_beta(self) -> None:
+        kwargs = self._kwargs("claude-haiku-5-5")
+        assert kwargs["thinking"] == {
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert kwargs["extra_headers"] == {"anthropic-beta": self._BETA}
 
     def test_caller_beta_header_is_joined_not_replaced(self) -> None:
         from tests._wire_capture import RecordingClient

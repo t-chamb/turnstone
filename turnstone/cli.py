@@ -120,6 +120,35 @@ class TerminalUI(SessionUI):
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
 
+    def _show(self, text: str, *, stderr: bool = False) -> None:
+        """Show *text*, on stdout, or on stderr when *stderr* is set.
+
+        Everything the UI writes goes through here, except the spinner, the
+        status line and what must reach the terminal now (``_write_terminal``),
+        so a workstream in the background can keep it for later
+        (``WorkstreamTerminalUI``).
+        """
+        self._write_terminal(text, stderr=stderr)
+
+    def _write_terminal(self, text: str, *, stderr: bool = False) -> None:
+        """Write *text* to the terminal now, whichever workstream is in front.
+
+        For text a person must see now, which no buffer may keep.
+        """
+        out = sys.stderr if stderr else sys.stdout
+        out.write(text)
+        out.flush()
+
+    def _wait_for_foreground(
+        self, items: list[dict[str, Any]], pending: list[dict[str, Any]]
+    ) -> bool:
+        """Wait until the person can answer the approval prompt for *pending*.
+
+        False when the batch was cancelled meanwhile.  A lone terminal is
+        always in front, so it never waits.
+        """
+        return True
+
     def on_turn_start(self) -> None:
         # Terminal UI has no inflight buffer to reset.
         pass
@@ -148,22 +177,17 @@ class TerminalUI(SessionUI):
             self.spinner = None
 
     def on_reasoning_token(self, text: str) -> None:
-        sys.stdout.write(f"{DIM}{text}{RESET}")
-        sys.stdout.flush()
+        self._show(f"{DIM}{text}{RESET}")
 
     def on_content_token(self, text: str) -> None:
         rendered = self.md.feed(text)
         if rendered:
-            sys.stdout.write(rendered)
-            sys.stdout.flush()
+            self._show(rendered)
 
     def on_stream_end(self) -> None:
         remainder = self.md.flush()
-        if remainder:
-            sys.stdout.write(remainder)
         self.md.in_code_block = False
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        self._show(f"{remainder}\n")
 
     @staticmethod
     def _approval_was_cancelled(items: list[dict[str, Any]]) -> bool:
@@ -237,28 +261,32 @@ class TerminalUI(SessionUI):
             }
             return bool(pending_names) and pending_names.issubset(self.auto_approve_tools)
 
-        # The prompt below waits on a person, so the workstream says so first.
-        # Outside the print lock: the publish takes the session's generation
-        # and state locks.
-        if not _settled():
+        # The prompt below waits on a person, so the workstream says so first,
+        # then waits until the person can answer it.  Outside the print lock:
+        # the publish takes the session's generation and state locks.
+        needs_person = not _settled()
+        if needs_person:
             publish_gate_state(items, "attention")
+            if not self._wait_for_foreground(items, pending):
+                return False, "Cancelled by user"
 
         with self._print_lock:
-            # The publish above (storage I/O) and the wait for this lock can
+            # The publish and the wait above, and the wait for this lock, can
             # block too: recheck before painting the batch.
             if self._approval_was_cancelled(items):
                 return False, "Cancelled by user"
-            # Print all headers, previews, and heuristic verdicts
+            # All headers, previews, and heuristic verdicts
+            lines: list[str] = []
             for item in items:
                 header = item.get("header") or item.get("func_name", "")
                 if item.get("error"):
-                    sys.stdout.write(f"  {red(header)}\n")
-                    sys.stdout.write(f"  {red(item['error'])}\n")
+                    lines.append(f"  {red(header)}\n")
+                    lines.append(f"  {red(item['error'])}\n")
                 else:
-                    sys.stdout.write(f"  {yellow(header)}\n")
+                    lines.append(f"  {yellow(header)}\n")
                 if item.get("preview"):
                     styled = dim(item["preview"]) if not item.get("error") else red(item["preview"])
-                    sys.stdout.write(styled + "\n")
+                    lines.append(styled + "\n")
                 verdict = item.get("_heuristic_verdict")
                 if verdict:
                     risk = verdict.get("risk_level", "medium")
@@ -266,12 +294,17 @@ class TerminalUI(SessionUI):
                     conf = int(verdict.get("confidence", 0.5) * 100)
                     summary = verdict.get("intent_summary", "")
                     color = _VERDICT_COLORS.get(risk, "")
-                    sys.stdout.write(
+                    lines.append(
                         f"  {color}RISK: {risk} (confidence: {conf}%) \u2014 {rec}{RESET}\n"
                     )
                     if summary:
-                        sys.stdout.write(f"  Intent: {summary}\n")
-            sys.stdout.flush()
+                        lines.append(f"  Intent: {summary}\n")
+            if needs_person:
+                # The prompt below goes to the terminal whichever workstream is
+                # in front, so the card it asks about goes there too.
+                self._write_terminal("".join(lines))
+            else:
+                self._show("".join(lines))
 
             # Rechecked: a concurrent prompt's "always" may have covered this
             # batch since.
@@ -294,8 +327,16 @@ class TerminalUI(SessionUI):
                     )
                 resp = input(prompt_text).strip()
             except (EOFError, KeyboardInterrupt):
-                sys.stdout.write("\n")
+                self._write_terminal("\n")
                 resp = "n"
+
+            # A Stop (Ctrl-C, a close) can retire the batch while its prompt
+            # waits, and the line typed next then lands here: use none of it.
+            if self._approval_was_cancelled(items):
+                self._write_terminal(
+                    f"  {DIM}The batch was stopped; that answer was not used.{RESET}\n"
+                )
+                return False, "Cancelled by user"
 
             # Parse decision and optional feedback: "y, use absolute path"
             decision = resp.lower()
@@ -339,9 +380,7 @@ class TerminalUI(SessionUI):
         # names what was shown, and the header carries the target for the
         # operator to open themselves.
         if is_error:
-            with self._print_lock:
-                sys.stderr.write(f"{RED}\u2717 {name}: {output}{RESET}\n")
-                sys.stderr.flush()
+            self._show(f"{RED}\u2717 {name}: {output}{RESET}\n", stderr=True)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         pass  # Terminal shows spinner during tool execution
@@ -350,7 +389,7 @@ class TerminalUI(SessionUI):
         # CLI keeps an inline "leg" per sub-agent step — the structured nesting
         # card is web-only.
         hdr = item.get("header") or item.get("func_name") or "tool"
-        print(f"{DIM}  - {hdr}{RESET}")
+        self._show(f"{DIM}  - {hdr}{RESET}\n")
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
@@ -364,11 +403,10 @@ class TerminalUI(SessionUI):
         sys.stdout.flush()
 
     def on_info(self, message: str) -> None:
-        print(message)
+        self._show(f"{message}\n")
 
     def on_error(self, message: str) -> None:
-        sys.stdout.write(f"{RED}{message}{RESET}\n")
-        sys.stdout.flush()
+        self._show(f"{RED}{message}{RESET}\n")
 
     def on_system_turn(self, content: str, source: str, meta: dict[str, Any] | None = None) -> None:
         """Render a first-class operator-context system turn as an
@@ -380,8 +418,7 @@ class TerminalUI(SessionUI):
         in ``content`` already reads well in a terminal.
         """
         label = "operator" + (f" · {source}" if source else "")
-        sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
-        sys.stdout.flush()
+        self._show(f"{YELLOW}[{label}]{RESET} {content}\n")
 
     # No on_compaction override: TerminalUI subclasses SessionUI
     # explicitly, and the inherited protocol default body IS the
@@ -394,7 +431,11 @@ class TerminalUI(SessionUI):
         pass  # base TerminalUI ignores state changes
 
     def on_intent_verdict(self, verdict: dict[str, Any], judge_event: object | None = None) -> None:
-        """Display LLM judge verdict — called from daemon thread while approval is pending.
+        """Display LLM judge verdict — called from the judge's daemon thread.
+
+        The daemon finishes its batch after the approval resolves (unless
+        ``judge.cancel_on_approval``), so a verdict can land once the turn is
+        over and the user has switched to another workstream.
 
         ``judge_event`` (the delivering judge generation) is a
         cycle-registry concern — the terminal renders every verdict it
@@ -407,11 +448,10 @@ class TerminalUI(SessionUI):
         tier = verdict.get("tier", "llm")
 
         color = _VERDICT_COLORS.get(risk, "")
-        print(
-            f"\n  {color}\u25b8 {tier.upper()} VERDICT: {risk.upper()} ({conf}%) \u2014 {rec}{RESET}"
-        )
+        text = f"\n  {color}\u25b8 {tier.upper()} VERDICT: {risk.upper()} ({conf}%) \u2014 {rec}{RESET}"
         if summary:
-            print(f"    {summary}")
+            text += f"\n    {summary}"
+        self._show(text + "\n")
 
     def record_output_assessment(
         self,
@@ -434,14 +474,12 @@ class TerminalUI(SessionUI):
             return
         flags = assessment.get("flags", [])
         color = _VERDICT_COLORS.get(risk, YELLOW)
-        sys.stdout.write(
-            f"\n  {color}⚠ OUTPUT WARNING: {risk.upper()} — {', '.join(flags)}{RESET}\n"
-        )
+        lines = [f"\n  {color}⚠ OUTPUT WARNING: {risk.upper()} — {', '.join(flags)}{RESET}\n"]
         for ann in assessment.get("annotations", []):
-            sys.stdout.write(f"    {ann}\n")
+            lines.append(f"    {ann}\n")
         if assessment.get("redacted"):
-            sys.stdout.write(f"    {DIM}(credentials redacted from output){RESET}\n")
-        sys.stdout.flush()
+            lines.append(f"    {DIM}(credentials redacted from output){RESET}\n")
+        self._show("".join(lines))
 
     def on_rename(self, name: str) -> None:
         pass  # base TerminalUI ignores renames
@@ -472,13 +510,16 @@ def _state_from_wire(value: str) -> WorkstreamState:
 
 class WorkstreamTerminalUI(TerminalUI):
     """TerminalUI with workstream awareness: buffers output when in background,
-    blocks on approval until foregrounded."""
+    and holds a tool batch that needs a person until brought forward."""
 
     def __init__(self, ws_id: str, manager: SessionManager) -> None:
         super().__init__()
         self.ws_id = ws_id
         self.manager = manager
-        self._output_buffer: list[tuple[str, str]] = []  # (event_type, text)
+        self._output_buffer: list[tuple[bool, str]] = []  # (stderr, text)
+        # Held only to append or take the buffer, never across I/O: a write
+        # from a thread holding session locks never waits behind a prompt.
+        self._buffer_lock = threading.Lock()
         self._fg_event = threading.Event()
         self._fg_event.set()  # starts as foreground
 
@@ -531,126 +572,100 @@ class WorkstreamTerminalUI(TerminalUI):
             self.spinner.stop()
             self.spinner = None
 
-    def _buffer(self, event_type: str, text: str) -> None:
-        with self._print_lock:
-            self._output_buffer.append((event_type, text))
-
-    def on_reasoning_token(self, text: str) -> None:
-        if self.is_foreground:
-            super().on_reasoning_token(text)
-        else:
-            self._buffer("reasoning", text)
-
-    def on_content_token(self, text: str) -> None:
-        if self.is_foreground:
-            super().on_content_token(text)
-        else:
-            self._buffer("content", text)
-
-    def on_stream_end(self) -> None:
-        if self.is_foreground:
-            super().on_stream_end()
-        else:
-            self._buffer("stream_end", "")
+    def _show(self, text: str, *, stderr: bool = False) -> None:
+        # Decided under the buffer lock: a switch moves the front before it
+        # takes the buffer to replay it, so a write lands in that replay or
+        # on the terminal, never in a buffer already taken.
+        with self._buffer_lock:
+            if not self.is_foreground:
+                self._output_buffer.append((stderr, text))
+                return
+        self._write_terminal(text, stderr=stderr)
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         if self.is_foreground:
             super().on_status(usage, context_window, effort)
         # silently drop status for background streams
 
-    def on_info(self, message: str) -> None:
-        if self.is_foreground:
-            super().on_info(message)
-        else:
-            self._buffer("info", message)
-
-    def on_error(self, message: str) -> None:
-        if self.is_foreground:
-            super().on_error(message)
-        else:
-            self._buffer("error", message)
-
     def on_workstream_stopped(self, message: str) -> None:
         """Another process took this workstream over: say so even from the background.
 
-        The workstream leaves this CLI right after, so a buffered notice would
-        never be seen.
+        Kept in the buffer, the notice would show only in the replay printed when
+        the workstream leaves this CLI (``on_workstream_closed``), which after a
+        refused write waits for the next lease renewal: both branches write to
+        the terminal at once, whatever a switch does meanwhile, and neither waits
+        behind an open prompt.
         """
         if self.is_foreground:
-            super().on_info(message)
+            self._write_terminal(f"{message}\n")
             return
         ws = self.manager.get(self.ws_id)
         label = f"{self.manager.index_of(self.ws_id)}:{ws.name}" if ws is not None else self.ws_id
-        with self._print_lock:
-            print(yellow(f"Workstream {label}: {message}"))
-
-    def on_tool_result(
-        self,
-        call_id: str,
-        name: str,
-        output: str,
-        *,
-        is_error: bool = False,
-        preview: dict[str, Any] | None = None,
-    ) -> None:
-        if self.is_foreground:
-            super().on_tool_result(call_id, name, output, is_error=is_error, preview=preview)
+        self._write_terminal(yellow(f"Workstream {label}: {message}") + "\n")
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         if self.is_foreground:
             super().on_tool_output_chunk(call_id, chunk)
 
-    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
-        """Block until foregrounded if in background, then show approval prompt."""
-        if not self.is_foreground:
-            # Every background batch waits here for a person to bring the
-            # workstream forward, whatever it needs once it is.
-            publish_gate_state(items, "attention")
-            tool_names = ", ".join(
-                it.get("approval_label", it.get("func_name", "?"))
-                for it in items
-                if it.get("needs_approval") and not it.get("error")
-            )
-            if tool_names:
-                self._buffer("info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}")
-            # Foreground state is persistent, so close must not set this event
-            # merely to wake us: a later durability refusal would leave a live
-            # background workstream acting foregrounded. Poll the gate's
-            # monotonic cancellation witness instead; the bounded interval is
-            # comfortably inside soft-close's structural grace period.
-            while not self._fg_event.wait(timeout=0.05):
-                if self._approval_was_cancelled(items):
-                    return False, "Cancelled by user"
-        return super().approve_tools(items)
+    def _wait_for_foreground(
+        self, items: list[dict[str, Any]], pending: list[dict[str, Any]]
+    ) -> bool:
+        """In the background, hold the batch until the user brings the workstream forward.
+
+        The gate calls this only for a batch that still needs a person once
+        tool policies and auto-approve have run; a batch they settle runs at
+        once, and its lines wait in the buffer.
+        """
+        if self.is_foreground:
+            return True
+        tool_names = ", ".join(it.get("approval_label", it.get("func_name", "?")) for it in pending)
+        self._show(f"{YELLOW}Waiting for approval: {tool_names}{RESET}\n")
+        # Foreground state is persistent, so close must not set this event
+        # merely to wake us: a later durability refusal would leave a live
+        # background workstream acting foregrounded. Poll the gate's
+        # monotonic cancellation witness instead; the bounded interval is
+        # comfortably inside soft-close's structural grace period.
+        while not self._fg_event.wait(timeout=0.05):
+            if self._approval_was_cancelled(items):
+                return False
+        # A close sets the event too, after stopping the batch.
+        return not self._approval_was_cancelled(items)
 
     def flush_buffer(self) -> None:
-        """Replay buffered output when switching to foreground."""
+        """Replay buffered output when switching to foreground.
+
+        Under the print lock, so a gate the switch woke paints its card and
+        prompt before or after the replay, never in the middle of it.
+        """
         with self._print_lock:
-            if not self._output_buffer:
-                return
-            buf = list(self._output_buffer)
-            self._output_buffer.clear()
-        sys.stdout.write(f"\n  {DIM}--- buffered output ({len(buf)} events) ---{RESET}\n")
-        replay_md = MarkdownRenderer()
-        for event_type, text in buf:
-            if event_type == "reasoning":
-                sys.stdout.write(f"{DIM}{text}{RESET}")
-            elif event_type == "content":
-                rendered = replay_md.feed(text)
-                if rendered:
-                    sys.stdout.write(rendered)
-            elif event_type == "stream_end":
-                remainder = replay_md.flush()
-                if remainder:
-                    sys.stdout.write(remainder)
-                replay_md.in_code_block = False
-                sys.stdout.write("\n")
-            elif event_type == "info":
-                sys.stdout.write(f"{text}\n")
-            elif event_type == "error":
-                sys.stdout.write(f"{RED}{text}{RESET}\n")
-        sys.stdout.write(f"  {DIM}--- end buffered output ---{RESET}\n\n")
-        sys.stdout.flush()
+            self._replay("buffered output")
+
+    def on_workstream_closed(self, name: str) -> None:
+        """The workstream is leaving this CLI: show what it kept in the background.
+
+        It will not come forward again, so what it buffered (a late judge
+        verdict, say) prints now, under its name.  Called once its session's
+        close has returned or raised, from whichever thread closed it (a lease
+        keeper's, for a lost lease), and never under the print lock: an open
+        prompt can hold it.
+        """
+        self._replay(f"{name or self.ws_id} closed; its buffered output")
+
+    def _replay(self, title: str) -> None:
+        """Take the buffer and write it to the terminal, under *title*.
+
+        The caller decides about the print lock: ``flush_buffer`` holds it, and
+        the replay as a workstream closes never takes it.
+        """
+        with self._buffer_lock:
+            buf, self._output_buffer = self._output_buffer, []
+        if not buf:
+            return
+        self._write_terminal(f"\n  {DIM}--- {title} ({len(buf)} events) ---{RESET}\n")
+        for stderr, text in buf:
+            # Each on the stream it was written to in front, in order.
+            self._write_terminal(text, stderr=stderr)
+        self._write_terminal(f"  {DIM}--- end buffered output ---{RESET}\n\n")
 
 
 # ─── Workstream commands ──────────────────────────────────────────────────
@@ -671,6 +686,39 @@ def _print_ws_status_line(manager: SessionManager) -> None:
     if parts:
         sys.stderr.write(f"  {'  '.join(parts)}\n")
         sys.stderr.flush()
+
+
+def _default_model_not_loaded(alias: str, registry: Any = None) -> str:
+    """CLI wording for a default model that isn't loaded (#1359).
+
+    Nothing substitutes another model. The CLI reads only its own config.toml,
+    so the reason the loader recorded is the operator's and is shown.
+    """
+    if not alias:
+        return (
+            "no default chat model is configured: set [model] default in config.toml, "
+            "or add a chat model under [models.*]."
+        )
+    reason = ""
+    others = ""
+    if registry is not None:
+        from turnstone.core.model_registry import serves_chat
+
+        why = registry.skipped_aliases.get(alias)
+        if why:
+            reason = f" ({why})"
+        # Only models that can hold a chat, as every automatic pick takes.
+        loaded = [
+            a
+            for a in registry.list_aliases()
+            if serves_chat(registry.get_config(a).capabilities, registry.get_config(a).model)
+        ]
+        if loaded:
+            others = f", or set [model] default to one of: {', '.join(loaded)}"
+    return (
+        f"the default model '{alias}' isn't loaded{reason}. "
+        f"Check [models.{alias}] in config.toml{others}."
+    )
 
 
 def _handle_ws_command(
@@ -695,11 +743,16 @@ def _handle_ws_command(
         return False
 
     elif sub == "new":
+        from turnstone.core.model_registry import UnknownModelAliasError
+
         name = parts[2] if len(parts) > 2 else ""
         try:
             ws = manager.create(user_id="", name=name)
         except RuntimeError as e:
             print(red(str(e)))
+            return False
+        except UnknownModelAliasError as e:
+            print(red(f"Can't create a workstream: {_default_model_not_loaded(e.alias)}"))
             return False
         if skip_permissions and isinstance(ws.ui, TerminalUI):
             ws.ui.auto_approve = True
@@ -1028,16 +1081,25 @@ def _close_all_sessions(manager: SessionManager) -> None:
     skipped, and the caller still runs MCP/registry shutdown.  Best-effort
     per workstream either way — one bad teardown must not stop the rest.
     """
-    loaded = [(ws.id, ws.session) for ws in manager.list_all() if ws.session is not None]
-    for _ws_id, session in loaded:
+    loaded = [(ws, ws.session) for ws in manager.list_all() if ws.session is not None]
+    for _ws, session in loaded:
         with contextlib.suppress(Exception):
             session._background_shells.signal_all()
     try:
-        for ws_id, session in loaded:
-            try:
-                session.close()
-            except Exception:
-                print(dim(f"  (workstream {ws_id[:8]} teardown error, continuing)"))
+        try:
+            for ws, session in loaded:
+                try:
+                    session.close()
+                except Exception:
+                    print(dim(f"  (workstream {ws.id[:8]} teardown error, continuing)"))
+        finally:
+            # What a background workstream kept for the user shows now, as when it
+            # closes any other way (``cleanup_session_ui``), a Ctrl-C during the
+            # closes included: the replay is a few writes, not a join.
+            for ws, _session in loaded:
+                if isinstance(ws.ui, WorkstreamTerminalUI):
+                    with contextlib.suppress(Exception):
+                        ws.ui.on_workstream_closed(ws.name)
     except KeyboardInterrupt:
         # The kills above already landed; skipping the remaining joins
         # leaks nothing — it only abandons wedged drain threads that die
@@ -1385,12 +1447,16 @@ def _open_for_cli_resume(manager: SessionManager, target_id: str, requested: str
 
 
 def _build_cli_manager(
-    session_factory: Callable[..., ChatSession], has_alias: Callable[[str], bool]
+    session_factory: Callable[..., ChatSession],
+    has_alias: Callable[[str], bool],
+    default_alias: Callable[[], str],
 ) -> SessionManager:
     """The CLI's workstream manager: a terminal UI per workstream, sessions from *session_factory*.
 
     Opening a workstream saved with an alias this CLI does not define falls
     back to the default model instead of failing (*has_alias* tells).
+    *default_alias* reads that default, so a reopen whose default stays
+    unloaded fails at once instead of retrying as if it raced (#1359).
     """
     import queue
 
@@ -1406,7 +1472,11 @@ def _build_cli_manager(
         session_factory=session_factory,
     )
     manager = SessionManager(
-        adapter, storage=get_storage(), max_active=50, model_validator=has_alias
+        adapter,
+        storage=get_storage(),
+        max_active=50,
+        model_validator=has_alias,
+        default_alias_reader=default_alias,
     )
     adapter.attach(manager)
     return manager
@@ -1685,11 +1755,18 @@ def main() -> None:
 
     # Create client and detect model
     provider_name = args.provider
-    api_key = (
-        args.api_key
-        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
-        or "dummy"
-    )
+    key_variable = "ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY"
+    api_key = args.api_key or os.environ.get(key_variable) or "dummy"
+    # Checked before its first use below, by the rule every model key follows.
+    from turnstone.core.http_headers import HeaderValueError, checked_header_value
+
+    try:
+        api_key = checked_header_value(
+            api_key, "--api-key (or [api] api_key)" if args.api_key else f"${key_variable}"
+        )
+    except HeaderValueError as exc:
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
     base_url = args.base_url
     if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
         # Override local default to Anthropic API
@@ -1710,16 +1787,31 @@ def main() -> None:
     elif not context_window:
         context_window = 32768
 
+    # A malformed [secrets] table is a startup failure, like a malformed keyring:
+    # [models.*] keys and MCP headers may hold secret:// references. Building
+    # the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
+
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        print(f"config.toml: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry
 
-    registry = load_model_registry(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        context_window=context_window,
-        provider=provider_name,
-    )
+    try:
+        registry = load_model_registry(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            context_window=context_window,
+            provider=provider_name,
+        )
+    except ValueError as exc:  # a configuration problem, reported like the [secrets] check
+        print(f"turnstone: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
@@ -1854,7 +1946,8 @@ def main() -> None:
             workstream_lease=workstream_lease,
         )
 
-    manager = _build_cli_manager(session_factory, registry.has_alias)
+    # The factory builds ``model_alias or registry.default``; the reader names the same.
+    manager = _build_cli_manager(session_factory, registry.has_alias, lambda: registry.default)
     # Renew the owner leases of the workstreams this REPL has open (#988).
     manager.start_lease_keeper()
     # CLI has no background maintenance lifespan. Recover crash-abandoned
@@ -1879,7 +1972,13 @@ def main() -> None:
             print(yellow("--persona is ignored with --resume (the stamped persona applies)"))
         ws = _open_for_cli_resume(manager, resume_target, args.resume)
     else:
-        ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
+        from turnstone.core.model_registry import UnknownModelAliasError
+
+        try:
+            ws = manager.create(user_id="", **resolve_cli_persona_kwargs(cli_storage, args.persona))
+        except UnknownModelAliasError as exc:
+            print(f"turnstone: {_default_model_not_loaded(exc.alias, registry)}", file=sys.stderr)
+            sys.exit(1)
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
     if resume_target:

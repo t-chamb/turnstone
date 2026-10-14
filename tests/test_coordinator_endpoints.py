@@ -36,6 +36,7 @@ from tests._coord_test_helpers import (
 )
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    COORDINATOR_MODEL_WORDING,
     _audit_cancel_coordinator,
     _audit_close_coordinator,
     _audit_coordinator_create,
@@ -53,6 +54,7 @@ from turnstone.core.attachments import (
     classify_upload as _coord_test_classify_upload,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.model_registry import UnknownModelAliasError
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     SessionEndpointConfig,
@@ -131,6 +133,8 @@ _coord_endpoint_config = SessionEndpointConfig(
     create_post_install=_coord_create_post_install,
     list_resolve_titles=None,
     list_kind=WorkstreamKind.COORDINATOR,
+    # As the console wires it (#1359).
+    model_wording=COORDINATOR_MODEL_WORDING,
 )
 
 
@@ -338,6 +342,38 @@ def test_missing_coord_mgr_returns_503(storage):
     assert "not initialized" in body["error"]
 
 
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        # Every stored definition was skipped: the loader's text names the reference.
+        "No model definitions could be loaded. Skipped: main: secret://vault/kv/team#key: not found",
+        # A fresh console with no definitions at all.
+        "No model definitions found. Provide --model, configure [models.*] in config.toml, "
+        "or add model definitions in the admin panel.",
+        # The definitions loaded, but the builder failed.
+        "Coordinator subsystem failed to initialise (RuntimeError). See console logs and retry.",
+        "",
+    ],
+)
+def test_the_503_is_the_same_neutral_text_whatever_the_cause(storage, recorded):
+    # The recorded cause can name secret reference paths, and any
+    # admin.coordinator holder reads this 503, so it never carries it; and it
+    # asserts no cause that may be false (#1359).
+    client = _make_client(storage, coord_mgr=None)
+    client.app.state.coord_registry_error = recorded  # type: ignore[attr-defined]
+    resp = client.post(
+        "/v1/api/workstreams/new",
+        json={"name": "c1"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"] == (
+        "Coordinator subsystem not initialized. Add a model definition in the admin "
+        "Models tab; if one exists, an admin can see why by pressing Sync to Nodes "
+        "there, or in the console log."
+    )
+
+
 def test_missing_model_alias_falls_back_to_registry_default(storage):
     """``coordinator.model_alias`` unset → resolve through the
     registry's default alias rather than 503-ing.  Operators get a
@@ -356,35 +392,47 @@ def test_missing_model_alias_falls_back_to_registry_default(storage):
     assert resp.status_code != 503, resp.json()
 
 
-def test_missing_alias_and_no_default_returns_503(storage):
-    """When neither ``coordinator.model_alias`` nor the registry
-    default resolves, 503 with remediation still fires so operators
-    know they haven't configured any model at all."""
-    mgr = _build_mgr(storage)
+def test_unloaded_coordinator_model_fails_only_the_create(storage):
+    """#1359: the gate no longer resolves the coordinator's model, so one that
+    isn't loaded fails the create with ``model_not_loaded`` and leaves the
+    other coordinator verbs working; no other model is used."""
+
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        raise UnknownModelAliasError("ghost")
+
+    mgr = _build_mgr_with_factory(storage, _sf)
     broken_registry = MagicMock()
-    broken_registry.resolve.side_effect = KeyError("no-default")
-    client = _make_client(storage, coord_mgr=mgr, alias="", registry=broken_registry)
+    broken_registry.resolve.side_effect = UnknownModelAliasError("ghost")
+    client = _make_client(storage, coord_mgr=mgr, alias="ghost", registry=broken_registry)
+    headers = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
+    resp = client.post("/v1/api/workstreams/new", json={}, headers=headers)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["code"] == "model_not_loaded"
+    assert body["alias"] == "ghost"
+    assert body["error"] == (
+        "The coordinator model 'ghost' isn't loaded on the console. Ask an admin to "
+        "check its definition, or to set coordinator.model_alias."
+    )
+    broken_registry.resolve.assert_not_called()
+    assert client.get("/v1/api/workstreams", headers=headers).status_code == 200
+
+
+def test_create_naming_an_unloaded_model_says_so(storage):
+    def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
+        raise UnknownModelAliasError(model_alias or "")
+
+    mgr = _build_mgr_with_factory(storage, _sf)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         "/v1/api/workstreams/new",
-        json={},
+        json={"model": "picked"},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
     assert resp.status_code == 503
-    assert "does not resolve" in resp.json()["error"]
-
-
-def test_unresolvable_alias_returns_503(storage):
-    mgr = _build_mgr(storage)
-    broken_registry = MagicMock()
-    broken_registry.resolve.side_effect = KeyError("no-such-alias")
-    client = _make_client(storage, coord_mgr=mgr, alias="my-alias", registry=broken_registry)
-    resp = client.post(
-        "/v1/api/workstreams/new",
-        json={},
-        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
-    )
-    assert resp.status_code == 503
-    assert "does not resolve" in resp.json()["error"]
+    body = resp.json()
+    assert body["code"] == "model_not_loaded"
+    assert body["error"].startswith("The model 'picked' isn't loaded")
 
 
 # ---------------------------------------------------------------------------

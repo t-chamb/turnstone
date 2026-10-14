@@ -413,17 +413,32 @@ identity used to reject stale verdicts from a prior approval round.
 `WorkstreamTerminalUI` (in `turnstone.cli`) extends `TerminalUI` with workstream
 awareness:
 
-- **Output buffering**: When in background (`is_foreground` is False), tokens
-  are appended to `_output_buffer` instead of written to stdout. When the user
-  switches to this workstream, `flush_buffer()` replays them.
+- **Output buffering**: When in background (`is_foreground` is False),
+  everything `TerminalUI` writes through `_show()` (the rendered reply,
+  reasoning, info and error lines, a settled tool batch's card, tool errors,
+  judge verdicts, output warnings, task-agent steps, operator turns) is
+  appended to `_output_buffer` instead of written to the terminal. `_show()`
+  decides under `_buffer_lock`, so a write that races a switch lands in the
+  replay or on the terminal. When the user switches to this workstream,
+  `flush_buffer()` replays the buffer, each write on the stream it was meant
+  for (stderr for tool errors, stdout for the rest). A workstream that leaves
+  the CLI without coming forward (a close, a lost lease, an eviction, `/exit`)
+  shows its buffer as it goes (`on_workstream_closed()`).
 
-- **Approval blocking**: `approve_tools()` calls `_fg_event.wait()` when in
-  background, blocking the worker thread until the workstream is foregrounded.
-  This ensures the user sees the approval prompt in the correct context.
+- **Approval blocking**: `approve_tools()` runs tool policies and auto-approve
+  first. A batch they settle runs at once, in the background too. When a batch
+  still needs a person, the gate publishes `attention` and, in background,
+  `_wait_for_foreground()` blocks on `_fg_event` until the workstream is
+  foregrounded, and the gate then paints the batch's card on the terminal with
+  its prompt. If a Stop retires the batch while the prompt waits, the gate does
+  not use the answer typed next.
 
-- **Foreground/background toggle**: `set_foreground(bool)` sets or clears
-  `_fg_event` (a `threading.Event`). The manager calls this during `/ws <N>`
-  switches.
+- **Foreground/background toggle**: `is_foreground` is
+  `manager.active_id == ws_id`, and it alone decides whether a write is
+  buffered. `set_foreground(bool)` sets or clears `_fg_event` (a
+  `threading.Event`), which gates only the approval wait; `_bring_to_front()`
+  calls it whenever the front moves (a `/ws` command, `/resume`, `/new`, or a
+  close).
 
 ---
 
@@ -826,9 +841,16 @@ non-idle background workstreams above the input prompt.
 - `SessionUIBase._ws_lock` protects concurrent approval cycles, verdict caches,
   and SSE projection state; approval admission uses a separate condition so
   Stop never waits on database I/O.
-- `WorkstreamTerminalUI._print_lock`: guards `_output_buffer` access.
-- `WorkstreamTerminalUI._fg_event`: `threading.Event` that blocks background
-  approval until the workstream is foregrounded.
+- `TerminalUI._print_lock`: one per workstream UI; held while that
+  workstream's tool-batch card and prompt are up and while `flush_buffer()`
+  replays its buffered output, so those two never interleave. The replay as a
+  workstream closes (`on_workstream_closed()`) never takes it: the close can
+  run on a lease keeper's thread while a prompt holds it.
+- `WorkstreamTerminalUI._buffer_lock`: guards `_output_buffer`. It is held only
+  to append or take the buffer, never across I/O, so a write from a thread that
+  holds session locks never waits behind an open prompt.
+- `WorkstreamTerminalUI._fg_event`: `threading.Event` that blocks a background
+  batch that needs a person until the workstream is foregrounded.
 
 ---
 
@@ -1341,8 +1363,10 @@ ConfigStore. When unset (`NULL`), the global default is used.
   reasoning blocks are sent back to the provider on subsequent turns.
   Capability-gated: `ModelCapabilities.supports_reasoning_replay` must
   also be `True` for the wire path to actually replay (canonical OpenAI
-  gpt-5*/o-series and Anthropic Claude entries set it; unknown / local-
-  server models default to `False`).
+  gpt-5*/o-series, Grok and Anthropic Claude entries set it, as do the
+  default rows of `anthropic`, for any id with no row, and of
+  `anthropic-compatible`; models on `google` or `openai-compatible`,
+  and unknown ones on `openai` or `xai`, default to `False`).
 
 Three reasoning paths are recognised:
 
@@ -1496,8 +1520,9 @@ The console surfaces this projection as an *effective effort ladder*:
 the admin model form's per-model effort select annotates each position
 with what the request will carry, in plain words — a position whose
 delivered level matches its name stays plain ("Max"), a snapped
-position says so ("Low — sends high"), the adaptive lanes' none
-position warns "thinking stays on", and budget detail lives in the
+position says so ("Low — sends high"), the none position warns
+"thinking stays on" on a local adaptive lane and says "model sets
+effort" on the native Anthropic one, and budget detail lives in the
 tooltip. A position is never labeled after a sibling that shares its
 wire (that rendered "Max (= minimal)", implying a downgrade the wire
 doesn't contain). Computed server-side by `providers/effort_ladder.py`
@@ -1514,7 +1539,15 @@ models keep native thinking, budget mapping, and `output_config`
 effort. A gateway fronting *real* Claude on a Messages-shaped URL
 (e.g. a LiteLLM `anthropic/` route to the Claude API) should use
 `provider = "anthropic"` with a custom `base_url`, which keeps the
-native thinking params.
+native thinking params; any other model behind a Messages-shaped API
+belongs on `anthropic-compatible`. The capability row comes from the
+model name the definition sends, so a gateway name that no row
+matches gets the default row, which thinks adaptively: a model that
+takes a thinking budget needs a name its own row matches, such as
+its Anthropic id, or `thinking_mode` set to `manual` and
+`supports_temperature` to `true` in the definition's capabilities,
+plus `supports_effort` set to `false` unless the model accepts
+`output_config` effort.
 
 Verified quirks of vLLM's Anthropic endpoint:
 
@@ -1559,12 +1592,29 @@ rows are never modified).
    parameters
 6. `_model_turn_with_fallback()` tries the primary lane, then each fallback
    alias's lane in order if the primary is unreachable
-7. `_run_agent()` resolves `registry.agent_model` (if set) for task
-   sub-agents, allowing a cheaper model for autonomous loops
+7. `_run_agent()` resolves the task model (the `model.task_alias` setting,
+   else `[model].task_model`, else `[model].agent_model`) for task sub-agents,
+   allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
 `"model"` field; without one the workstream runs on the default alias. A
 `skill` never selects the model or its sampling settings.
+
+**Routing never substitutes a model.** The default is the `model.default_alias`
+setting, else `[model].default`, else the model named `default`, else the first
+chat model defined (`serves_chat`: not a reranker or speech model), whether or
+not it loaded; adding or enabling the first chat model in the Models tab stores
+it as the setting when none is stored (nothing else does, so a reset stays
+reset), and nodes read it with their model definitions (at a Sync, or at the
+secret-store refresh, which reloads changed settings too), so a cluster's
+default is uniform. The registry holds only the loader's values, and the
+settings apply where they are read (`ModelRegistry.effective_default`,
+`resolve_agent_alias`, `resolve_agent_effort`), so a changed or cleared setting
+takes effect at once. When a routing alias (the default, the task model, the
+coordinator model, the channel model) isn't loaded, a create that relies on it
+fails with a 503 whose body carries `"code": "model_not_loaded"`, and no other
+model is used. The console refuses to delete, disable or rename a model one of
+those settings names, unless it is the last enabled model.
 
 ### Tool Output Truncation
 
@@ -2152,8 +2202,14 @@ degraded ──(any success)─────────────────�
   primary lane is always dialed.
 - `HealthTrackerRegistry` keys trackers by `(provider, base_url)` so aliases
   sharing a backend share one tracker. The `/health` endpoint projects the
-  same trackers: `"status": "ok"` when the backend is healthy, `"degraded"`
-  otherwise.
+  default model's tracker: `"status": "ok"` when that backend is healthy and
+  the default model is loaded, `"degraded"` otherwise (`default_model` says
+  which alias and whether it loaded). One summary (`_health_summary`) feeds
+  `/health`, the global snapshot, every `health_changed` event and the
+  `turnstone_backend_up` metric. A backend transition sends the event; a
+  reload, or the 10-second aggregate tick, sends it when the summary changed,
+  so a path that changes it without saying so reaches the console within a
+  tick. The console stores the node's verdict instead of deriving its own.
 
 ### Rate Limiting
 
@@ -2395,29 +2451,47 @@ The SSE handlers bridge these sync queues to async via
 ### Workstream Threading (CLI)
 
 ```
-Main thread                  Background workstream thread
-+------------------+         +---------------------------+
-| REPL input()     |         | session.send()            |
-| /ws commands     |         | streams response          |
-| active workstream|         | executes tools            |
-| send() inline   |         | approve_tools() ->        |
-+------------------+         |   _fg_event.wait() BLOCKS |
-       |                     +---------------------------+
-       |                                ^
-       +-- /ws <N> switch ------------->|
-       |   old.set_foreground(False)    |
-       |   new.set_foreground(True)     |
-       |   new.flush_buffer()           |
-       +-- _fg_event.set() unblocks --->+
+Main thread                     Other threads, background workstream
++------------------------+      +--------------------------------------+
+| REPL input()           |      | judge daemon: a verdict landing      |
+| /ws commands           |      |   after the turn                     |
+| send() inline: the     |      |     -> _output_buffer                |
+|   workstream in front  |      +--------------------------------------+
++------------------------+                          |
+       |                                            |
+       +-- /ws <N> switch                           |
+           manager.switch_by_index(N)               |
+             (moves active_id)                      |
+           old.set_foreground(False)                |
+           new.set_foreground(True)                 |
+           new.flush_buffer() <---------------------+
+             (replays the buffer)
 ```
 
-When a background workstream reaches its approval gate (every main-loop tool
-batch, and every task-agent call outside `TASK_AUTO_TOOLS` or with a
-private-network grant, whatever either needs once brought forward), its
-`WorkstreamTerminalUI` publishes `attention` and calls `_fg_event.wait()`,
-which blocks the worker thread until the user switches to that workstream.
-The `_bg_attention_notify` callback writes a bell + status line to stderr to
-alert the user.
+The REPL runs each turn inline on the main thread, so the workstream in front
+is the one running a turn; the CLI starts none in a background workstream (it
+wires no wake or watch runner). Other threads can still reach a background
+workstream's `WorkstreamTerminalUI`: the judge's daemon finishes its batch
+after the approval resolves, so a verdict can land after the user has switched
+away, and it waits in `_output_buffer` until the user switches back.
+
+A parallel batch's calls run on a thread pool, and Ctrl-C reaches only the main
+thread, which waits on that pool. Leaving the pool waits for every call still
+running, so on the first Ctrl-C `_execute_tools` stops the batch as Stop does
+(`cancel()`): commands are killed, task agents stop, a web fetch's model step
+aborts, every intent judge still running in the workstream stops, and the calls
+the pool never started are recorded as not run. A call that cannot stop
+part-way (an MCP call, a web search, a page still downloading) runs until it
+returns or times out, which is why a second Ctrl-C can end the pool's wait
+early; a call of the stopped batch that starts or registers after that is
+refused, since the batch's approval witness reads aborted for good. An approval
+prompt already open on a task agent's thread still takes the next line typed,
+and the gate does not use it.
+
+No CLI flow makes a gate wait in the background today. A gate reached there
+still runs tool policies and auto-approve first: a call they settle runs at
+once, and one that still needs a person publishes `attention` and blocks on
+`_fg_event` until the user switches to that workstream.
 
 ### Cluster Console
 

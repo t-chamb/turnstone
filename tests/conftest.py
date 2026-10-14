@@ -171,6 +171,42 @@ def resolve_when_pending(ui: Any, *args: Any, **kwargs: Any) -> _PendingResolver
     return _PendingResolver(ui, *args, **kwargs)
 
 
+@contextlib.contextmanager
+def stdin_from_pipe(data: bytes = b"") -> Iterator[None]:
+    """Make this process's stdin (fd 0) a pipe holding *data* for the block, so a
+    child that inherits fd 0 would read it."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, data)
+    os.close(write_end)
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(read_end, 0)
+        yield
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(read_end)
+
+
+@contextlib.contextmanager
+def stdin_from_pty() -> Iterator[int]:
+    """Make this process's stdin (fd 0) a pseudo-terminal for the block, as the
+    CLI's is; yields its master, where a write is a line typed into it."""
+    try:
+        master, slave = os.openpty()
+    except OSError:
+        pytest.skip("this host cannot open a pseudo-terminal")
+    saved_stdin = os.dup(0)
+    try:
+        os.dup2(slave, 0)
+        yield master
+    finally:
+        os.dup2(saved_stdin, 0)
+        os.close(saved_stdin)
+        os.close(slave)
+        os.close(master)
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
@@ -712,6 +748,21 @@ def make_config_store():
         return _ConfigStoreDouble()
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_refs():
+    """Drop the process-wide secret:// resolver between tests.
+
+    It is built lazily from config.toml on the first reference and would
+    otherwise carry one test's patched ``[secrets]`` (or a developer's real
+    one) into the next. A no-op when nothing built it.
+    """
+    from turnstone.core.secret_refs import reset_for_tests
+
+    reset_for_tests()
+    yield
+    reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

@@ -108,7 +108,7 @@ Model definitions support four backend credential modes:
 
 | `auth_mode` | Identity sent to the model gateway |
 |-------------|------------------------------------|
-| `static` | The definition's stored `api_key`. |
+| `static` | The definition's stored `api_key`: a literal, or a `secret://` reference resolved when the registry loads (see [Secret references](security.md#secret-references)). |
 | `entra_obo` | A caller-delegated Entra access token minted from that user's captured OIDC credential. |
 | `entra_app` | A shared app-identity token minted with Turnstone's OIDC client credentials. |
 | `rfc8693_obo` | A caller-delegated access token minted from the captured credential via RFC 8693 token exchange, requesting the definition's `obo_scopes`. |
@@ -242,7 +242,7 @@ reasoning text round-trips per model:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `surface_persisted_reasoning` | `True` | Surface stored reasoning text on `/history` payloads so a page reload re-renders the reasoning bubble. **Storage of reasoning bytes is independent of this flag** — they ride in `provider_data` regardless. |
-| `replay_reasoning_to_model` | `False` | Send stored reasoning blocks back to the provider on subsequent turns. Capability-gated: only takes effect when the model's `ModelCapabilities.supports_reasoning_replay` is also `True`. Set on canonical OpenAI gpt-5*/o-series and Anthropic Claude entries; unknown / local-server models default to `False` so an operator who flips the flag on a model whose API doesn't understand reasoning replay silently no-ops rather than 400-ing. |
+| `replay_reasoning_to_model` | `False` | Send stored reasoning blocks back to the provider on subsequent turns. Capability-gated: only takes effect when the model's `ModelCapabilities.supports_reasoning_replay` is also `True`. Set on canonical OpenAI gpt-5*/o-series, Grok and Anthropic Claude entries, and on the default rows of `anthropic`, for any id with no row, and of `anthropic-compatible`, so the flag takes effect there too. Models on `google` or `openai-compatible`, and unknown ones on `openai` or `xai`, default to `False`, so an operator who flips the flag on a model whose API doesn't understand reasoning replay silently no-ops rather than 400-ing. |
 
 Edit both via the admin Models tab. See the architecture doc for the
 provider-side mechanics (Anthropic `thinking`, OpenAI Responses
@@ -256,7 +256,7 @@ so operators can pick a cheaper/faster model for autonomous loops:
 
 | Setting | Purpose |
 |---------|---------|
-| `model.task_alias` | Alias used for `task_agent` sub-sessions. Falls back to `[model].agent_model` in config.toml, then the session's active model. |
+| `model.task_alias` | Alias used for `task_agent` sub-sessions. Falls back to `[model].task_model` in config.toml, then `[model].agent_model`, then the session's active model. When the alias isn't loaded, `task_agent` refuses the call before asking for approval instead of using another model. |
 | `model.task_effort` | Reasoning effort for `task_agent`. Empty string means "inherit from the session". |
 
 Both are live-editable from the Settings tab and take effect on the
@@ -477,7 +477,9 @@ The registry currently defines no production secret system setting. The generic
 machinery nevertheless treats any future `is_secret=True` entry as write-only:
 list and write responses return `"***"`, and submitting that sentinel preserves
 the stored value. Model API keys are fields on model definitions—not
-`judge.*` system settings—and use the Models tab's separate write-only flow.
+`judge.*` system settings—and use the Models tab's separate write-only flow. A
+model key or MCP header may also hold a `secret://` reference, which is not
+secret and is shown verbatim; see [Secret references](security.md#secret-references).
 
 ---
 

@@ -742,7 +742,16 @@ function _populateModelSelect(modelSel, judgeSel, opts) {
   const defaults = M.modelDefaults();
   const prevModel = fresh ? "" : modelSel.value;
   const prevJudge = fresh || !judgeSel ? "" : judgeSel.value;
-  const modelDefault = M.modelLabel(defaults.default_alias || "");
+  // This node lists every model it loaded, so a default it doesn't list isn't
+  // loaded here: a create that relies on it fails rather than using another.
+  const defaultAlias = defaults.default_alias || "";
+  const defaultListed = choices.some(function (c) {
+    return c.value === defaultAlias;
+  });
+  const modelDefault =
+    defaultAlias && !defaultListed
+      ? defaultAlias + " (not available)"
+      : M.modelLabel(defaultAlias);
   const judgeDefault = M.modelLabel(defaults.judge_default_alias || "");
   modelSel.replaceChildren();
   _appendOption(
@@ -1581,19 +1590,20 @@ function dashboardResumeSession(wsId) {
     headers: { "Content-Type": "application/json" },
   })
     .then(function (r) {
-      if (r.status === 409) {
+      // Every refusal says why: a lease held elsewhere (409), or a model
+      // that isn't loaded (503 model_not_loaded), among others.
+      if (!r.ok) {
         return readRefusal(r).then(function (refusal) {
           showToast(
             refusal.where
               ? "This workstream is open " + refusal.where + ". Retry once it closes there."
               : (typeof refusal.data.error === "string" && refusal.data.error) ||
                   "Failed to open workstream",
-            "warn",
+            r.status === 409 ? "warn" : "error",
           );
           return {};
         });
       }
-      if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
     .then(function (data) {

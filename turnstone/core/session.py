@@ -557,6 +557,53 @@ def _generation_superseded(session: ChatSession, my_generation: int) -> bool:
     return bool(my_generation and session._generation != my_generation)
 
 
+@contextlib.contextmanager
+def _ctrl_c_held() -> Iterator[None]:
+    """Hold a Ctrl-C that lands while the block runs, and deliver it once the block is done.
+
+    For a block a ``KeyboardInterrupt`` must not cut short part-way.  The block runs under a SIGINT
+    handler that only records the Ctrl-C: a function rather than ``SIG_IGN``, which a process
+    started meanwhile would keep.  The held Ctrl-C then reaches the handler that was in force
+    before the block.  Only a Python handler on the main thread is replaced: ``SIG_IGN`` and
+    ``SIG_DFL`` raise nothing to hold, and replacing ``SIG_IGN`` would take a process started
+    meanwhile off it; ``getsignal`` gives ``None`` for a handler Python did not install; and only
+    the main thread may set a handler.  Anywhere else the block runs as it is.
+    """
+    previous = (
+        signal.getsignal(signal.SIGINT)
+        if threading.current_thread() is threading.main_thread()
+        else None
+    )
+    if not callable(previous):
+        yield
+        return
+    held: list[int] = []
+    signal.signal(signal.SIGINT, lambda signum, _frame: held.append(signum))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if held:
+            signal.raise_signal(signal.SIGINT)
+
+
+class _CtrlCSafeThreadPool(concurrent.futures.ThreadPoolExecutor):
+    """Thread pool whose ``submit`` a Ctrl-C cannot cut short.
+
+    ``submit`` may start a thread for the call and wait until it runs.  A ``KeyboardInterrupt``
+    raised in that wait leaves the thread running unknown to the pool, and leaving the pool does
+    not wait for it.  A Ctrl-C there is held until ``submit`` returns, so it lands between calls:
+    the call being handed over runs, the stop that follows ends or waits for it with the rest, and
+    no call after it is handed over.
+    """
+
+    def submit[**P, T](
+        self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+    ) -> concurrent.futures.Future[T]:
+        with _ctrl_c_held():
+            return super().submit(fn, *args, **kwargs)
+
+
 class _CancelRef(list[Any]):
     """List proxy handed to ``create_streaming`` as its ``cancel_ref``.
 
@@ -762,6 +809,11 @@ class _ApprovalCancelWitness:
     can forget a Stop. The epoch snapshot taken at construction cannot forget it, and it ignores a
     Stop that predates the witness. Main and task-agent gates additionally carry their
     generation-local event or abort ref so supersession and scope cancellation remain visible.
+
+    A tool batch's witness is read after its gate too: when the executor admits each call
+    (``_run_one_body``), and when a call of the batch registers its model stream
+    (``_registered_parallel_model_cancel_scope``). A Stop that reached the batch therefore refuses
+    a call that starts late, even after ``send()`` cleared the event.
     """
 
     __slots__ = ("_cancel_epoch", "_cancel_source", "_session")
@@ -6737,7 +6789,12 @@ class ChatSession:
                 # Broadcast current name so the UI resets the "refreshing" indicator
                 if current_title:
                     self.ui.on_rename(current_title)
-            log.warning("ws.title.failed", ws_id=ws_id[:8], error=str(e), exc_info=True)
+            # The traceback only at DEBUG, as the request retry ("API error details") and
+            # fallback ("fallback failure detail") logs do.
+            log.warning(
+                "ws.title.failed", ws_id=ws_id[:8], error_type=type(e).__name__, error=str(e)
+            )
+            log.debug("ws.title.failure_detail", ws_id=ws_id[:8], exc_info=True)
 
     def _title_owner_is_valid(
         self,
@@ -10059,6 +10116,7 @@ class ChatSession:
         self,
         origin_event: threading.Event,
         origin_generation: int,
+        origin_witness: _ApprovalCancelWitness | None,
     ) -> Iterator[_ParallelModelCancelScope]:
         """Register one parallel child model call for Stop/close propagation.
 
@@ -10066,7 +10124,12 @@ class ChatSession:
         run is therefore either in the snapshot or observes the already-set
         originating event/shutdown latch and is born aborted.  The generation
         comparison also rejects a queued predecessor that starts only after a
-        force-cancel successor claimed the session.  Removal stays in
+        force-cancel successor claimed the session.  *origin_witness* is the
+        launching batch's approval witness, None only for a call no batch
+        launched, and every caller names it: once a Stop has reached the batch
+        it reads aborted for good, after ``send()`` cleared the generation's
+        event on its way out too (a second Ctrl-C can end the batch's wait
+        for a call that has not registered yet).  Removal stays in
         ``finally`` so completed and failed operations never accumulate stale
         handles.
         """
@@ -10077,6 +10140,7 @@ class ChatSession:
                 self._parallel_model_cancel_shutdown
                 or origin_event.is_set()
                 or bool(origin_generation and self._generation != origin_generation)
+                or (origin_witness is not None and origin_witness.aborted)
             )
             if not refused:
                 self._parallel_model_cancel_scopes[token] = scope
@@ -18895,10 +18959,8 @@ class ChatSession:
         # publishes them itself, through the ``_publish_gate_state`` stamped
         # below (``publish_gate_state`` in session_ui_base), where it actually
         # waits: a batch that policies, "Always" grants or auto-approve settle
-        # never leaves ``running``, except that a background CLI workstream
-        # holds every batch in ``attention`` until it is brought forward.  The
-        # generation-fenced commit runs first: it is the cancel boundary before
-        # the gate opens.
+        # never leaves ``running``.  The generation-fenced commit runs first: it
+        # is the cancel boundary before the gate opens.
 
         def _publish_gate_state(state: str | None) -> None:
             """Commit *state* for this batch; ``None`` is the generation fence alone."""
@@ -19083,12 +19145,18 @@ class ChatSession:
                 # Mark the final executor-admission boundary atomically with a
                 # last owner/cancel check.  A queued parallel sibling remains
                 # absent and is later staged NONE; once this marker lands, a
-                # missing result is conservatively UNKNOWN.
+                # missing result is conservatively UNKNOWN.  The batch's
+                # witness keeps a stopped batch's calls out for good: send()
+                # clears the generation's event on its way out, and a call can
+                # reach this check after that, as one a worker took just as the
+                # stop dropped the rest can once a second Ctrl-C ends the
+                # pool's wait.
                 with self._generation_lock:
                     if (
                         self._publication_shutdown
                         or (my_generation and self._generation != my_generation)
                         or self._cancel_event.is_set()
+                        or approval_cancel_witness.aborted
                     ):
                         raise GenerationCancelled()
                     started_call_ids.add(str(item.get("call_id") or ""))
@@ -19170,8 +19238,24 @@ class ChatSession:
                 if serialize_batch:
                     results = [run_one(it) for it in items]
                 else:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                        results = list(pool.map(run_one, items))
+                    with _CtrlCSafeThreadPool(max_workers=4) as pool:
+                        try:
+                            results = list(pool.map(run_one, items))
+                        except KeyboardInterrupt:
+                            # Ctrl-C reaches only this thread, and leaving the pool waits for every
+                            # call still running.  Stop the batch first, as Stop does, so that wait
+                            # is short and nothing outlives the turn: drop the calls the pool has
+                            # not started (a Ctrl-C that came out of ``submit`` never reached
+                            # ``map``'s own cancel) and record them as not run.  A call that cannot
+                            # stop part-way (an MCP call, a web search, a page still downloading)
+                            # finishes or times out first.  A further Ctrl-C is held until the
+                            # stop is done.
+                            with _ctrl_c_held():
+                                if not _generation_superseded(self, my_generation):
+                                    pool.shutdown(wait=False, cancel_futures=True)
+                                    self.cancel()
+                                    _stage_unstarted_tool_calls()
+                            raise
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
             raise
@@ -20448,6 +20532,32 @@ class ChatSession:
             }
         return alias, None
 
+    def _unloaded_task_model_error(self, call_id: str) -> dict[str, Any] | None:
+        """Refuse a task_agent call whose configured task model isn't loaded.
+
+        Checked at prep, before the approval prompt, so nobody is asked to
+        approve a call that can't run. Nothing substitutes another model
+        (#1359), and the error doesn't steer the caller to one: it says why the
+        model isn't available and whether trying again may work. An explicit
+        ``model=`` stays allowed; it just isn't suggested.
+        """
+        registry = self._registry
+        if registry is None:
+            return None
+        alias = registry.resolve_agent_alias("task", self._config_store)
+        if not alias or registry.has_alias(alias):
+            return None
+        reason, retryable = registry.unavailable_reason(alias)
+        remedy = "Try the task again shortly." if retryable else "An operator has to fix it."
+        return {
+            "call_id": call_id,
+            "func_name": "task_agent",
+            "header": f"✗ task_agent: task model '{alias}' is not available",
+            "preview": "",
+            "needs_approval": False,
+            "error": f"Error: the task model '{alias}' is not available: {reason}. {remedy}",
+        }
+
     def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a general-purpose sub-agent task for approval."""
         prompt = (args.get("prompt") or "").strip()
@@ -20463,6 +20573,10 @@ class ChatSession:
         model_override, err = self._validate_agent_model_override(call_id, "task_agent", args)
         if err is not None:
             return err
+        if model_override is None:
+            err = self._unloaded_task_model_error(call_id)
+            if err is not None:
+                return err
         skill_arg = (args.get("skill") or "").strip()
         skill_data: dict[str, Any] | None = None
         if skill_arg:
@@ -25440,6 +25554,7 @@ class ChatSession:
 
         proc = subprocess.Popen(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=scrubbed_env(),
@@ -25786,18 +25901,22 @@ class ChatSession:
         origin_cancel_event: threading.Event | None = None,
         origin_generation: int = 0,
         execution_journal: _TaskExecutionJournal | None = None,
+        origin_witness: _ApprovalCancelWitness | None = None,
     ) -> str:
         """Run one autonomous child under an independently abortable scope.
 
         The wrapper owns registration, ContextVar propagation to child tools,
         and exact cleanup.  The loop below never observes a task-agent run
-        without a registered provider-stream handle.
+        without a registered provider-stream handle.  *origin_witness* is the
+        launching batch's approval witness (see
+        ``_registered_parallel_model_cancel_scope``).
         """
         parent_event = self._cancel_event if origin_cancel_event is None else origin_cancel_event
         journal = execution_journal or _TaskExecutionJournal(agent_turns)
         with self._registered_parallel_model_cancel_scope(
             parent_event,
             origin_generation,
+            origin_witness,
         ) as cancel_scope:
             context_token = _active_task_agent_cancel_scope.set(cancel_scope)
             try:
@@ -25891,13 +26010,19 @@ class ChatSession:
         agent_prefix = tuple(agent_turns)
 
         # Resolve agent model: explicit per-call override wins, then the
-        # per-kind registry override (task_model), then the session-wide
-        # agent_model fallback, then the session's primary model.
+        # model.task_alias setting, then the per-kind registry override
+        # (task_model), then the session-wide agent_model fallback, then the
+        # session's primary model. A configured alias that isn't loaded raises
+        # from resolve_model_binding rather than running another model (#1359).
         if agent_alias is not None:
             if self._registry is None or not self._registry.has_alias(agent_alias):
                 raise ValueError(f"Unknown agent_alias '{agent_alias}'")
         else:
-            agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
+            agent_alias = (
+                self._registry.resolve_agent_alias(label, self._config_store)
+                if self._registry
+                else None
+            )
         primary_lane = self._primary_lane()
         if self._registry and agent_alias and agent_alias != self._model_alias:
             agent_binding = resolve_model_binding(
@@ -25920,7 +26045,7 @@ class ChatSession:
         # delegate to the registry which knows the per-kind default (task
         # returns None to inherit the session).
         if reasoning_effort is None and self._registry:
-            reasoning_effort = self._registry.resolve_agent_effort(label)
+            reasoning_effort = self._registry.resolve_agent_effort(label, self._config_store)
 
         # Gate web_search: remove when no backend exists for the agent model
         agent_caps = require_lane_capabilities(lane)
@@ -26935,6 +27060,7 @@ class ChatSession:
                 origin_cancel_event=item.get("_origin_cancel_event"),
                 origin_generation=origin_generation,
                 execution_journal=execution_journal,
+                origin_witness=item.get("_approval_cancel_witness"),
             )
 
             # Self-report the task_agent's OWN result.  The parent run-loop only
@@ -28092,6 +28218,7 @@ class ChatSession:
             with self._registered_parallel_model_cancel_scope(
                 origin_event,
                 origin_generation,
+                item.get("_approval_cancel_witness"),
             ) as cancel_scope:
                 return self._exec_web_fetch(
                     {
@@ -28278,6 +28405,10 @@ class ChatSession:
                 _check_fetch_cancelled()
                 if materialized.mode == "resource_limited":
                     msg = "Error: fetched PDF exceeded local processing safety limits"
+                    _report_fetch_result(msg, is_error=True)
+                    return call_id, msg
+                if materialized.mode == "host_unavailable":
+                    msg = "Error: local PDF processing isn't available on this host"
                     _report_fetch_result(msg, is_error=True)
                     return call_id, msg
                 if max_content <= 0 and materialized.mode == "extracted_text":

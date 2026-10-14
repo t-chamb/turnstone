@@ -102,6 +102,14 @@ frozen.
 > **Before upgrading:** migration 081 rebuilds the orphan reaper's partial index
 > (`idx_workstreams_reaper`) to cover the new `evaluation` state, concurrently on PostgreSQL. The
 > reaper runs without the index for the length of the build.
+>
+> **Before upgrading:** migration 082 stores the default model in the `model.default_alias` setting
+> when that setting has no value yet and the database holds enabled chat model definitions
+> (rerankers and speech models are skipped): the one named `default`, else the first in alias order.
+> A node or console whose config.toml picks its default itself, with `[model] default` or a model
+> named `default` under `[models.*]`, while the database holds model definitions, follows the stored
+> setting from now on, because the setting outranks config.toml; clear `model.default_alias` in the
+> Settings tab to go back to the config.toml default.
 
 ### Added
 
@@ -114,6 +122,25 @@ frozen.
   their own network. Each test is audited as `mcp_server.test`, with the scheme, host, port and
   outcome. Scripts can call `POST /v1/api/admin/mcp-servers/test` (`admin.mcp`), or
   `test_mcp_server` (which waits up to 75 s) / `testMcpServer` in the SDKs.
+- **Secret references for model API keys and MCP headers (#1329).** A model definition's `api_key`
+  and a `streamable-http` MCP server's headers can hold `secret://<backend>/<path>[#<field>]`
+  instead of the value. The value is fetched from the store configured under `[secrets]` in
+  config.toml when the registry loads or the server connects, is reused for `cache_ttl_seconds`, and
+  is never written to the database. Two backends ship: `file` (a file under a dedicated root, for
+  container and Kubernetes secret mounts) and `vault` (Vault or OpenBao KV v2 with `jwt` or
+  `approle` login). Both backends drop one trailing line break; what remains must be printable
+  ASCII, with spaces and tabs only between other characters, as an HTTP header value must, or it is
+  refused without being quoted. The console shows a reference verbatim where it masks a literal,
+  validates it when it is saved, and requires `admin.mcp`, held explicitly, to introduce one, to
+  probe a typed one with Detect, or to test an MCP server's connection with one; a reference in MCP
+  stdio `env` is refused. While the store is down, values already fetched stay in use. With a store
+  configured, nodes and the console reload their models every `cache_ttl_seconds` (at least 60 s),
+  so a rotated key, and any model definition saved since the last Sync to Nodes, reaches them within
+  that interval (the Models tab then clears its pending-Sync marker); MCP connections pick a
+  rotation up on Reconnect. When the store refuses a reference (not found, denied), anything new
+  gets the refusal at once, a model already running keeps running until Sync to Nodes leaves it out,
+  and an MCP server whose header is refused is retried every five minutes. See [Secret
+  references](docs/security.md#secret-references).
 - **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
   tool outputs with directives planted at known lines: detection, false positives, whether its flags
   stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.
@@ -192,6 +219,95 @@ frozen.
 
 ### Changed
 
+- **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
+  model, the task model, the coordinator model or the channel model names a definition that isn't
+  loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
+  couldn't be read), whatever relies on it now fails instead of quietly running on another model,
+  possibly a different provider. Creating a workstream without a model returns 503 with `"code":
+  "model_not_loaded"` and a message naming the model, which the console launcher, the CLI and the
+  Slack and Discord bots turn into their own wording; `task_agent` refuses the call before asking
+  for approval, saying why and suggesting a retry only when the secret store didn't answer (never
+  another model), and no longer falls through to `[model].agent_model`; the CLI exits at startup
+  naming the model. The coordinator check now blocks only creating a coordinator, so list, open,
+  events, send and close keep working while its model is missing. A fork (the node's Fork,
+  continuing elsewhere, a channel conversation's recovery) builds on its source's model when that
+  model is loaded, and fails if that model's client can't be built, as a reopen does; otherwise it
+  builds on the model the request names (for a channel recovery, the channel's model), else the
+  default, and fails when that one isn't loaded either. With nothing stored or configured, the
+  default is `[model].default`, else the model named `default`, else the first chat model defined
+  (not a reranker or speech model), whether or not it loaded. Adding or enabling the first chat
+  model in the Models tab stores it as `model.default_alias` when nothing is stored there; nothing
+  else stores it, so a reset in the Settings tab stays reset. Nodes read it with their model
+  definitions, at a Sync or at the secret-store refresh, which now also reloads settings that
+  changed. It outranks each node's config.toml default, so a cluster's default is uniform. The
+  Models tab refuses to delete, disable or rename a model that `model.default_alias`,
+  `model.task_alias`, `coordinator.model_alias` or `channels.default_model_alias` names, saying
+  which setting to change first; deleting or disabling the last enabled model clears them. A changed
+  or cleared `model.default_alias` or `model.task_alias` now takes effect at once on running nodes;
+  before, a node kept the previous value until the next Sync or restart. The model pickers name a
+  default their list doesn't hold instead of showing a bare "Default model", and the node's picker
+  marks one the node didn't load as not available.
+- **Slack uses the channel adapter model (#1359).** New Slack conversations run on
+  `channels.default_model_alias`, as the Roles tab says, instead of always the server default;
+  before, only Discord used it. Both bots now re-read the setting every 30 seconds instead of every
+  5 minutes, since a channel model that was removed fails new conversations until they do.
+- **A coordinator create ignores `resume_ws` (#1359).** Coordinators can't be forked, but a
+  coordinator create carrying `resume_ws` read the named workstream, without checking that the
+  caller could see it, and stamped that workstream's persona onto the new coordinator. Only a create
+  endpoint that forks (the node's) now reads a fork source.
+- **A node's health says when its default model isn't loaded (#1359).** `/health` and the console's
+  node status are `degraded` while the node's default model isn't loaded, since every create that
+  relies on it fails, and `/health` gains `default_model` (`alias`, `loaded`); it still answers 200.
+  The console now shows the status the node computes (its default model's backend, and whether that
+  model is loaded) instead of the state of whichever backend changed last, so an outage of a backend
+  other than the default's no longer marks the node degraded there, as it never did in `/health`.
+- **Claude models without a capability row get adaptive thinking (#1366).** An Anthropic model id
+  with no row, such as the first model of a new line, took a default shaped for models that take a
+  thinking budget: any configured reasoning effort sent `budget_tokens`, which adaptive-only models
+  reject with a 400, and with no effort set a configured temperature was sent, which Claude 4.7 and
+  later models also reject. The default now sends adaptive thinking with summarized display, effort
+  on the `low` through `high` ladder (`xhigh` and `max` ride `high`; left unset, the model's own
+  default applies) and no temperature. It keeps the 200K context and 64K output limits, and tool
+  search, native mid-conversation system messages and the binding control for thinking bound to the
+  conversation prefix stay off until the model has its own row; a model definition on auto-detect
+  keeps the 32,768-token fallback window. An id with no row that names a model which thinks only
+  when asked, such as a gateway's name for Claude Opus 4.6 to 4.8 or Sonnet 4.6, now thinks on every
+  request, at the model's own default effort when none is set: a `low` effort on the alias bounds
+  that, and a `thinking_mode` of `none` in the definition's capabilities turns it off. In the admin
+  model form, the effort ladder for any id with no row on the `anthropic` provider lists effort
+  levels instead of thinking budgets, and its capability tiles show the default row's flags, as they
+  now do on every commercial provider (they showed generic defaults). Claude Haiku 4.5, Sonnet 4.5
+  and Opus 4.5 take a thinking budget and reject adaptive thinking, so a name for one of them that
+  no row matches, such as a gateway's own, now fails every request with a 400: use the model's
+  Anthropic id as that name, or set `thinking_mode` to `manual` and `supports_temperature` to `true`
+  in the definition's capabilities, plus `supports_effort` to `false` for Haiku 4.5 and Sonnet 4.5.
+  A non-Claude model behind an Anthropic-style API on the `anthropic` provider now gets adaptive
+  thinking on every request, which its server may reject; move it to the `anthropic-compatible`
+  provider, which sends no native thinking params, and set its vision and PDF capabilities there if
+  the model takes them.
+- **Model definitions saved in the console no longer expand `${VAR}`** *(BREAKING)* — a `${NAME}`
+  placeholder in a definition's `api_key` or `base_url` is no longer filled in from the environment;
+  only config.toml `[models.*]` entries expand one. The console refuses a placeholder in either
+  field when a definition is saved, and a definition saved with one earlier is skipped when models
+  load, named with its field in the console's save and Sync to Nodes replies (and in
+  `turnstone-doctor`'s report when it cannot resolve its model). Edit such a definition to hold the
+  key or URL itself, or a `secret://` reference for the key, or define the model in config.toml,
+  where a URL that carries a credential belongs.
+- **Two kinds of model key that loaded no longer do** *(BREAKING)* — a config.toml `[models.*]`
+  `api_key` whose `${VAR}` expands to nothing, and a reranker key with a space at either end. The
+  first fell back to the provider SDK's own variable, which then went to that entry's endpoint (or,
+  on a local server with that variable unset, to the placeholder key); the second was trimmed. Both
+  now follow the model key rule (under Fixed): the model is skipped and named with the reason. Set
+  the variable, or remove the `api_key` line for a server without auth, and trim the key.
+- **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
+  ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
+  for another workstream, and one that prompted waited until its timeout for an answer nobody
+  could give. A `bash` command now gets `/dev/null`: it reads end-of-file at once and finds that
+  stdin is not a terminal. A background shell gets `/dev/null` too, unless the process's own stdin
+  is a terminal, as the CLI's is: then it gets a terminal of its own that nothing is typed into,
+  so a long-running program keeps running as before, and one that waits for input waits until the
+  shell is killed. That terminal has no window size, so a program that sizes its output by it uses
+  its default width, as a `bash` command now does.
 - **A message to a waiting coordinator ends the wait at once (#1339).** A message the user sends
   while the coordinator blocks in `wait_for_workstream` no longer queues until the wait ends (up to
   600 seconds): the wait returns at once with `complete: false` and `interrupted: "user_message"`,
@@ -415,6 +531,55 @@ frozen.
 
 ### Fixed
 
+- **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
+  limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
+  directory can't be created or the worker can't start, every PDF that needed local processing was
+  reported as having exceeded the safety limits. Models without native PDF input are now told that
+  local PDF processing isn't available on this host, `web_fetch` returns the same error, and a
+  server-log warning names the step that failed. The worker still never touches the PDF in those
+  cases, and models that take PDFs natively are unaffected. Inside the worker, running out of file
+  descriptors or processes is now reported as a limit rather than as an unreadable PDF. A temporary
+  directory that can't be cleaned up no longer hides the error that stopped the work, and a worker
+  cut off by a deadline or cancellation is killed before its temporary directory is removed; killing
+  it after could leave a `turnstone-pdf-*` directory behind.
+- **The model form no longer saves a hidden thinking mode (#1366).** The Thinking mode field shows
+  only for the two compatible providers, but every save wrote its value back for any provider, and
+  editing a definition moved a stored `thinking_mode` out of the raw capabilities JSON into that
+  hidden field: a value left there after switching provider was saved, and a stored one could not be
+  seen or removed. The field, and the effort annotations it feeds, now apply only on the compatible
+  lanes; on other providers `thinking_mode` stays in the raw capabilities JSON. The effort
+  annotations now also follow the capability tiles, as a save does.
+- **Claude Haiku 5.5 requests rejected (#1362).** `claude-haiku-5-5` had no capability row and fell
+  through to the default Anthropic row, which then described models that take a thinking budget.
+  Any configured reasoning effort sent `budget_tokens`, which this model rejects with a 400, and
+  with no effort set a configured temperature was sent, which it also rejects. With no effort set
+  the model still thinks by default, so with reasoning replay enabled, on Anthropic organizations
+  created on or after 2026-08-31, a replayed thinking block whose earlier conversation had since
+  changed, for example after compaction, failed the whole request with a 400. A model definition
+  left on auto-detect also ran with the 32,768-token fallback context window instead of 1M, and tool
+  search ran client-side instead of through the API's search tool. The model now has its own row:
+  adaptive thinking, the documented `low` through `max` effort ladder (left unset, the model's own
+  default, `medium`, applies), no temperature, the API's tool search, and the binding control, so a
+  thinking block bound to a changed conversation is dropped server-side, unbilled, and the request
+  proceeds. Like Opus 5.5 and Sonnet 5.5, it also receives operator notes as native mid-conversation
+  system messages. A Haiku 5.5 model definition whose window was saved as 32,768 from the Models
+  tab's Detect result keeps that value until it is set to 0 (auto-detect) or 1,000,000.
+- **A model definition saved with a non-string `api_key` or `base_url`, JSON `null` included, is
+  refused.** The console stored the value's text (`None`, `False`, `123`) and sent that as the key
+  or URL; it now answers 400.
+- **A model key follows the rule a `secret://` key does.** One trailing line break is dropped, so a
+  key read from a file works wherever it is written: a model definition, a config.toml `[models.*]`
+  entry (after `${VAR}` expansion), the CLI's `--api-key`, `[api] api_key` or provider key variable,
+  and the provider SDK's own variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`) that a model with an empty key uses, as the compose and Helm setups do. A
+  key an HTTP header still cannot carry is refused, and so is one that was only a line break or
+  written without quotes in config.toml; such a key failed every request or, depending on the
+  provider, was sent. The message names where the key came from, never the key: a model definition
+  or `[models.*]` entry is skipped and named with the reason, the CLI's own key stops the CLI at
+  startup, a provider variable fails the models that use it when their client is built, and the
+  console's Detect and Re-calibrate and `turnstone-admin rerank-calibrate` refuse the key.
+  turnstone-doctor's backend check, given no key, sends a placeholder rather than the provider
+  variable.
 - **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
   carrying error text, a server that failed to connect showed **idle**, and a newly saved one
   showed **connecting** forever. The list marks a failing server as **error**, and admins
@@ -774,6 +939,28 @@ frozen.
   task agent's call waits for a person (`evaluation` while one waits on the judge in a Smart
   Approvals wait), as it does for the main loop's calls, and goes back to `running` when the last
   waiting call is resolved.
+- **A background CLI workstream waits only for tool calls that need a person (#1342).** Its
+  approval gate held every tool batch until the workstream was brought forward, before tool
+  policies and auto-approve had run, so calls that need no approval and calls that a policy, an
+  "Always" answer or `--skip-permissions` settles waited too. A batch they settle now runs at once.
+  No current CLI flow makes a gate wait in the background, since the CLI runs each turn in the
+  workstream in front.
+- **CLI output no longer prints over the workstream in front.** The intent judge keeps working
+  after a call is approved, so a verdict could land after a switch to another workstream and print
+  over its prompt. A background workstream now keeps its judge verdicts, tool errors, output
+  warnings, task-agent steps and operator messages with its buffered output, shown when you switch
+  back to it (tool errors on stderr); before, its tool errors were dropped and the rest printed over
+  the workstream in front. In front, a tool error now prints at once even while a task agent's
+  approval prompt is open, instead of waiting for that prompt's answer.
+- **The first Ctrl-C stops a parallel batch in the CLI.** During a batch of tool calls run in
+  parallel (several task agents, say), the first Ctrl-C waited for every call to finish, and a
+  second ended that wait but left the calls running, out of sight. The first Ctrl-C now stops the
+  batch as Stop does: running commands are killed, task agents stop, every intent judge still
+  running in the workstream stops (late verdicts are not shown), and calls that had not started
+  are recorded as not run; the turn then ends as interrupted. A call that cannot stop part-way (an
+  MCP call, a web search, a page still downloading) still runs until it returns or times out.
+  Ctrl-C reaches only the main thread, so an approval prompt already open on a task agent's thread
+  still takes the next line typed: that answer is not used, and the CLI says so.
 - **Smart Approvals hands a batch to a person sooner (#1325).** The verdict wait ends as soon as
   one verdict rules the batch out (a `review` or `deny`, a judge error, or a confidence below the
   threshold), instead of waiting for every verdict, and a batch with a call the heuristic rules

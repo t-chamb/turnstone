@@ -467,14 +467,33 @@ DEFAULT_THINKING_BUDGET = 4096
 
 # -- model capabilities -------------------------------------------------------
 
+# The row a Claude model id gets when no entry in the table below matches it
+# (``_lookup_capabilities``), such as the first model of a new line.  The
+# models the API still serves that take a thinking budget each have a row, so
+# every served model that lands here under its Anthropic id thinks
+# adaptively, and the row sends only what all of them accept: adaptive
+# thinking with ``display: "summarized"`` (newer models return thinking
+# blocks with empty text without it), the ``low``..``high`` effort ladder (a
+# knob of ``xhigh`` or ``max`` rides ``high``; an unset knob still omits
+# ``output_config.effort``), and no temperature (newer models reject any
+# non-default value).  A budget model reached under another name, such as a
+# gateway's, lands here too and needs its own row's ``thinking_mode``,
+# ``supports_temperature`` and ``supports_effort`` in its definition's
+# capabilities.  Limits stay conservative, and features some models lack stay
+# off: native mid-conversation system messages, the prefix-binding control
+# and tool search.  A model's real limits and features belong in its own row.
 _ANTHROPIC_DEFAULT = ModelCapabilities(
     context_window=200000,
     max_output_tokens=64000,
     token_param="max_tokens",
-    thinking_mode="manual",
+    thinking_mode="adaptive",
+    supports_effort=True,
+    effort_levels=("low", "medium", "high"),
     supports_web_search=True,
     supports_vision=True,
     supports_pdf=True,
+    supports_temperature=False,
+    thinking_display="summarized",
     supports_reasoning_replay=True,
 )
 
@@ -732,6 +751,42 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_vision=True,
         supports_pdf=True,
         supports_reasoning_replay=True,
+    ),
+    # Haiku 5.5: the first Haiku with adaptive thinking and effort.  The API
+    # default effort is medium; an unset knob omits ``output_config.effort``
+    # rather than pinning a level.  Its documented breaking changes against
+    # haiku-4-5, as they meet this lane:
+    #   * a thinking budget (``budget_tokens``) is a 400 -- the adaptive branch
+    #     never sends one.
+    #   * non-default sampling params are a 400 -- temperature is never sent.
+    #   * assistant prefill is a 400, as on every adaptive row.
+    #   * the older computer-use tool is a 400 -- this lane sends none.
+    #   * thinking blocks are bound to the conversation prefix -- the
+    #     fable-5-1 posture, so the row opts into drop_block via
+    #     ``thinking_prefix_bound``.
+    # Thinking turns off with {"type": "disabled"} only at effort high or
+    # below (a 400 at xhigh and max); "between_tools", sonnet-5-5's off
+    # switch, is a 400 here.  The adaptive branch sends neither, so a
+    # thinking-off branch added later must gate on effort <= high and leave
+    # out ``block_binding``, which the API accepts only with adaptive
+    # thinking.  Forced tool choice is accepted (it skips thinking), and this
+    # lane never sends ``tool_choice``.
+    "claude-haiku-5-5": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_pdf=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+        supports_reasoning_replay=True,
+        supports_mid_conversation_system=True,
+        thinking_prefix_bound=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
         context_window=200000,

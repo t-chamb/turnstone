@@ -66,6 +66,7 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
@@ -78,8 +79,10 @@ from turnstone.core.model_registry import (
     MODEL_AUTH_TEXT_MAX_LEN,
     SCOPES_MODEL_AUTH_MODES,
     DynamicAuthKeyError,
+    describe_skipped,
     dynamic_auth_key_error,
     sanitize_backend_auth_scopes,
+    stored_definition_error,
     strip_control_characters,
 )
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
@@ -94,10 +97,13 @@ from turnstone.core.session_replay import (
     session_replay_preamble,
 )
 from turnstone.core.session_routes import (
+    MODEL_NOT_LOADED_CODE,
     AttachmentUploadHelpers,
     CoordOnlyVerbHandlers,
+    ModelWording,
     SessionEndpointConfig,
     SharedSessionVerbHandlers,
+    echoable_alias,
     make_approve_handler,
     make_attachment_handlers,
     make_cancel_handler,
@@ -1664,44 +1670,37 @@ async def list_available_models(request: Request) -> JSONResponse:
     # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
     models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
 
-    # Include effective defaults for clients (web UI, channel gateway).
+    # Include effective defaults for clients (web UI, channel gateway). The
+    # default, channel and coordinator aliases are reported as configured even
+    # when no enabled row matches: a create that relies on one fails with
+    # ``model_not_loaded`` rather than moving to another model (#1359). The
+    # pickers name it rather than hide it; ``models`` holds only stored
+    # definitions, so a config.toml model isn't in it and nothing here can say
+    # whether the alias is loaded.
     default_alias = ""
     channel_default_alias = ""
     coordinator_default_alias = ""
     judge_default_alias = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs is not None:
-        default_alias = cs.get("model.default_alias") or ""
-        channel_default_alias = cs.get("channels.default_model_alias") or ""
+        default_alias = (cs.get("model.default_alias") or "").strip()
+        channel_default_alias = (cs.get("channels.default_model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
     enabled_aliases = {r["alias"] for r in rows}
-    if default_alias and default_alias not in enabled_aliases:
-        default_alias = ""
-    if channel_default_alias and channel_default_alias not in enabled_aliases:
-        channel_default_alias = ""
     # Coordinator default walks the standard three-tier chain (see
-    # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`).
-    # The placeholder restricts every tier to enabled DB rows so the home
-    # composer doesn't advertise a model the workstream-creation picker
-    # can't actually offer — the session factory uses the same chain
-    # without that filter so explicit operator pins surface as 503 at
-    # ``registry.resolve`` instead of being silently swapped out.
+    # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`),
+    # the same one the session factory walks.
     coord_registry = getattr(request.app.state, "coord_registry", None)
     if cs is not None and coord_registry is not None:
         coordinator_default_alias = resolve_coordinator_alias(
             explicit=cs.get("coordinator.model_alias"),
             config_store=cs,
             registry=coord_registry,
-            alias_filter=lambda a: a in enabled_aliases,
         )
     elif coord_registry is not None:
         # ConfigStore failed lifespan but coord_registry is still bound —
-        # fall through to ``registry.default`` (filtered) so the home
-        # composer isn't blank.  Mirrors the helper's tier 3 with the
-        # placeholder's enabled-rows filter applied.
-        registry_default = getattr(coord_registry, "default", "") or ""
-        if registry_default in enabled_aliases:
-            coordinator_default_alias = registry_default
+        # report the helper's tier 3 so the home composer isn't blank.
+        coordinator_default_alias = getattr(coord_registry, "default", "") or ""
     # Judge falls back to the resolved coordinator alias when
     # ``judge.model`` is empty *or* not a registered alias — judge.model
     # is alias-only (matches IntentJudge.__init__), so an unknown value is
@@ -1962,6 +1961,29 @@ async def create_workstream(request: Request) -> JSONResponse:
         if required:
             error = NodeAffinityError(required)
             return JSONResponse(error.as_dict(), status_code=error.status_code)
+
+    if (
+        resp.status_code == 503
+        and node_body is not None
+        and node_body.get("code") == MODEL_NOT_LOADED_CODE
+    ):
+        # The node holds no model this create can use and substitutes none
+        # (#1359). Console-owned wording, as for require_project: only the
+        # node's alias crosses this boundary, and only in an alias's shape.
+        alias = echoable_alias(node_body.get("alias"))
+        noun = "The model" if model.strip() else "The default model"
+        named = f" '{alias}'" if alias else ""
+        log.info("Workstream dispatch to %s refused: model %r not loaded", node_id, alias)
+        return JSONResponse(
+            {
+                "error": (
+                    f"{noun}{named} isn't loaded on node {node_id}. Choose another model, "
+                    "or check it in the Models tab."
+                ),
+                "code": MODEL_NOT_LOADED_CODE,
+            },
+            status_code=503,
+        )
 
     if (
         resp.status_code == 400
@@ -3840,46 +3862,22 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
     when the coordinator subsystem isn't configured.
     """
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
-    config_store = getattr(request.app.state, "config_store", None)
     if coord_mgr is None:
-        registry_err = getattr(request.app.state, "coord_registry_error", "") or ""
-        msg = "Coordinator subsystem not initialized. " + (
-            registry_err or "Add a model definition in the admin Models tab."
+        # One message for every down state. The recorded cause
+        # (``coord_registry_error``) can be the loader's own text, which names
+        # secret reference paths, and every coordinator verb's caller reads
+        # this; admins see the cause in the Models tab's replies
+        # (:func:`_coord_registry_warning`) and the console log (#1359).
+        msg = (
+            "Coordinator subsystem not initialized. Add a model definition in the "
+            "admin Models tab; if one exists, an admin can see why by pressing Sync "
+            "to Nodes there, or in the console log."
         )
         return None, JSONResponse({"error": msg}, status_code=503)
-    if config_store is None:
-        return None, JSONResponse({"error": "ConfigStore unavailable"}, status_code=503)
-    alias = (config_store.get("coordinator.model_alias") or "").strip()
-    # Empty alias falls back to the registry's default model — operators
-    # get a working coordinator on a freshly-provisioned console without
-    # an extra manual setting.
-    registry = getattr(request.app.state, "coord_registry", None)
-    if registry is None:
-        return None, JSONResponse(
-            {
-                "error": (
-                    "ModelRegistry unavailable for coordinator sessions. "
-                    "Restart the console after adding a model definition."
-                )
-            },
-            status_code=503,
-        )
-    try:
-        # ``resolve(None)`` uses ``registry.default``; the registry
-        # raises when neither the explicit alias nor the default is
-        # configured, which we translate to a 503 with remediation.
-        registry.resolve(alias or None)
-    except Exception as exc:
-        hint = f"coordinator.model_alias '{alias}'" if alias else "the registry default alias"
-        return None, JSONResponse(
-            {
-                "error": (
-                    f"{hint} does not resolve: {exc}. "
-                    "Add or enable a model in the admin Models tab."
-                )
-            },
-            status_code=503,
-        )
+    # The coordinator's model is not resolved here: every coordinator verb
+    # passes this gate, and an unloaded default must not take list, open,
+    # events, send or close down with it. Only a create needs the model; its
+    # factory raises, and the create route answers ``model_not_loaded`` (#1359).
     return coord_mgr, None
 
 
@@ -4174,6 +4172,15 @@ def _coord_events_replay(
                 cached_verdicts = list(llm_verdicts.values())
             for v in cached_verdicts:
                 yield {"type": "intent_verdict", **v}
+
+
+#: How a coordinator create or reopen words a model that isn't loaded (#1359): a
+#: coordinator runs on this console, on ``coordinator.model_alias`` when set.
+COORDINATOR_MODEL_WORDING = ModelWording(
+    noun="The coordinator model",
+    host="the console",
+    remedy="Ask an admin to check its definition, or to set coordinator.model_alias.",
+)
 
 
 async def _coord_create_validate_request(
@@ -5671,6 +5678,9 @@ def _bootstrap_coord_subsystem(
         # coordinator pinned to a since-removed alias still rehydrates
         # (on the registry default) instead of 500-ing on every reopen.
         model_validator=coord_registry.has_alias,
+        default_alias_reader=lambda: resolve_coordinator_alias(
+            explicit="", config_store=config_store, registry=coord_registry
+        ),
     )
     # Late-bind the manager onto the adapter so
     # ``_rebuild_children_registry`` / ``send`` / fan-out dispatch can
@@ -5767,9 +5777,9 @@ def _bootstrap_coord_subsystem(
         raise
 
     # Atomic commit phase: stamp ``app.state`` and class attrs.  Order
-    # matters — :func:`_require_coord_mgr` reads ``coord_mgr`` first
-    # and only then reads ``coord_registry``, so ``coord_registry``
-    # MUST land BEFORE ``coord_mgr``.  Under CPython's GIL each
+    # matters — readers gate on ``coord_mgr`` and only then read the
+    # rest (``coord_registry`` included), so everything MUST land
+    # BEFORE ``coord_mgr``.  Under CPython's GIL each
     # individual ``setattr`` is atomic and ordering is preserved, so
     # any concurrent reader observing a populated ``coord_mgr`` is
     # guaranteed to see all the prior commits including the registry.
@@ -5804,8 +5814,9 @@ def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
 
     Shared by the lifespan bootstrap, the CRUD-triggered runtime bootstrap
     and :func:`_refresh_coord_registry` so the three cannot drift: an ERROR
-    log (the observable while the coordinator is live) plus the
-    ``coord_registry_error`` banner (rendered by the 503 path while down).
+    log (the observable while the coordinator is live) plus
+    ``coord_registry_error``, which the Models tab's replies show admins
+    (:func:`_coord_registry_warning`); the coordinator 503 stays neutral.
     """
     log.error("console.model_auth_key_missing: %s", key_err)
     app_state.coord_registry_error = key_err
@@ -5853,8 +5864,8 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
         try:
             coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
-            # No model rows configured.  Endpoint returns 503 with the
-            # error text so admin sees remediation in the UI; the
+            # No model rows configured.  Recorded for the Models tab's
+            # replies (the coordinator 503 says to add a model); the
             # operator can recover at runtime by adding a model in the
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
@@ -6080,7 +6091,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # OAuth client secrets, so it needs the cipher even when no node
     # currently dispatches.
     from turnstone.core.mcp_crypto import initialize_mcp_crypto_state
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
 
+    # A malformed [secrets] table (or a CA bundle that cannot be loaded) is a
+    # boot failure, like a malformed keyring, not a per-row surprise at the
+    # first secret:// reference. Building the resolver touches no store.
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        log.error("secret_refs.config_invalid: %s", exc)
+        raise SystemExit(1) from exc
     initialize_mcp_crypto_state(app.state, node_id="console")
     get_model_token_client(app.state)
 
@@ -6222,8 +6242,26 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
                 exc_info=True,
             )
 
+    # With a secret store configured, the coordinator's models reload on its
+    # cache interval as Sync to Nodes would, so a key rotated in the store
+    # reaches this console without an operator. Each node runs its own timer.
+    from turnstone.core.secret_refs import start_refresh
+
+    _secret_refresh_task = (
+        start_refresh(
+            lambda: _refresh_coord_registry(app.state, storage, from_timer=True),
+            what="console models",
+        )
+        if storage
+        else None
+    )
+
     yield
     # Shutdown
+    if _secret_refresh_task is not None:
+        _secret_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _secret_refresh_task
     if _console_heartbeat_task is not None:
         _console_heartbeat_task.cancel()
     # Deregister console from services table
@@ -10684,6 +10722,9 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         input_error = _mcp_url_error(config.get("url", "")) or _mcp_headers_error(merged_headers)
         if input_error:
             return JSONResponse({"error": input_error}, status_code=400)
+    err = await _check_mcp_secret_fields(request, merged_headers, merged_env)
+    if err is not None:
+        return err
 
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
@@ -10705,13 +10746,20 @@ async def admin_registry_install(request: Request) -> JSONResponse:
         registry_meta=json.dumps(config["registry_meta"]),
     )
 
+    install_detail: dict[str, Any] = {
+        "name": name,
+        "registry_name": registry_name,
+        "source": source,
+    }
+    if header_refs := _header_references(merged_headers):
+        install_detail["header_references"] = header_refs
     record_audit(
         storage,
         audit_uid,
         "mcp_server.registry_install",
         "mcp_server",
         server_id,
-        {"name": name, "registry_name": registry_name, "source": source},
+        install_detail,
         ip,
     )
 
@@ -10883,8 +10931,6 @@ def _mcp_url_error(url: str) -> str | None:
 
 
 _HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-# Printable ASCII with spaces and tabs inside, never at either end.
-_HTTP_HEADER_VALUE_RE = re.compile(r"(?:[!-~](?:[ \x09!-~]*[!-~])?)?")
 
 
 def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
@@ -10900,7 +10946,7 @@ def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
             return "headers: a header name is not a valid HTTP header name"
         if not isinstance(value, str):
             return f"headers: the value of '{name}' must be a string"
-        if not _HTTP_HEADER_VALUE_RE.fullmatch(value):
+        if not HEADER_VALUE_RE.fullmatch(value):
             return (
                 f"headers: the value of '{name}' has a space at either end, a control character, "
                 "or a character outside ASCII"
@@ -10917,6 +10963,19 @@ def _json_object(raw: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _changed_entries(sent: Any, stored: Any) -> dict[str, Any] | None:
+    """The entries of a request's *sent* object (``headers``, ``env``) that its *stored* JSON
+    column does not hold already, or None when *sent* is not an object.
+
+    The admin form re-sends every field, so checking only these keeps a row stored before a
+    check editable.
+    """
+    if not isinstance(sent, dict):
+        return None
+    kept = _json_object(stored)
+    return {k: v for k, v in sent.items() if kept.get(k) != v}
 
 
 def _enforce_oauth_user_https(auth_type: str, url: str | None) -> JSONResponse | None:
@@ -11306,16 +11365,162 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
-            s["env"] = json.dumps({k: "***" for k in env_dict})
         except (json.JSONDecodeError, TypeError):
-            s["env"] = "{}"
+            env_dict = {}
+        # A stored value that is not an object (hand-edited rows) shows as empty.
+        s["env"] = json.dumps({k: "***" for k in env_dict} if isinstance(env_dict, dict) else {})
     if s.get("headers") and s["headers"] != "{}":
+        from turnstone.core.secret_refs import is_reference
+
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-            s["headers"] = json.dumps({k: "***" for k in hdr_dict})
         except (json.JSONDecodeError, TypeError):
-            s["headers"] = "{}"
+            hdr_dict = {}
+        # A secret:// reference is not itself a secret; it stays visible. A
+        # stored value that is not an object (hand-edited rows) shows as empty.
+        s["headers"] = json.dumps(
+            {k: (v if is_reference(v) else "***") for k, v in hdr_dict.items()}
+            if isinstance(hdr_dict, dict)
+            else {}
+        )
     return s
+
+
+async def _secret_reference_problem(value: str) -> tuple[str, int] | None:
+    """Resolve a ``secret://`` reference once, off the event loop, before it is stored.
+
+    Returns ``(message, status)`` for a reference the store rejects, so a typo
+    never reaches the database: 400 for a malformed or unconfigured reference
+    and for a definitive answer (not found, denied, missing field), 503 while
+    the store cannot answer. ``None`` means the reference resolved.
+    """
+    from turnstone.core.secret_refs import SecretError, resolve
+
+    try:
+        await asyncio.to_thread(resolve, value)
+    except SecretError as exc:
+        return str(exc), (503 if exc.retryable else 400)
+    return None
+
+
+async def _check_secret_reference(value: str) -> JSONResponse | None:
+    """JSON-response form of :func:`_secret_reference_problem`."""
+    problem = await _secret_reference_problem(value)
+    if problem is None:
+        return None
+    message, status = problem
+    return JSONResponse({"error": message}, status_code=status)
+
+
+async def _mcp_secret_fields_problem(headers: Any, env: Any) -> tuple[str, int] | None:
+    """Validate ``secret://`` use in an MCP server's headers and env before a write.
+
+    A header value is either a whole reference (resolved once here) or a
+    literal; ``Bearer secret://...`` would be sent verbatim, so it is refused.
+    stdio ``env`` takes no references at all: its values reach a child
+    process unresolved.
+    """
+    from turnstone.core.secret_refs import contains_reference_text, is_reference
+
+    if isinstance(env, dict):
+        for key, value in env.items():
+            if is_reference(value):
+                return f"env {key!r}: env does not take secret:// references", 400
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if contains_reference_text(value):
+                return (
+                    f"header {key!r}: a secret:// reference must be the whole value; "
+                    "store the complete header value (for example 'Bearer ...') in the secret",
+                    400,
+                )
+            if is_reference(value):
+                problem = await _secret_reference_problem(value)
+                if problem is not None:
+                    message, status = problem
+                    return f"header {key!r}: {message}", status
+    return None
+
+
+def _header_references(headers: Any) -> dict[str, str]:
+    """The header names of *headers* that hold a ``secret://`` reference, with the text.
+
+    A reference is not secret, and which store entry a server was pointed at is
+    the one fact an audit reader needs, so it goes into the audit row verbatim.
+    """
+    from turnstone.core.secret_refs import is_reference
+
+    if not isinstance(headers, dict):
+        return {}
+    return {str(k): v for k, v in headers.items() if is_reference(v)}
+
+
+async def _check_mcp_secret_fields(request: Request, headers: Any, env: Any) -> JSONResponse | None:
+    """JSON-response form of :func:`_mcp_secret_fields_problem`, behind the reference gate.
+
+    A header reference lets its holder read whatever the store allows and send
+    it to the server's URL, so introducing one takes ``admin.mcp`` without the
+    service-token bypass, as it does for a model definition's api_key.
+    """
+    from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import has_reference
+
+    if isinstance(headers, dict) and has_reference(headers):
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+    problem = await _mcp_secret_fields_problem(headers, env)
+    if problem is None:
+        return None
+    message, status = problem
+    return JSONResponse({"error": message}, status_code=status)
+
+
+async def _probe_model_key(value: str) -> tuple[str, JSONResponse | None]:
+    """A model's stored or submitted api_key as Detect and Re-calibrate send it, or the refusal.
+
+    :func:`turnstone.core.model_registry.probe_api_key` off the loop: a ``secret://`` reference
+    resolves, and the value follows the rule every key does, so a probe agrees with the loader.
+    """
+    from turnstone.core.model_registry import probe_api_key
+    from turnstone.core.secret_refs import SecretError
+
+    try:
+        return await asyncio.to_thread(probe_api_key, value), None
+    except SecretError as exc:
+        return "", JSONResponse({"error": str(exc)}, status_code=503 if exc.retryable else 400)
+    except HeaderValueError as exc:
+        return "", JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def _resolve_mcp_header_reference(value: str) -> tuple[str, JSONResponse | None]:
+    """An MCP header's ``secret://`` reference resolved for a connection test, or the refusal.
+
+    The store round trip runs off the loop. The caller passes references only; a model key
+    goes through :func:`_probe_model_key` instead.
+    """
+    from turnstone.core.secret_refs import SecretError, resolve
+
+    try:
+        return await asyncio.to_thread(resolve, value), None
+    except SecretError as exc:
+        return "", JSONResponse({"error": str(exc)}, status_code=503 if exc.retryable else 400)
+
+
+def _coord_registry_warning(app_state: Any) -> str:
+    """The console registry's current problem, if any, for write and reload replies.
+
+    A refused swap (``coord_registry_error``) comes first; otherwise the aliases
+    the last load recorded in ``skipped_aliases`` are named.
+    """
+    error = str(getattr(app_state, "coord_registry_error", "") or "")
+    if error:
+        return error
+    registry = getattr(app_state, "coord_registry", None)
+    skipped = getattr(registry, "skipped_aliases", None) or {}
+    if not skipped:
+        return ""
+    return "model definitions skipped on the console: " + describe_skipped(skipped)
 
 
 def _mcp_server_to_detail(
@@ -11616,6 +11821,9 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     args_list = body.get("args", [])
     headers_dict = body.get("headers", {})
     env_dict = body.get("env", {})
+    err = await _check_mcp_secret_fields(request, headers_dict, env_dict)
+    if err is not None:
+        return err
 
     # Column policy — the SAME ``_oauth_columns_to_clear`` rule the update
     # handler applies on a flip: persist only the OAuth columns the target
@@ -11666,6 +11874,8 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         return err_resp
 
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
+    if header_refs := _header_references(headers_dict):
+        audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
         if secret_set_state is not None:
@@ -11775,6 +11985,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         )
     if "env" in body:
         updates["env"] = json.dumps(body["env"]) if isinstance(body["env"], dict) else "{}"
+    # A stored reference echoed back unchanged (GET shows it verbatim) is keep-existing: only
+    # new or changed values face the gate and the store round trip.
+    changed_headers = _changed_entries(body.get("headers"), existing.get("headers"))
+    changed_env = _changed_entries(body.get("env"), existing.get("env"))
+    err = await _check_mcp_secret_fields(request, changed_headers, changed_env)
+    if err is not None:
+        return err
     if "auto_approve" in body:
         updates["auto_approve"] = bool(body["auto_approve"])
     if "enabled" in body:
@@ -11807,10 +12024,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         input_error = None
         if moved or url_after != (existing.get("url") or ""):
             input_error = _mcp_url_error(url_after)
-        if not input_error and isinstance(body.get("headers"), dict):
-            stored = _json_object(existing.get("headers"))
-            changed = {k: v for k, v in body["headers"].items() if stored.get(k) != v}
-            input_error = _mcp_headers_error(changed)
+        if not input_error and changed_headers is not None:
+            input_error = _mcp_headers_error(changed_headers)
         if input_error:
             return JSONResponse({"error": input_error}, status_code=400)
 
@@ -12073,6 +12288,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     for _secret_key in ("env", "headers"):
         if _secret_key in audit_detail:
             audit_detail[_secret_key] = "(updated)"
+    if header_refs := _header_references(body.get("headers")):
+        audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
         if secret_set_state is not None:
@@ -12487,9 +12704,10 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     connect failed. Nothing is stored and no catalog is published; the test itself is audited.
     Streamable HTTP servers with auth ``none`` or ``static`` only. The name, URL and headers get
     the checks a save gives them (:func:`_mcp_name_error`, :func:`_mcp_url_error`,
-    :func:`_mcp_headers_error`), which judge their form alone. There is no address screening:
-    the admin.mcp gate is the control here, as it is on the save that makes the console and every
-    node connect to the URL.
+    :func:`_mcp_headers_error`), which judge their form alone. A header holding a ``secret://``
+    reference also gets a save's reference checks (:func:`_check_mcp_secret_fields`), and the test
+    sends the value it names. There is no address screening: the admin.mcp gate is the control
+    here, as it is on the save that makes the console and every node connect to the URL.
     """
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
@@ -12530,13 +12748,33 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     input_error = _mcp_test_input_error(url, headers) or (_mcp_name_error(name) if name else None)
     if input_error:
         return JSONResponse({"error": input_error}, status_code=400)
+    # The test answers in time for the SDKs' read timeout; resolving references counts against it.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + probe_http_server_max_s() + _MCP_TEST_WAIT_HEADROOM_S
+    # The edit form loads a header's secret:// reference as stored. The test sends the value it
+    # names to the form's URL, so the reference gets a save's checks, the gate included, and the
+    # test connects with the value, read from the cache the check has just filled.
+    err = await _check_mcp_secret_fields(request, headers, {})
+    if err is not None:
+        return err
+    header_references = _header_references(headers)
+    headers = dict(headers)
+    for key, reference in header_references.items():
+        headers[key], err = await _resolve_mcp_header_reference(reference)
+        if err is not None:
+            return err
+    if header_references and loop.time() >= deadline:
+        # No time is left to wait for a connect, so none is started.
+        return JSONResponse(
+            {"error": "The secret store took too long to answer; the connection was not tested"},
+            status_code=503,
+        )
 
     if not _MCP_TEST_SLOTS.acquire(blocking=False):
         return JSONResponse(
             {"error": "Other connection tests are still running; try again shortly"},
             status_code=429,
         )
-    loop = asyncio.get_running_loop()
     finished: asyncio.Future[ConnectionProbe] = loop.create_future()
     context = contextvars.copy_context()  # the request's log fields, as asyncio.to_thread copies
 
@@ -12565,7 +12803,7 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
         _MCP_TEST_SLOTS.release()
         raise
     try:
-        async with asyncio.timeout(probe_http_server_max_s() + _MCP_TEST_WAIT_HEADROOM_S):
+        async with asyncio.timeout_at(deadline):
             probe = await finished
     except TimeoutError:
         message = "The connection test did not finish in time"
@@ -12582,6 +12820,8 @@ async def admin_test_mcp_server(request: Request) -> JSONResponse:
     }
     if failure is not None and failure.status is not None:
         audit_detail["status"] = failure.status
+    if header_references:
+        audit_detail["header_references"] = header_references
     audit_uid, ip = _audit_context(request)
     record_audit(storage, audit_uid, "mcp_server.test", "mcp_server", name, audit_detail, ip)
     return JSONResponse(
@@ -12799,9 +13039,19 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
     imported: list[str] = []
     skipped: list[str] = []
     errors: list[str] = []
+    header_references: dict[str, dict[str, str]] = {}
     audit_uid, ip = _audit_context(request)
     current_count = len(storage.list_mcp_servers())
     max_servers = _get_mcp_max_servers(request)
+
+    # Introducing a header reference takes admin.mcp without the service-token
+    # bypass, as on every other MCP write (see ``_check_mcp_secret_fields``).
+    if any(
+        _header_references(cfg.get("headers")) for cfg in servers.values() if isinstance(cfg, dict)
+    ):
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
 
     for srv_name, cfg in servers.items():
         srv_name = str(srv_name).strip()[:64]
@@ -12838,6 +13088,12 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             if input_error:
                 errors.append(f"{srv_name}: {input_error}")
                 continue
+        secret_problem = await _mcp_secret_fields_problem(raw_headers, raw_env)
+        if secret_problem is not None:
+            errors.append(f"{srv_name}: {secret_problem[0]}")
+            continue
+        if refs := _header_references(raw_headers):
+            header_references[srv_name] = refs
 
         server_id = uuid.uuid4().hex
         try:
@@ -12860,13 +13116,16 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             errors.append(f"{srv_name}: {exc}")
 
     if imported:
+        import_detail: dict[str, Any] = {"imported": imported, "skipped": skipped}
+        if imported_refs := {n: r for n, r in header_references.items() if n in imported}:
+            import_detail["header_references"] = imported_refs
         record_audit(
             storage,
             audit_uid,
             "mcp_server.import",
             "mcp_server",
             "",
-            {"imported": imported, "skipped": skipped},
+            import_detail,
             ip,
         )
 
@@ -13461,9 +13720,15 @@ _PROVIDER_DEFAULT_URLS: dict[str, str] = {
 
 
 def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
-    """Replace api_key with '***' (unconditional, write-only)."""
+    """Replace a literal api_key with '***' (write-only).
+
+    A ``secret://`` reference is not itself a secret: it is returned verbatim so
+    the operator can see which store entry the definition uses.
+    """
+    from turnstone.core.secret_refs import is_reference
+
     m = dict(model)
-    if m.get("api_key"):
+    if m.get("api_key") and not is_reference(m["api_key"]):
         m["api_key"] = "***"
     return m
 
@@ -13500,14 +13765,22 @@ async def _collect_model_status(
     return {nid: models for nid, models in results if models is not None}
 
 
-def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
+def _refresh_coord_registry(app_state: Any, storage: Any, *, from_timer: bool = False) -> None:
     """Serialize one strict DB snapshot load and live-registry install."""
     with _COORD_REGISTRY_REFRESH_LOCK:
-        _refresh_coord_registry_locked(app_state, storage)
+        _refresh_coord_registry_locked(app_state, storage, from_timer=from_timer)
 
 
-def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
+def _refresh_coord_registry_locked(
+    app_state: Any, storage: Any, *, from_timer: bool = False
+) -> None:
     """Rebuild ``app_state.coord_registry`` in place from DB model definitions.
+
+    *from_timer* marks the secret refresh timer's tick: it probes for a
+    context window only definitions not already detected from the same
+    endpoint, leaves the live registry alone when nothing changed, and a model
+    whose key the loader refuses (see ``model_registry._materialize_row_key``)
+    keeps the config it is running with (a Sync or a save applies the refusal).
 
     Caller holds :data:`_COORD_REGISTRY_REFRESH_LOCK` across both the strict
     snapshot load and ``ModelRegistry.reload``.  Keeping the lock outside the
@@ -13530,10 +13803,10 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
-    remains the user-facing recovery path.  Validation failures
-    (e.g. admin deleted the alias that ``registry.default`` points at)
-    leave the existing registry intact rather than tearing down a
-    working coordinator.
+    remains the user-facing recovery path.  Validation failures leave
+    the existing registry intact rather than tearing down a working
+    coordinator; a default whose model was deleted is not one of them,
+    since the default names its model whether or not it loaded (#1359).
 
     The swap runs through the chokepoint in ``ModelRegistry.reload``: a
     keyless console must not acquire dynamic aliases through a peer
@@ -13542,6 +13815,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
     :func:`_record_coord_key_refusal`.
     """
     from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.secret_refs import invalidate_cache as invalidate_secret_cache
 
     existing = getattr(app_state, "coord_registry", None)
     if existing is None:
@@ -13554,11 +13828,20 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # Without it, the loader degrades to a config.toml-only registry
         # and ``existing.reload()`` would silently drop every DB-sourced
         # alias.
+        # An operator-triggered refresh asks the secret store again, so a value
+        # rotated in the store is picked up now, not after the cache TTL.
+        invalidate_secret_cache()
         new_registry = load_model_registry(
             storage=storage,
             strict=True,
+            # Nothing loading (every row disabled or skipped) keeps the live
+            # registry, below, but must still name the aliases recorded in
+            # skipped_aliases rather than raise into a warning log.
+            allow_empty=True,
             detect_context_windows=True,
             prior=existing.models,
+            reprobe_known_windows=not from_timer,
+            keep_refused=existing.models if from_timer else None,
         )
     except ValueError as exc:
         # ModelRegistry.__init__ raises ValueError for several distinct
@@ -13571,6 +13854,31 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
     except Exception:
         log.warning("console.coord_registry_refresh_load_failed", exc_info=True)
         return
+    if not new_registry.models:
+        existing.adopt_skips(new_registry)
+        log.warning(
+            "console.coord_registry_refresh_skipped reason=no model definitions loaded skipped=%s",
+            existing.skipped_aliases,
+        )
+        return
+    if from_timer:
+        unchanged = (
+            new_registry.models == existing.models
+            and {a: c.max_concurrency for a, c in new_registry.models.items()}
+            == {a: c.max_concurrency for a, c in existing.models.items()}
+            and new_registry.default == existing.default
+            and new_registry.fallback == existing.fallback
+            and new_registry.agent_model == existing.agent_model
+            and new_registry.task_model == existing.task_model
+            and new_registry.task_effort == existing.task_effort
+        )
+        if unchanged:
+            existing.adopt_skips(new_registry)
+            try:
+                new_registry.shutdown()
+            except Exception:
+                log.warning("console.coord_registry_refresh_shutdown_failed", exc_info=True)
+            return
     try:
         existing.reload(
             new_registry.models,
@@ -13595,6 +13903,7 @@ def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
         # as the refusal arm, in the recovery direction (pinned:
         # test_refresh_clears_key_refusal_after_recovery).
         app_state.coord_registry_error = ""
+        existing.adopt_skips(new_registry)
         model_client = get_model_token_client(app_state)
         coord_mgr = getattr(app_state, "coord_mgr", None)
         if coord_mgr is not None:
@@ -13664,9 +13973,9 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         try:
             coord_registry = load_model_registry(storage=storage, detect_context_windows=True)
         except ValueError as exc:
-            # Still no usable rows (e.g. all disabled).  Surface the
-            # reason via the same channel the lifespan path uses so
-            # ``_require_coord_mgr``'s 503 message stays accurate.
+            # Still no usable rows (e.g. all disabled).  Record the
+            # reason via the same channel the lifespan path uses, for
+            # the Models tab's replies.
             app.state.coord_registry_error = str(exc)
             return
         except Exception:
@@ -13693,8 +14002,8 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
             # The "no models found" message captured at boot is
             # demonstrably stale — load_model_registry just succeeded
             # against N>0 rows.  Replace it with a builder-specific
-            # diagnosis so the dashboard's 503 banner reflects the
-            # actual cause (operators can grep logs for the type name).
+            # diagnosis so the Models tab's replies name the actual
+            # cause (operators can grep logs for the type name).
             app.state.coord_registry_error = (
                 f"Coordinator subsystem failed to initialise "
                 f"({type(exc).__name__}). See console logs and retry."
@@ -13728,6 +14037,226 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
 
     results = await asyncio.gather(*[_notify(n) for n in nodes])
     return {nid: data for nid, data in results if data is not None}
+
+
+# The routing settings that name one model and fail closed when it isn't
+# loaded (#1359). The Models tab refuses to delete, disable or rename a
+# definition one of them names: a routine swap (add a model, delete the old
+# default) would otherwise block every create that relies on the setting,
+# every new Slack conversation included, until someone repoints it.
+_FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
+    "model.default_alias",
+    "model.task_alias",
+    "coordinator.model_alias",
+    "channels.default_model_alias",
+)
+
+
+def _routing_settings_naming(storage: Any, alias: str) -> list[tuple[str, str]]:
+    """``(key, node_id)`` of each fail-closed routing setting that names *alias*.
+
+    Global and per-node rows alike, read from storage rather than a cache. A
+    row whose value won't decode names nothing.
+    """
+    from turnstone.core.settings_registry import deserialize_value
+
+    named: list[tuple[str, str]] = []
+    for row in storage.list_system_settings():
+        key = row.get("key")
+        if key not in _FAIL_CLOSED_ROUTING_KEYS:
+            continue
+        try:
+            value = deserialize_value(key, str(row.get("value") or ""))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, str) and value.strip() == alias:
+            named.append((key, str(row.get("node_id") or "")))
+    return named
+
+
+def _console_config_default() -> str:
+    """The ``[model] default`` in this console's config.toml, or ``""``."""
+    from turnstone.core.config import load_config
+
+    return str(load_config("model").get("default") or "").strip()
+
+
+def _stored_default_alias(storage: Any) -> str:
+    """The global ``model.default_alias`` value, or ``""`` (absent, cleared or unreadable)."""
+    from turnstone.core.settings_registry import deserialize_value
+
+    row = storage.get_system_setting("model.default_alias", node_id="")
+    if row is None:
+        return ""
+    try:
+        value = deserialize_value("model.default_alias", str(row.get("value") or ""))
+    except (ValueError, TypeError):
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _row_serves_chat(row: dict[str, Any]) -> bool:
+    """:func:`~turnstone.core.model_registry.serves_chat` for a stored row,
+    whose capabilities are JSON text (or ``{}`` for a node-reported entry)."""
+    from turnstone.core.model_registry import serves_chat
+
+    raw = row.get("capabilities") or "{}"
+    try:
+        caps = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        caps = {}
+    return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
+
+
+def _is_only_enabled_definition(storage: Any, definition_id: str) -> bool:
+    rows = storage.list_model_definitions(enabled_only=True)
+    return len(rows) == 1 and rows[0].get("definition_id") == definition_id
+
+
+def _model_in_use_refusal(storage: Any, alias: str, action: str) -> JSONResponse | None:
+    """The 409 for removing a model a fail-closed routing setting names, else ``None``.
+
+    *action* is the verb the message uses ("delete", "disable", "rename").
+    """
+    named = _routing_settings_naming(storage, alias)
+    sources = [f"{key} (node {node_id})" if node_id else key for key, node_id in named]
+    steps = []
+    if len(sources) == 1:
+        steps.append("Point that setting at another model, or clear it.")
+    elif sources:
+        steps.append("Point those settings at another model, or clear them.")
+    # The console's config.toml default routes while no stored default
+    # outranks it, and takes over when a stored default naming this same
+    # model is cleared.
+    stored = _stored_default_alias(storage)
+    if _console_config_default() == alias and stored in ("", alias):
+        sources.append("[model] default in the console's config.toml")
+        if stored:
+            steps.append(
+                "Clearing model.default_alias hands the default to that config.toml line, "
+                "which names it too: change the line and restart the console."
+            )
+        else:
+            steps.append("Change that config.toml line and restart the console.")
+    if not sources:
+        return None
+    return JSONResponse(
+        {
+            "error": (
+                f"'{alias}' is still named by {', '.join(sources)}. {' '.join(steps)} "
+                f"Do this before you {action} it: creates that rely on a setting naming "
+                "a missing model fail."
+            ),
+            "code": "model_in_use",
+            "settings": sorted({key for key, _ in named}),
+        },
+        status_code=409,
+    )
+
+
+def _clear_routing_settings(
+    storage: Any, named: list[tuple[str, str]], audit_uid: str, ip: str
+) -> None:
+    """Clear the routing settings naming the last enabled model as it goes.
+
+    Nothing is left to route to, so the settings would only name a missing model.
+    """
+    from turnstone.core.audit import record_audit
+
+    for key, node_id in named:
+        if storage.delete_system_setting(key, node_id=node_id):
+            record_audit(
+                storage,
+                audit_uid,
+                "setting.delete",
+                "setting",
+                key,
+                {"node_id": node_id, "reason": "last enabled model removed"},
+                ip,
+            )
+
+
+def _enabled_chat_aliases(storage: Any) -> list[str]:
+    """Aliases of the enabled stored definitions that can hold a chat
+    (:func:`_row_serves_chat`), in alias order."""
+    return [
+        str(r.get("alias") or "")
+        for r in storage.list_model_definitions(enabled_only=True)
+        if r.get("alias") and _row_serves_chat(r)
+    ]
+
+
+def _first_chat_model_pending(storage: Any) -> bool:
+    """Whether a write could give the cluster its first chat model with no
+    default stored, read before the write. The cheap checks run first, so
+    the usual state (a stored default) never lists the definitions."""
+    if storage.get_system_setting("model.default_alias", node_id="") is not None:
+        return False
+    if _console_config_default():
+        return False
+    return not _enabled_chat_aliases(storage)
+
+
+def _pin_first_chat_model(storage: Any, audit_uid: str, ip: str) -> str:
+    """Store the cluster's first chat model as its default model (#1359).
+
+    Called after an add or edit that found no enabled chat model before its
+    write. Among the enabled chat definitions (:func:`_enabled_chat_aliases`),
+    the one named ``default``, else the first in alias order, becomes
+    ``model.default_alias``, unless a global row exists, cleared or not, or this
+    console's config.toml names a default (that operator routes through
+    config). Nothing else stores it, Sync and the timers included, so a Reset in
+    the Settings tab stays reset until the cluster is left with no chat model
+    and gets one again. Nothing is pushed to the nodes: they read the setting
+    together with the model definitions it names, at a Sync or at their timer's
+    settings reload (a settings push from another change, before then, sends it
+    early). It outranks every node's config.toml default, which keeps a
+    cluster's default uniform. Returns the alias stored, or ``""``.
+    """
+    from turnstone.core.audit import record_audit
+    from turnstone.core.model_registry import pick_default_alias
+    from turnstone.core.settings_registry import serialize_value
+
+    if storage.get_system_setting("model.default_alias", node_id="") is not None:
+        return ""
+    if _console_config_default():
+        return ""
+    alias = pick_default_alias("", _enabled_chat_aliases(storage))
+    if not alias:
+        return ""
+    storage.upsert_system_setting(
+        key="model.default_alias",
+        value=serialize_value(alias),
+        node_id="",
+        changed_by=audit_uid,
+    )
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.update",
+        "setting",
+        "model.default_alias",
+        {"value": alias, "node_id": "", "reason": "first chat model added or enabled"},
+        ip,
+    )
+    log.info("console.default_model_pinned alias=%s", alias)
+    return alias
+
+
+def _pin_default_and_reload(app_state: Any, storage: Any, audit_uid: str, ip: str) -> str:
+    """:func:`_pin_first_chat_model`, best-effort; when a default was stored,
+    this console's settings cache is reloaded so its coordinators use it. A
+    failure is logged, and the add or edit that called it still stands."""
+    try:
+        alias = _pin_first_chat_model(storage, audit_uid, ip)
+    except Exception:
+        log.warning("console.default_model_pin_failed", exc_info=True)
+        return ""
+    if alias:
+        cs = getattr(app_state, "config_store", None)
+        if cs is not None:
+            cs.reload()
+    return alias
 
 
 async def admin_list_model_definitions(request: Request) -> JSONResponse:
@@ -13799,35 +14328,42 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
             }
         )
 
-    # Include the effective default alias so the UI can highlight it.
-    # Prefer ConfigStore override, fall back to config.toml [model].default,
-    # then validate against the actual enabled model list (same fallback
-    # rules as load_model_registry).
+    # Include the effective default alias so the UI can highlight it: the
+    # ``model.default_alias`` setting, else config.toml [model].default, else
+    # the rule the loader applies to the defined models (pick_default_alias).
+    # A configured default is reported even when no enabled row matches, so
+    # the tab can flag it instead of highlighting another model (#1359).
+    from turnstone.core.model_registry import pick_default_alias
+
     configured_default = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs:
-        configured_default = cs.get("model.default_alias") or ""
+        configured_default = (cs.get("model.default_alias") or "").strip()
     if not configured_default:
-        from turnstone.core.config import load_config as _load_cfg
+        configured_default = _console_config_default()
 
-        configured_default = _load_cfg().get("model", {}).get("default", "default")
-
-    enabled_aliases = [m["alias"] for m in result if m.get("alias") and m.get("enabled", True)]
-    enabled_set = set(enabled_aliases)
-    if configured_default in enabled_set:
-        default_alias = configured_default
-    elif "default" in enabled_set:
-        default_alias = "default"
-    elif enabled_aliases:
-        default_alias = enabled_aliases[0]
-    else:
-        default_alias = ""
+    chat_aliases = [
+        m["alias"]
+        for m in result
+        if m.get("alias") and m.get("enabled", True) and _row_serves_chat(m)
+    ]
+    default_alias = pick_default_alias(configured_default, chat_aliases)
 
     # Deliberately NO auth constraints here: serving the allow-list and grant
     # profile under admin.models (or to a service token via the bypass) hands
     # out the enumeration the write siblings were reordered to prevent. The
     # shelf fetches them from the admin.mcp-gated auth-constraints route.
-    return JSONResponse({"models": result, "default_alias": default_alias})
+    from turnstone.core.secret_refs import refresh_seconds
+
+    return JSONResponse(
+        {
+            "models": result,
+            "default_alias": default_alias,
+            # The admin UI clears its "Sync pending" marker once every node
+            # has had a timed reload.
+            "auto_sync_seconds": refresh_seconds(),
+        }
+    )
 
 
 async def admin_model_auth_constraints(request: Request) -> JSONResponse:
@@ -13882,6 +14418,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
 
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -13925,6 +14462,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         )
     from turnstone.core.providers import LOCAL_PROVIDERS
 
+    for field in ("base_url", "api_key"):
+        # str() would store a JSON null as the text "None"; twin of the update check.
+        if not isinstance(body.get(field, ""), str):
+            return JSONResponse({"error": f"{field} must be a string"}, status_code=400)
     base_url = str(body.get("base_url", "")).strip()
     if provider in LOCAL_PROVIDERS and not base_url:
         # Fully knowable at save time; without it the SDK client would target
@@ -13934,6 +14475,20 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"base_url is required for provider {provider!r}"}, status_code=400
         )
     api_key = str(body.get("api_key", "")).strip()
+    # The loader's own check, so a definition saved here is one it would load.
+    placeholder_error = stored_definition_error({"api_key": api_key, "base_url": base_url})
+    if placeholder_error:
+        return JSONResponse({"error": placeholder_error}, status_code=400)
+    if is_secret_reference(api_key):
+        # A reference lets its holder read whatever the store's role allows and
+        # send it to the definition's endpoint: the same capability-widening
+        # choice as a dynamic auth mode, gated the same way.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+        err = await _check_secret_reference(api_key)
+        if err is not None:
+            return err
     ctx_raw = body.get("context_window", 0)  # omitted = auto-detect
     # json admits NaN/Infinity literals, which pass the isinstance check but
     # crash int(); refuse non-finite floats as invalid values instead.
@@ -14037,6 +14592,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if dynamic_auth_error is not None:
         return dynamic_auth_error
 
+    # Read before the write: the cluster's first chat model becomes its stored
+    # default (#1359).
+    could_pin = _first_chat_model_pending(storage)
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -14063,6 +14621,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # capability-escalating choice, so the audit trail must cover the request
     # that INTRODUCES it, not only later edits.
     audit_detail: dict[str, Any] = {"alias": alias}
+    if is_secret_reference(api_key):
+        # Not a secret, and the one fact a later reader needs: which store
+        # entry this definition was pointed at.
+        audit_detail["api_key"] = api_key
     if auth_mode != "static":
         audit_detail["auth_mode"] = auth_mode
         audit_detail["obo_audience"] = obo_audience
@@ -14077,18 +14639,25 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         audit_detail,
         ip,
     )
-
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     # First-row bootstrap on a freshly-installed console: a runtime-added
     # model promotes the coord subsystem from "not initialized" to ready
     # without a console restart.  No-op when already built.
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     await asyncio.to_thread(_ensure_console_mcp_client, request.app)
+    # After the refresh, so this console has loaded the model before its
+    # coordinators route to it.
+    pinned = ""
+    if could_pin:
+        pinned = await asyncio.to_thread(
+            _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+        )
     _emit_models_changed(request)
-    # Same refused-swap surfacing as the update twin (see its comment): the
-    # row is stored, but a keyless console's live registry may have refused
-    # to adopt it, so the shelf warns instead of toasting success.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    # Same surfacing as the update twin (see its comment): the row is stored,
+    # but a keyless console's live registry may have refused to adopt it, or
+    # its load skipped stored definitions, so the shelf warns instead of
+    # toasting success.
+    registry_warning = _coord_registry_warning(request.app.state)
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -14097,6 +14666,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             status_code=409,
         )
     payload = _mask_model_secrets(created)
+    if pinned:
+        payload["default_pinned"] = pinned
     if registry_warning:
         payload["registry_warning"] = registry_warning
     return JSONResponse(payload)
@@ -14126,6 +14697,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/model-definitions/{definition_id}."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -14173,6 +14745,19 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
                 status_code=400,
             )
         updates["provider"] = prov
+    for field in ("base_url", "api_key"):
+        # str() would store a JSON null as the text "None"; twin of the create check.
+        if not isinstance(body.get(field, ""), str):
+            return JSONResponse({"error": f"{field} must be a string"}, status_code=400)
+    # The loader's own check, run before any gate as in the create twin. A value
+    # echoing the stored one is refused too: the loader skips such a row, so a
+    # form save names what to fix instead of storing it again. "", "***" and an
+    # echoed reference pass, as the key branch below keeps the stored key for them.
+    placeholder_error = stored_definition_error(
+        {field: body[field].strip() for field in ("api_key", "base_url") if field in body}
+    )
+    if placeholder_error:
+        return JSONResponse({"error": placeholder_error}, status_code=400)
     if "base_url" in body:
         updates["base_url"] = str(body["base_url"]).strip()
     if "provider" in body or "base_url" in body:
@@ -14196,8 +14781,23 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             )
     if "api_key" in body:
         api_key = str(body["api_key"]).strip()
-        # Sentinel "***" or empty string means "keep existing"
-        if api_key and api_key != "***":
+        # Sentinel "***" or empty string means "keep existing"; so does the
+        # stored reference echoed back unchanged (GET shows it verbatim, and
+        # a read-modify-write client sends it back). A literal is written
+        # whether or not it changed, as it always was.
+        echoed_reference = is_secret_reference(api_key) and api_key == str(
+            existing.get("api_key") or ""
+        )
+        if api_key and api_key != "***" and not echoed_reference:
+            if is_secret_reference(api_key):
+                # Same gate as the create twin: a reference widens what this
+                # definition can send to its endpoint.
+                err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+                if err:
+                    return err
+                err = await _check_secret_reference(api_key)
+                if err is not None:
+                    return err
             updates["api_key"] = api_key
     if "context_window" in body:
         ctx_raw = body["context_window"]
@@ -14352,7 +14952,34 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         if dynamic_auth_error is not None:
             return dynamic_auth_error
 
+    # A model a fail-closed routing setting names can't be renamed or disabled
+    # out from under it (#1359). Disabling the last enabled model is allowed:
+    # nothing is left to route to, and the settings naming it are cleared.
+    existing_alias = str(existing.get("alias") or "")
+    clear_after_update: list[tuple[str, str]] = []
+    if existing.get("enabled", True):
+        renaming = "alias" in updates and updates["alias"] != existing_alias
+        disabling = updates.get("enabled") is False
+        if disabling and _is_only_enabled_definition(storage, definition_id):
+            clear_after_update = _routing_settings_naming(storage, existing_alias)
+        elif renaming or disabling:
+            refusal = _model_in_use_refusal(
+                storage, existing_alias, "rename" if renaming else "disable"
+            )
+            if refusal is not None:
+                return refusal
+
+    could_pin = False
     if updates:
+        # Read before the write: an edit that leaves this row an enabled chat
+        # model (enabling one, say), on a cluster that had none, stores it as
+        # the default. The row's after-state decides, as the pin does.
+        after = {**existing, **updates}
+        could_pin = (
+            bool(after.get("enabled", True))
+            and _row_serves_chat(after)
+            and _first_chat_model_pending(storage)
+        )
         storage.update_model_definition(definition_id, **updates)
         old_alias = str(existing.get("alias") or "")
         alias_changed = "alias" in updates and updates["alias"] != old_alias
@@ -14367,7 +14994,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
-    if "api_key" in audit_detail:
+    if "api_key" in audit_detail and not is_secret_reference(audit_detail["api_key"]):
         audit_detail["api_key"] = "(updated)"
     if gate.auth_config_changed:
         # Make the gate decision reconstructable from the audit row alone.
@@ -14389,24 +15016,34 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         audit_detail,
         ip,
     )
-
-    registry_warning = ""
+    if clear_after_update:
+        _clear_routing_settings(storage, clear_after_update, audit_uid, ip)
+        await _publish_config_change(request)
+    pinned = ""
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
         await asyncio.to_thread(_ensure_console_mcp_client, request.app)
+        # After the refresh, as on create.
+        if could_pin:
+            pinned = await asyncio.to_thread(
+                _pin_default_and_reload, request.app.state, storage, audit_uid, ip
+            )
         _emit_models_changed(request)
-        # The DB write is committed either way, but THIS console's live
-        # registry swap may have been refused (keyless host + dynamic rows).
-        # The refresh's refusal arm records ``coord_registry_error`` and its
-        # success arm clears it, so a non-empty value here means the running
-        # coordinator did NOT adopt this write. With the subsystem UP the 503
-        # remediation path never renders, so surfacing it on the response is
-        # the only evidence the shelf can show.
-        registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+
+    # Read outside the block: a save that changed nothing still reports the console's standing
+    # problem. The DB write is committed either way, but THIS console's live registry swap may
+    # have been refused (keyless host + dynamic rows), or its load may have skipped stored
+    # definitions. The refresh's refusal arm records ``coord_registry_error`` and its success arm
+    # clears it; the warning names that refusal first, else the skipped aliases. With the
+    # subsystem UP the 503 remediation path never renders, so surfacing it on the response is the
+    # only evidence the shelf can show.
+    registry_warning = _coord_registry_warning(request.app.state)
 
     model_def = storage.get_model_definition(definition_id)
     payload = _mask_model_secrets(model_def or {})
+    if pinned:
+        payload["default_pinned"] = pinned
     if registry_warning:
         payload["registry_warning"] = registry_warning
     return JSONResponse(payload)
@@ -14430,6 +15067,19 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "Model definition not found"}, status_code=404)
 
+    # A model a fail-closed routing setting names can't be deleted out from
+    # under it (#1359), unless it is the last enabled model: then nothing is
+    # left to route to, and the settings naming it are cleared with it.
+    existing_alias = str(existing.get("alias") or "")
+    clear_after_delete: list[tuple[str, str]] = []
+    if existing.get("enabled", True):
+        if _is_only_enabled_definition(storage, definition_id):
+            clear_after_delete = _routing_settings_naming(storage, existing_alias)
+        else:
+            refusal = _model_in_use_refusal(storage, existing_alias, "delete")
+            if refusal is not None:
+                return refusal
+
     # Purge the definition's mint-cache rows before the row goes away —
     # after the delete, nothing owns the alias's identity keys and their
     # encrypted bearers would persist at rest until another definition
@@ -14448,15 +15098,19 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
         {"alias": existing.get("alias", "")},
         ip,
     )
+    if clear_after_delete:
+        _clear_routing_settings(storage, clear_after_delete, audit_uid, ip)
+        await _publish_config_change(request)
 
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
-    # Same refused-swap surfacing as the create/update twins: the row is gone
-    # from the DB, but a keyless console's refused swap keeps SERVING the
-    # deleted alias to running and new coordinator sessions.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    # Same surfacing as the create/update twins: the row is gone from the DB,
+    # but a keyless console's refused swap keeps SERVING the deleted alias to
+    # running and new coordinator sessions; the warning also names the stored
+    # definitions the console's last load skipped.
+    registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
     if registry_warning:
         payload["registry_warning"] = registry_warning
@@ -14475,24 +15129,32 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     if err:
         return err
 
-    # Ensure config (including model.default_alias) is fresh on all nodes
-    # before they rebuild their model registries.
-    await _publish_config_change(request)
-
     # Refresh the console's own coord_registry first.  The node fan-out
     # below carries DB→nodes propagation; the console hosts coordinator
     # sessions itself and must mutate its in-process registry too —
     # otherwise the coord LLM keeps calling the prior model name even
     # after a successful reload.
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
+    # This console's own settings next: after its registry refresh, so its
+    # coordinators route to a stored default only once this console has loaded
+    # the model, and before the bootstrap and models_changed, so a setting
+    # another console wrote is read here first.
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        config_store.reload()
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
+    # Each node reloads its settings with the model definitions (after a
+    # successful load, before the swap), so a stored default arrives with the
+    # model it names; pushing the settings first switched nodes to a model they
+    # hadn't loaded yet (#1359). The push follows, for a node whose load failed.
     results = await _notify_nodes_model_reload(request)
+    await _publish_config_change(request)
     # This route's whole purpose is "make the live registry match the DB", so
-    # a refused console swap is the one outcome it must not report as
-    # unqualified success. Same surfacing as the create/update twins.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    # a refused console swap, or a load that skipped stored definitions, must
+    # not read as unqualified success. Same surfacing as the create/update twins.
+    registry_warning = _coord_registry_warning(request.app.state)
     payload: dict[str, Any] = {"status": "ok", "results": results}
     if registry_warning:
         payload["registry_warning"] = registry_warning
@@ -14537,6 +15199,7 @@ async def admin_detect_model(request: Request) -> JSONResponse:
 
     from turnstone.core.auth import require_permission
     from turnstone.core.model_registry import probe_model_endpoint
+    from turnstone.core.secret_refs import is_reference as is_secret_reference
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -14581,6 +15244,14 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
+    if is_secret_reference(api_key):
+        # A typed reference is resolved with the console's store role and sent
+        # to the base_url in this same body: the gate a save would apply. A
+        # stored reference (below) was introduced through that gate already.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+
     # Resolve api_key from DB when the UI sends the masked sentinel
     if (not api_key or api_key == "***") and definition_id:
         row = storage.get_model_definition(definition_id)
@@ -14595,6 +15266,11 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 # cleared field must probe unscoped, exactly as the save that
                 # follows will run.
                 workspace_id = _stored_workspace_id(row, provider)
+
+    # A secret:// reference (stored or submitted) resolves here, off the loop.
+    api_key, key_err = await _probe_model_key(api_key)
+    if key_err is not None:
+        return key_err
 
     # Reranker endpoints speak the Cohere/Jina ``POST <url>`` protocol, not
     # ``/v1/models`` — their base_url is the full rerank path, which the OpenAI
@@ -14742,6 +15418,9 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     instruction = _global_rerank_instruction(request.app.state)
+    stored_key, key_err = await _probe_model_key(str(existing.get("api_key") or ""))
+    if key_err is not None:
+        return key_err
     loop = asyncio.get_running_loop()
     try:
         async with asyncio.timeout(90):
@@ -14750,7 +15429,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
                 _run_rerank_calibration,
                 base_url,
                 str(existing.get("model") or ""),
-                str(existing.get("api_key") or ""),
+                stored_key,
                 instruction,
             )
     except TimeoutError:
@@ -14856,10 +15535,10 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     _emit_models_changed(request)
 
-    # Same refused-swap surfacing as the create/update twins: the
-    # calibration is stored, but a keyless console's live registry may
-    # have refused to adopt it.
-    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    # Same surfacing as the create/update twins: the calibration is stored,
+    # but a keyless console's live registry may have refused to adopt it, or
+    # its load skipped stored definitions.
+    registry_warning = _coord_registry_warning(request.app.state)
     payload = {
         "separated": cal.separated,
         "suggested_threshold": cal.suggested_threshold,
@@ -14877,7 +15556,7 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
 async def admin_model_capabilities(request: Request) -> JSONResponse:
     """GET /v1/api/admin/model-capabilities — static capability lookup."""
     from turnstone.core.auth import require_permission
-    from turnstone.core.providers import lookup_model_capabilities
+    from turnstone.core.providers import lookup_model_capabilities, static_model_capabilities
 
     err = require_permission(request, "admin.models")
     if err:
@@ -14892,12 +15571,17 @@ async def admin_model_capabilities(request: Request) -> JSONResponse:
         return JSONResponse({"error": "model is required"}, status_code=400)
 
     caps = lookup_model_capabilities(provider, model)
+    # An id with no row still runs on the provider's default row: return that
+    # row for display, while ``known`` stays false so the form fills nothing in
+    # from it.
+    defaults = static_model_capabilities(provider, model) if caps is None else None
     return JSONResponse(
         {
             "model": model,
             "provider": provider,
             "known": caps is not None,
             "capabilities": caps or {},
+            "defaults": defaults or {},
         }
     )
 
@@ -16889,6 +17573,7 @@ def create_app(
         # ``sse_executor_lookup`` wiring on ``interactive_endpoint_config``
         # in ``turnstone/server.py``.
         sse_executor_lookup=lambda request: request.app.state.coord_sse_executor,
+        model_wording=COORDINATOR_MODEL_WORDING,
     )
     # Minimal interactive cfg used ONLY by the unified saved-list handler
     # so the console's L-shell dashboard can show a single saved list

@@ -1118,13 +1118,14 @@ def resolve_doctor_brain(
     if storage is None:
         return None, BackendVerdict(False, f"storage unreachable: {storage_err}")
 
+    # Bound before the try: the loader can raise past its own skip handling.
+    skipped: dict[str, str] = {}
     try:
         from turnstone.core.config import load_config, set_config_path
         from turnstone.core.config_store import ConfigStore
         from turnstone.core.model_registry import load_model_registry
 
         cs = ConfigStore(storage=storage, node_id="")
-        alias = str(cs.get("model.default_alias", "") or "")
         # The same sources a node uses — DB definitions overlaid with
         # config.toml [models.*] — and nothing else: a node has no bootstrap
         # endpoint, so doctor must not invent one from [api] or the env. When
@@ -1140,9 +1141,25 @@ def resolve_doctor_brain(
         registry = load_model_registry(
             storage=storage, allow_empty=True, detect_context_windows=True
         )
-        client, model_name, cfg, _ = registry.resolve(alias or None)
+        skipped = registry.skipped_aliases
+        # The default a node uses: the setting, else the loader's pick, which
+        # names the configured model even when it isn't loaded (#1359).
+        client, model_name, cfg, _ = registry.resolve(registry.effective_default(cs))
     except Exception as exc:  # noqa: BLE001 - any failure means "no usable model"
-        return None, BackendVerdict(False, f"no usable model configured: {exc}")
+        from turnstone.core.model_registry import UnknownModelAliasError, describe_skipped
+
+        if isinstance(exc, UnknownModelAliasError):
+            # An empty alias: no chat model is defined, so there is no default.
+            missing = f"the default model '{exc.alias}' isn't loaded" if exc.alias else ""
+            detail = f"no usable model configured: {missing or 'no default chat model'}"
+        else:
+            detail = f"no usable model configured: {exc}"
+        if skipped:
+            # Named here rather than left to the loader's no-model error: the
+            # configured default can be skipped while other aliases load, and
+            # that error never reports it.
+            detail += "; skipped: " + describe_skipped(skipped)
+        return None, BackendVerdict(False, detail)
 
     fam = family_of(cfg.provider)
     if fam is None:
@@ -1340,7 +1357,14 @@ TOOLS: list[dict[str, Any]] = [
                         "description": "openai | anthropic | openai-compatible | google | xai.",
                     },
                     "base_url": {"type": "string", "description": "Endpoint base URL."},
-                    "api_key": {"type": "string", "description": "Optional API key."},
+                    "api_key": {
+                        "type": "string",
+                        "description": (
+                            "Optional API key. Without one a placeholder key is sent, never the "
+                            "machine's own, so a server that requires a key rejects the probe: "
+                            "that says nothing about the configured key."
+                        ),
+                    },
                     "model": {"type": "string", "description": "Optional model id to look for."},
                 },
                 "required": ["provider", "base_url"],
@@ -1555,10 +1579,20 @@ def _tool_http_health(args: dict[str, Any]) -> str:
 
 def _tool_check_llm_backend(args: dict[str, Any]) -> str:
     from turnstone.core.model_registry import probe_model_endpoint
+    from turnstone.core.providers import LOCAL_PLACEHOLDER_API_KEY
 
     provider = str(args.get("provider", "openai"))
     base_url = str(args.get("base_url", ""))
-    api_key = str(args.get("api_key", ""))
+    # The model chooses this host, so an empty key gets the placeholder rather than letting the
+    # provider SDK send the operator's own key variable there.
+    given_key = str(args.get("api_key", ""))
+    api_key = given_key or LOCAL_PLACEHOLDER_API_KEY
+    key_note = (
+        ""
+        if given_key
+        else "no api_key given: a placeholder key was sent, so an authentication error here "
+        "says nothing about the configured key"
+    )
     model = str(args.get("model", ""))
     # Same scheme / metadata-host guard as http_health: this URL is model-supplied
     # too, so refuse file:// and the cloud metadata endpoint before any request.
@@ -1569,7 +1603,9 @@ def _tool_check_llm_backend(args: dict[str, Any]) -> str:
     try:
         res = probe_model_endpoint(provider, base_url, api_key, target_model=model)
     except Exception as exc:  # noqa: BLE001 - report any probe failure to the model
-        return f"Error probing {base_url}: {exc}"
+        return f"Error probing {base_url}: {exc}" + (f" ({key_note})" if key_note else "")
+    if key_note:
+        res = {"key_note": key_note, **res}  # first, so the 4000-character cut keeps it
     return json.dumps(res, default=str)[:4000]
 
 
@@ -1941,12 +1977,25 @@ class _DoctorLLM:
 # ---------------------------------------------------------------------------
 
 
+def _env_api_key(env_var: str) -> str:
+    """*env_var*'s key, by the rule every model key follows; ``""`` when unset or refused.
+
+    A refused value is not offered, so the key prompt runs; the reason is printed, never the value.
+    """
+    from turnstone.core.http_headers import HeaderValueError, checked_header_value
+
+    try:
+        return checked_header_value(os.environ.get(env_var, ""), f"${env_var}")
+    except HeaderValueError as exc:
+        print(f"\n {YELLOW}{exc}{RESET}")
+        return ""
+
+
 def _prompt_api_key(env_var: str, label: str) -> str:
     """Prompt for an API key, checking the env var first."""
-    env_val = os.environ.get(env_var, "")
+    env_val = _env_api_key(env_var)
     if env_val:
-        prefix = env_val[:4] + "..." if len(env_val) > 4 else env_val
-        print(f"\n Found {CYAN}${env_var}{RESET} in environment ({DIM}{prefix}{RESET})")
+        print(f"\n Found {CYAN}${env_var}{RESET} in environment")
         try:
             use_env = input(f" Use it? {BOLD}[Y/n]{RESET} ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -2015,7 +2064,7 @@ def _setup_local() -> tuple[str, Any, str]:
         print("\nCancelled.")
         sys.exit(0)
 
-    env_key = os.environ.get("OPENAI_API_KEY", "")
+    env_key = _env_api_key("OPENAI_API_KEY")
     if env_key:
         api_key = env_key
         print(f" Using {CYAN}$OPENAI_API_KEY{RESET} from environment.")

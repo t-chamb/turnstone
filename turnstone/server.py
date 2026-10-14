@@ -1637,30 +1637,19 @@ async def list_available_models(request: Request) -> JSONResponse:
                 "capabilities": cfg.capabilities,
             }
         )
-    # Include effective defaults for clients (web UI, channel gateway).
+    # Include effective defaults for clients (web UI, channel gateway). The
+    # default and channel aliases are reported as configured even when their
+    # model isn't loaded here: a create that relies on one fails with
+    # ``model_not_loaded`` rather than moving to another model (#1359), and the
+    # pickers label it as not available instead of hiding it.
     cs = getattr(request.app.state, "config_store", None)
-    default_alias = ""
+    default_alias = registry.effective_default(cs)
     channel_default_alias = ""
     judge_default_alias = ""
     if cs is not None:
-        default_alias = cs.get("model.default_alias") or ""
-        channel_default_alias = cs.get("channels.default_model_alias") or ""
+        channel_default_alias = (cs.get("channels.default_model_alias") or "").strip()
         judge_default_alias = (cs.get("judge.model") or "").strip()
-    # Mirror session_factory's ``_effective_default_alias`` (and
-    # ``_effective_routing``): a ``model.default_alias`` that's unset — or
-    # names an alias absent from THIS server's registry — falls back to
-    # ``registry.default``, which is the model a new workstream actually
-    # launches on.  Reporting "" here made the dashboard show a bare
-    # "Default model" placeholder even though creation has a concrete default
-    # (e.g. when the shared ConfigStore points at a console-only alias).
     enabled_aliases = set(registry.list_aliases())
-    if default_alias not in enabled_aliases:
-        default_alias = registry.default
-    # Defensive: only blank if even registry.default is unknown/disabled.
-    if default_alias and default_alias not in enabled_aliases:
-        default_alias = ""
-    if channel_default_alias and channel_default_alias not in enabled_aliases:
-        channel_default_alias = ""
     # ``judge.model`` is alias-only.  When unset — or pointing at a
     # disabled/removed alias — the judge inherits the per-workstream agent
     # model at runtime (see session_factory: ``judge_config.model or
@@ -2018,6 +2007,32 @@ def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     return counts
 
 
+def _health_summary(app_state: Any) -> dict[str, Any]:
+    """The node's health verdict: degraded when its default model's backend is
+    down, or when the default model isn't loaded, so every create relying on it
+    fails (#1359).
+
+    The one derivation behind ``/health``, the global snapshot and every
+    ``health_changed`` event, so the console shows the node's own verdict.
+    """
+    health_reg = getattr(app_state, "health_registry", None)
+    registry = getattr(app_state, "registry", None)
+    alias = ""
+    loaded = False
+    tracker = None
+    if registry is not None:
+        alias = str(registry.effective_default(getattr(app_state, "config_store", None)) or "")
+        loaded = bool(alias) and bool(registry.has_alias(alias))
+        if health_reg and loaded:
+            tracker = health_reg.get_tracker_for_alias(registry, alias)
+    backend_ok = tracker.is_healthy if tracker else True
+    return {
+        "status": "ok" if backend_ok and loaded else "degraded",
+        "backend": {"status": "up" if backend_ok else "down"},
+        "default_model": {"alias": alias, "loaded": loaded},
+    }
+
+
 def _build_health_dict(app_state: Any) -> dict[str, Any]:
     """Assemble health status dict from app state.
 
@@ -2026,31 +2041,17 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
     mgr: SessionManager = app_state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
-    health_reg = getattr(app_state, "health_registry", None)
-    registry = getattr(app_state, "registry", None)
-    tracker = None
-    if health_reg and registry:
-        # Prefer ConfigStore runtime override, fall back to registry default
-        config_store = getattr(app_state, "config_store", None)
-        effective_alias = None
-        if config_store:
-            effective_alias = config_store.get("model.default_alias") or None
-        if effective_alias:
-            tracker = health_reg.get_tracker_for_alias(registry, effective_alias)
-        if tracker is None:
-            tracker = health_reg.get_tracker_for_alias(registry, registry.default)
-    backend_ok = tracker.is_healthy if tracker else True
+    summary = _health_summary(app_state)
     data: dict[str, Any] = {
-        "status": "ok" if backend_ok else "degraded",
+        "status": summary["status"],
         "version": __version__,
         "node_id": getattr(app_state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
         "max_ws": mgr.max_active,
         "workstreams": {"total": len(wss), **states},
-        "backend": {
-            "status": "up" if backend_ok else "down",
-        },
+        "backend": summary["backend"],
+        "default_model": summary["default_model"],
     }
     mc = getattr(app_state, "mcp_client", None)
     if mc:
@@ -4552,22 +4553,12 @@ def config_reload(request: Request) -> JSONResponse:
     gq = getattr(request.app.state, "global_queue", None)
     if not cs:
         return JSONResponse({"status": "noop"})
+    # The routing settings (model.default_alias, model.task_alias, ...) are read
+    # where they are used (ModelRegistry.effective_default and friends), so the
+    # fresh cache is all a settings change needs on this node.
     cs.reload()
-    # Apply routing overrides to the live registry — admin settings updates
-    # fan out via this endpoint and would otherwise not affect task
-    # routing until a model-reload or restart.
-    registry = getattr(request.app.state, "registry", None)
-    if registry is not None:
-        from turnstone.core.model_registry import DynamicAuthKeyError
-
-        try:
-            _apply_routing_overrides(registry, cs, request.app.state)
-        except DynamicAuthKeyError as exc:
-            # Latent today — a live registry with dynamic aliases implies the
-            # key was present at install — but this endpoint reaches
-            # ModelRegistry.reload with real app state, and complete
-            # mediation is only complete if every caller handles the refusal.
-            return _model_auth_key_refusal_response(exc)
+    # A changed default can name a model this node hasn't loaded.
+    _send_health(request.app.state, gq)
     # Broadcast settings_changed event to all connected clients
     if gq is not None:
         with contextlib.suppress(queue.Full):
@@ -4736,38 +4727,6 @@ def internal_mcp_reconnect_one(request: Request) -> JSONResponse:
 # -- internal model management -----------------------------------------------
 
 
-def _effective_routing(
-    cs: Any,
-    base_models: dict[str, Any],
-    base_default: str,
-    base_task_model: str | None,
-    base_task_effort: str | None,
-) -> tuple[str, str | None, str | None]:
-    """Compute (default, task_model, task_effort) after layering ConfigStore
-    overrides on top of the supplied base values.
-
-    Aliases require existence in *base_models* (silently dropped otherwise);
-    effort values were validated against SettingDef choices on write, so a
-    truthiness check is sufficient at apply time.
-
-    Returns the base values unchanged when *cs* is None.
-    """
-    eff_default = base_default
-    eff_task_model = base_task_model
-    eff_task_effort = base_task_effort
-    if cs is not None:
-        cs_default = cs.get("model.default_alias")
-        if cs_default and cs_default in base_models:
-            eff_default = cs_default
-        cs_task_alias = cs.get("model.task_alias")
-        if cs_task_alias and cs_task_alias in base_models:
-            eff_task_model = cs_task_alias
-        cs_task_effort = cs.get("model.task_effort")
-        if cs_task_effort:
-            eff_task_effort = cs_task_effort
-    return eff_default, eff_task_model, eff_task_effort
-
-
 def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
     """Tell every active session on this node to re-render its task_agent
     tool description.  Best-effort: a session that lacks the
@@ -4793,49 +4752,6 @@ def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
             refresh()
 
 
-def _apply_routing_overrides(registry: Any, cs: Any, app_state: Any) -> bool:
-    """Apply ConfigStore routing overrides to a live *registry* in place.
-
-    Used by the startup path and by ``config_reload`` (admin settings
-    update fan-out) — both keep the existing model definitions and only
-    rewrite routing fields.  Returns True when a reload happened.
-
-    ``app_state`` feeds the swap chokepoint in ``ModelRegistry.reload``: the
-    startup caller runs before the app exists and passes
-    ``KEY_GUARD_DEFERRED_TO_LIFESPAN``, the endpoint caller passes the real
-    state. Same-models swaps make the guard vacuous, but routing every swap
-    through the chokepoint means no site needs that reasoning (complete
-    mediation).
-    """
-    if not registry.models:
-        # Degraded (empty) registry — no aliases to route to yet. Routing
-        # overrides take effect once models are added (internal_model_reload).
-        return False
-    eff = _effective_routing(
-        cs,
-        registry.models,
-        registry.default,
-        registry.task_model,
-        registry.task_effort,
-    )
-    if (
-        eff[0] != registry.default
-        or eff[1] != registry.task_model
-        or eff[2] != registry.task_effort
-    ):
-        registry.reload(
-            registry.models,
-            eff[0],
-            registry.fallback,
-            registry.agent_model,
-            app_state=app_state,
-            task_model=eff[1],
-            task_effort=eff[2],
-        )
-        return True
-    return False
-
-
 # Serialises hot-reloads on this node. A reload may probe model endpoints for
 # several seconds; two overlapping console fan-outs would otherwise race to
 # install their snapshots and the older one could land last.
@@ -4845,10 +4761,44 @@ _MODEL_RELOAD_LOCK = threading.Lock()
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
     with _MODEL_RELOAD_LOCK:
-        return _internal_model_reload_locked(request)
+        response = _reload_model_registry_locked(request.app.state)
+    _send_health(request.app.state)
+    return response
 
 
-def _internal_model_reload_locked(request: Request) -> JSONResponse:
+def _refresh_models_from_store(app_state: Any) -> None:
+    """One tick of the secret refresh timer: the reload Sync to Nodes runs.
+
+    Runs while ``[secrets]`` configures a store, so a value rotated there, and
+    any model definition saved since, reach this node within the interval.
+    See :func:`_reload_model_registry_locked` for what a tick leaves out.
+    """
+    with _MODEL_RELOAD_LOCK:
+        response = _reload_model_registry_locked(app_state, from_timer=True)
+    _send_health(app_state)
+    if response.status_code != 200:
+        log.warning(
+            "server.model_refresh_failed",
+            status=response.status_code,
+            reply=bytes(response.body).decode("utf-8", "replace")[:300],
+        )
+
+
+def _reload_model_registry_locked(app_state: Any, *, from_timer: bool = False) -> JSONResponse:
+    """Rebuild the node's registry from the database and config.toml; hold ``_MODEL_RELOAD_LOCK``.
+
+    *from_timer* marks the secret refresh timer's tick, which differs from an
+    operator's Sync in three ways: it probes for a context window only the
+    definitions whose window is not already detected from the same endpoint
+    (a new or changed one), it reloads the settings only when they changed (so
+    a quiet tick leaves every settings snapshot current), and a model whose
+    key the loader refuses (see ``model_registry._materialize_row_key``) keeps
+    the config it is running with, so a refusal neither takes models away nor
+    moves the default while everything else the tick finds is applied; Sync
+    applies the refusal. The tick reads the settings so the cluster's stored
+    default reaches the node together with the model definitions it names:
+    on a secret-store cluster nobody may ever press Sync (#1359).
+    """
     from turnstone.core.model_registry import (
         DynamicAuthKeyError,
         ModelAuthConfigError,
@@ -4857,11 +4807,16 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
     )
     from turnstone.core.storage._registry import get_storage
 
-    registry = getattr(request.app.state, "registry", None)
+    registry = getattr(app_state, "registry", None)
     if registry is None:
         return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
 
     storage = get_storage()
+    # An operator-triggered reload asks the secret store again, so a value
+    # rotated in the store is picked up by this Sync, not after the cache TTL.
+    from turnstone.core.secret_refs import invalidate_cache
+
+    invalidate_cache()
     try:
         new_registry = load_model_registry(
             storage=storage,
@@ -4873,9 +4828,11 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
             # alias — the same posture as the console's refresh.
             strict=True,
             detect_context_windows=True,
-            # A definition the running registry already resolved keeps its
-            # window; only new or changed definitions are probed.
+            # A probe that misses keeps the window the running registry
+            # detected from the same endpoint; a tick does not re-probe those.
             prior=registry.models,
+            reprobe_known_windows=not from_timer,
+            keep_refused=registry.models if from_timer else None,
         )
     except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
         # A row whose auth or concurrency fields violate registry validation,
@@ -4896,25 +4853,14 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
             },
             status_code=503,
         )
-    cs = getattr(request.app.state, "config_store", None)
+    cs = getattr(app_state, "config_store", None)
     if cs is not None:
-        cs.reload()  # Ensure latest settings from DB
-    eff_default, eff_task_model, eff_task_effort = _effective_routing(
-        cs,
-        new_registry.models,
-        new_registry.default,
-        new_registry.task_model,
-        new_registry.task_effort,
-    )
-    if eff_default != new_registry.default:
-        log.info(
-            "ConfigStore override: using '%s' as default model (registry had '%s')",
-            eff_default,
-            new_registry.default,
-        )
+        cs.reload(if_changed=from_timer)  # Ensure latest settings from DB
 
     # No-op fast path: skip reload when nothing changed (avoids client churn
-    # on broadcast model-reloads where this node has no pending changes).
+    # on broadcast model-reloads where this node has no pending changes). The
+    # routing fields hold the loader's values; the settings apply where they
+    # are read (ModelRegistry.effective_default and friends).
     admission_unchanged = {
         alias: cfg.max_concurrency for alias, cfg in new_registry.models.items()
     } == {alias: cfg.max_concurrency for alias, cfg in registry.models.items()}
@@ -4923,24 +4869,34 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
         and admission_unchanged
         and new_registry.fallback == registry.fallback
         and new_registry.agent_model == registry.agent_model
-        and eff_default == registry.default
-        and eff_task_model == registry.task_model
-        and eff_task_effort == registry.task_effort
+        and new_registry.default == registry.default
+        and new_registry.task_model == registry.task_model
+        and new_registry.task_effort == registry.task_effort
     )
+    # Aliases the loader recorded in skipped_aliases ride every reply, so the
+    # console's Sync result names them per node.
+    skipped = dict(new_registry.skipped_aliases)
     if unchanged:
+        # The skip record can change while the models don't (a reason's text);
+        # keep it current for the sessions that name it (unavailable_reason).
+        registry.adopt_skips(new_registry)
         new_registry.shutdown()
-        return JSONResponse({"status": "ok", "aliases": registry.list_aliases(), "noop": True})
+        payload: dict[str, Any] = {"status": "ok", "aliases": registry.list_aliases(), "noop": True}
+        if skipped:
+            payload["skipped"] = skipped
+        return JSONResponse(payload)
 
     try:
         registry.reload(
             new_registry.models,
-            eff_default,
+            new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
-            app_state=request.app.state,
-            task_model=eff_task_model,
-            task_effort=eff_task_effort,
+            app_state=app_state,
+            task_model=new_registry.task_model,
+            task_effort=new_registry.task_effort,
         )
+        registry.adopt_skips(new_registry)
     except DynamicAuthKeyError as exc:
         # Matches the console write validator's classification of the
         # identical state; see the shared helper for the full policy.
@@ -4952,8 +4908,8 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
 
     # The process-owned model client survives registry changes, including
     # enabling dynamic authentication on a host with no MCP manager.
-    model_client = get_model_token_client(request.app.state)
-    workstreams = getattr(request.app.state, "workstreams", None)
+    model_client = get_model_token_client(app_state)
+    workstreams = getattr(app_state, "workstreams", None)
     if workstreams is not None:
         with contextlib.suppress(Exception):
             for ws in workstreams.list_all():
@@ -4962,7 +4918,7 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
                     session.set_model_mint_client(model_client)
 
     # Ensure health trackers exist for any newly-added backends
-    health_reg = getattr(request.app.state, "health_registry", None)
+    health_reg = getattr(app_state, "health_registry", None)
     if health_reg:
         for alias in registry.list_aliases():
             cfg = registry.get_config(alias)
@@ -4970,16 +4926,19 @@ def _internal_model_reload_locked(request: Request) -> JSONResponse:
 
     # Push the new alias list into active sessions so the task_agent
     # `model` parameter description reflects the current registry.
-    _broadcast_agent_tool_schema_refresh(request.app.state)
+    _broadcast_agent_tool_schema_refresh(app_state)
 
     # Refresh the per-node ``models`` metadata entry the coord reads on
     # ``list_nodes``.  Without this, the heartbeat loop's 30s tick would
     # be the coord's first chance to see new aliases an admin just added.
-    node_id = getattr(request.app.state, "node_id", "")
+    node_id = getattr(app_state, "node_id", "")
     if node_id:
-        _publish_models_metadata(request.app.state, storage, node_id)
+        _publish_models_metadata(app_state, storage, node_id)
 
-    return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
+    payload = {"status": "ok", "aliases": registry.list_aliases()}
+    if skipped:
+        payload["skipped"] = skipped
+    return JSONResponse(payload)
 
 
 def internal_model_status(request: Request) -> JSONResponse:
@@ -5166,45 +5125,49 @@ def _emit_health_changed(
     """Push a health_changed event onto the global SSE queue.
 
     Called from the BackendHealthTracker callback on state transitions.
-    *status* is ``"healthy"`` or ``"degraded"``.
-
-    Also updates the global ``turnstone_backend_up`` metric using the
-    effective default backend's health (not the backend that triggered
-    this callback, which may be a non-default fallback).
+    *status* is ``"healthy"`` or ``"degraded"``. The event, and the
+    ``turnstone_backend_up`` metric :func:`_send_health` sets, follow the
+    effective default's backend, not the one that triggered this callback.
     """
-    if app_state is not None:
-        _update_backend_metric(app_state)
-    with contextlib.suppress(queue.Full):
-        gq.put_nowait(
-            {
-                "type": "health_changed",
-                "backend_status": status,
-            }
-        )
-
-
-def _update_backend_metric(app_state: Any) -> None:
-    """Update ``turnstone_backend_up`` from the effective default's tracker.
-
-    Called on any backend state change.  Only the effective default
-    backend drives this global metric — fallback backend transitions
-    do not affect it.
-    """
-    health_reg = getattr(app_state, "health_registry", None)
-    registry = getattr(app_state, "registry", None)
-    if not health_reg or not registry:
+    if app_state is None:
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait({"type": "health_changed", "backend_status": status})
         return
-    config_store = getattr(app_state, "config_store", None)
-    effective = None
-    if config_store:
-        effective = config_store.get("model.default_alias") or None
-    tracker = None
-    if effective:
-        tracker = health_reg.get_tracker_for_alias(registry, effective)
-    if tracker is None:
-        tracker = health_reg.get_tracker_for_alias(registry, registry.default)
-    if tracker is not None:
-        _metrics.set_backend_status(tracker.is_healthy)
+    _send_health(app_state, gq, backend_status=status)
+
+
+# Orders health_changed events: each one carries the summary computed under
+# the lock, so the last event queued is never older than an earlier one.
+_HEALTH_EVENT_LOCK = threading.Lock()
+
+
+def _send_health(
+    app_state: Any, gq: queue.Queue[dict[str, Any]] | None = None, *, backend_status: str = ""
+) -> None:
+    """Queue a ``health_changed`` event carrying :func:`_health_summary`, and set
+    the ``turnstone_backend_up`` metric from the same summary.
+
+    A backend transition (*backend_status*) always sends one; otherwise one is
+    sent only when the summary changed since the last event, since a settings
+    or model reload can load or drop the default model without any backend
+    changing state. The aggregate thread calls this every tick, so a path that
+    changes the summary without calling it reaches the console within one.
+    """
+    if gq is None:
+        gq = getattr(app_state, "global_queue", None)
+    if gq is None:
+        return
+    with _HEALTH_EVENT_LOCK:
+        summary = _health_summary(app_state)
+        _metrics.set_backend_status(summary["backend"]["status"] == "up")
+        if not backend_status and summary == getattr(app_state, "health_summary_sent", None):
+            return
+        app_state.health_summary_sent = summary
+        event: dict[str, Any] = {"type": "health_changed", **summary}
+        if backend_status:
+            event["backend_status"] = backend_status
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait(event)
 
 
 def _aggregate_emitter_thread(
@@ -5212,6 +5175,7 @@ def _aggregate_emitter_thread(
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
     stop: threading.Event | None = None,
+    app_state: Any = None,
 ) -> None:
     """Periodically emit aggregate token/tool_call totals on the global SSE queue.
 
@@ -5219,7 +5183,9 @@ def _aggregate_emitter_thread(
     having to poll ``/v1/api/dashboard``.  ``stop`` (#885) is the lifespan
     shutdown signal — ``wait(interval)`` doubles as the tick sleep, so a
     set wakes the thread immediately instead of stranding shutdown behind
-    a sleep.
+    a sleep.  With *app_state*, each tick also sends the health summary when it
+    changed (:func:`_send_health`), the backstop for any path that changes it
+    without saying so.
     """
     if stop is None:
         stop = threading.Event()
@@ -5253,6 +5219,11 @@ def _aggregate_emitter_thread(
                 )
         except Exception:
             log.debug("Aggregate emitter error", exc_info=True)
+        if app_state is not None:
+            try:
+                _send_health(app_state, global_queue)
+            except Exception:
+                log.debug("Health backstop error", exc_info=True)
 
 
 def _idle_cleanup_thread(
@@ -5406,7 +5377,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     agg_emitter = threading.Thread(
         target=_aggregate_emitter_thread,
         args=(app.state.workstreams, app.state.global_queue),
-        kwargs={"stop": daemon_stop},
+        kwargs={"stop": daemon_stop, "app_state": app.state},
         daemon=True,
     )
     agg_emitter.start()
@@ -5564,8 +5535,21 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
 
         _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
+    # With a secret store configured, models reload on its cache interval as
+    # Sync to Nodes would, so a key rotated in the store reaches this node
+    # without an operator.
+    from turnstone.core.secret_refs import start_refresh
+
+    _secret_refresh_task = start_refresh(
+        lambda: _refresh_models_from_store(app.state), what="models"
+    )
+
     yield
     # Shutdown
+    if _secret_refresh_task is not None:
+        _secret_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _secret_refresh_task
     if _heartbeat_task is not None:
         _heartbeat_task.cancel()
         # Wait for the cancel to land before we run the metadata
@@ -5810,6 +5794,8 @@ def create_app(
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
         create_supports_attachments=True,
         create_supports_user_id_override=True,
+        # The validator checks the source's visibility; the pre-commit forks it.
+        create_supports_resume=True,
         create_gate_require_project=True,
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
@@ -6246,6 +6232,17 @@ def main() -> None:
 
     warn_migrated_settings()
 
+    # A malformed [secrets] table (or a CA bundle that cannot be loaded) is a
+    # boot failure, like a malformed keyring, not a per-row surprise at the
+    # first secret:// reference. Building the resolver touches no store.
+    from turnstone.core.secret_refs import SecretConfigError, get_resolver
+
+    try:
+        get_resolver()
+    except SecretConfigError as exc:
+        log.error("secret_refs.config_invalid: %s", exc)
+        raise SystemExit(1) from exc
+
     # Prune stale / empty workstreams on startup
     from turnstone.core.memory import prune_workstreams
 
@@ -6267,18 +6264,10 @@ def main() -> None:
         detect_context_windows=True,
     )
 
-    # Apply runtime overrides from ConfigStore for default alias plus the
-    # per-kind sub-agent routing.  Only triggers a reload when at least one
-    # ConfigStore value differs from what the registry loaded from disk.
-    # ConfigStore returns the SettingDef default ("" for these keys) when
-    # unset — distinct from the registry's None for unconfigured fields.
+    # The routing settings (model.default_alias, model.task_alias,
+    # model.task_effort) are read where they are used, never written into the
+    # registry, so a fresh settings cache is all boot needs.
     config_store.reload()  # symmetry with internal_model_reload's cs.reload()
-    # Pre-lifespan: no app.state exists yet, so there is no token store to
-    # check. initialize_mcp_crypto_state owns the dynamic-auth key
-    # requirement for this boot phase — see the sentinel's definition.
-    from turnstone.core.model_registry import KEY_GUARD_DEFERRED_TO_LIFESPAN
-
-    _apply_routing_overrides(registry, config_store, KEY_GUARD_DEFERRED_TO_LIFESPAN)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
@@ -6355,7 +6344,12 @@ def main() -> None:
         )
 
     judge_config = _build_judge_config()
-    default_model_id = registry.get_config(registry.default).model if registry.default else ""
+    boot_default = registry.effective_default(config_store)
+    # The default may name a model this node didn't load (#1359): report no id
+    # rather than crash the boot; creates that rely on it fail with the reason.
+    default_model_id = (
+        registry.get_config(boot_default).model if registry.has_alias(boot_default) else ""
+    )
     if judge_config.enabled:
         log.info(
             "Judge: enabled (model=%s, threshold=%.2f)",
@@ -6367,13 +6361,10 @@ def main() -> None:
     def _effective_default_alias() -> str:
         """Return the runtime-effective default model alias.
 
-        Checks ConfigStore for a ``model.default_alias`` override first,
-        then falls back to the registry's static default.
+        The ``model.default_alias`` setting, else the registry's own default,
+        loaded or not: an unloaded default fails the create (#1359).
         """
-        cs_alias: str = config_store.get("model.default_alias")
-        if cs_alias and registry.has_alias(cs_alias):
-            return cs_alias
-        return registry.default
+        return registry.effective_default(config_store)
 
     def session_factory(
         ui: SessionUI | None,
@@ -6393,13 +6384,13 @@ def main() -> None:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
         # for both client resolution and ChatSession.model_alias.
-        # Unknown aliases here raise ValueError — the create handler
-        # maps that to a 503 with operator-friendly text so a typo or
-        # removed alias in body.model surfaces instead of silently
-        # starting on the default. SessionManager.open's rehydrate
-        # path is the one place where unknown aliases must NOT fail
-        # loud; the manager filters those out via its model_validator
-        # before the alias reaches this factory.
+        # An alias that isn't loaded raises UnknownModelAliasError — the
+        # create handler maps that to a 503 model_not_loaded naming it, so a
+        # typo or removed alias in body.model surfaces instead of silently
+        # starting on the default. SessionManager.open's rehydrate path
+        # passes a saved alias only when its model_validator finds it
+        # loaded, else falls back to the default here, which fails the same
+        # way when it isn't loaded either (#1359).
         model_alias = model_alias or _effective_default_alias()
         # Resolve every stable model facet under one registry lock hold.  Passing
         # the same immutable binding through to ChatSession prevents a reload in
@@ -6546,6 +6537,7 @@ def main() -> None:
         # workstream pinned to a since-removed alias still rehydrates
         # (on the registry default) instead of 500-ing on every reopen.
         model_validator=registry.has_alias,
+        default_alias_reader=_effective_default_alias,
     )
     interactive_adapter.attach(manager)
     # Renew from here on: a startup ``--resume`` takes leases long before the
@@ -6660,10 +6652,15 @@ def main() -> None:
     _app_ref[0] = app
 
     log.info("Server starting on http://%s:%s", args.host, args.port)
-    log.info("Default model: %s", registry.default or "(none configured)")
+    log.info("Default model: %s", boot_default or "(none configured)")
+    if boot_default and not registry.has_alias(boot_default):
+        log.warning(
+            "Default model %s is not loaded; creates that rely on it fail until it loads",
+            boot_default,
+        )
     if registry.count > 1:
-        others = [a for a in registry.list_aliases() if a != registry.default]
-        log.info("Models: %s (default), %s", registry.default, ", ".join(others))
+        others = [a for a in registry.list_aliases() if a != boot_default]
+        log.info("Models: %s (default), %s", boot_default, ", ".join(others))
     if mcp_client:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:

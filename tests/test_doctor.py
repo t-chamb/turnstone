@@ -463,6 +463,35 @@ class TestCheckLlmBackendTool:
         assert "Refused" in out
         probe.assert_not_called()
 
+    def test_sends_the_placeholder_rather_than_the_operators_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The model chooses the host, so a probe without a key never falls back to the provider
+        SDK's own variable. The real client is built (which sends nothing) and its headers read."""
+        import turnstone.core.providers as providers
+        from turnstone.doctor import _tool_check_llm_backend
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-operator")
+        real_create_client = providers.create_client
+        sent: list[dict[str, str]] = []
+
+        def headers_then_stop(*args: Any, **kwargs: Any) -> Any:
+            sent.append(dict(real_create_client(*args, **kwargs).auth_headers))
+            raise RuntimeError("stopped before any request")
+
+        # probe_model_endpoint imports create_client when it runs.
+        monkeypatch.setattr(providers, "create_client", headers_then_stop)
+        out = _tool_check_llm_backend({"provider": "openai", "base_url": "http://127.0.0.1/v1"})
+        _tool_check_llm_backend(
+            {"provider": "openai", "base_url": "http://127.0.0.1/v1", "api_key": "sk-given"}
+        )
+        assert sent == [
+            {"Authorization": f"Bearer {providers.LOCAL_PLACEHOLDER_API_KEY}"},
+            {"Authorization": "Bearer sk-given"},
+        ]
+        # The model learns that an authentication error there says nothing about the real key.
+        assert "a placeholder key was sent" in out
+
 
 class TestNodeHealth:
     def _capture_cmd(self, tmp_path: Path, kind: str, args: dict[str, object]) -> list[str]:
@@ -954,6 +983,119 @@ base_url = "http://laptop:8000/v1"
             assert brain is not None
             assert brain.model == "test-model"
             assert verdict.ok is True
+        finally:
+            reset_storage()
+
+    def test_names_a_skipped_definition_when_nothing_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            st.create_model_definition(
+                "def1",
+                "default",
+                "test-model",
+                provider="openai-compatible",
+                base_url="http://localhost:9/v1",
+                api_key="${TS_DOCTOR_KEY}",
+                context_window=8192,
+                enabled=True,
+            )
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert verdict.detail.startswith(
+                "no usable model configured: the default model 'default' isn't loaded; "
+                "skipped: default: api_key contains ${TS_DOCTOR_KEY}"
+            )
+        finally:
+            reset_storage()
+
+    def test_an_unconfigured_default_left_out_is_not_replaced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With nothing configured the default is the first defined model; one
+        a load leaves out fails doctor instead of handing it the next (#1359)."""
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            for definition_id, alias, api_key in (
+                ("def1", "alpha", "${TS_DOCTOR_KEY}"),
+                ("def2", "beta", "dummy"),
+            ):
+                st.create_model_definition(
+                    definition_id,
+                    alias,
+                    "test-model",
+                    provider="openai-compatible",
+                    base_url="http://localhost:9/v1",
+                    api_key=api_key,
+                    context_window=8192,
+                    enabled=True,
+                )
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert "the default model 'alpha' isn't loaded" in verdict.detail
+        finally:
+            reset_storage()
+
+    def test_names_a_skipped_default_while_other_models_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case doctor keeps its own skip summary for: the loader raises no
+        error when the configured default is skipped and another alias loads,
+        and doctor fails on that default rather than using the other (#1359)."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import init_storage, reset_storage
+
+        monkeypatch.setattr("turnstone.core.config.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.core.model_registry.load_config", lambda section=None: {})
+        monkeypatch.setattr("turnstone.doctor._validate_connection", lambda llm: (True, ""))
+        db_path = str(tmp_path / "doctor.db")
+        reset_storage()
+        st = init_storage("sqlite", path=db_path, run_migrations=True)
+        try:
+            for definition_id, alias, api_key in (
+                ("def1", "older", "${TS_DOCTOR_KEY}"),
+                ("def2", "ok", "dummy"),
+            ):
+                st.create_model_definition(
+                    definition_id,
+                    alias,
+                    "test-model",
+                    provider="openai-compatible",
+                    base_url="http://localhost:9/v1",
+                    api_key=api_key,
+                    context_window=8192,
+                    enabled=True,
+                )
+            ConfigStore(storage=st, node_id="").set("model.default_alias", "older")
+            profile = _make_profile(
+                tmp_path, db_config={"backend": "sqlite", "url": "", "path": db_path}
+            )
+            brain, verdict = resolve_doctor_brain(profile, st, "")
+            assert brain is None
+            assert (
+                "the default model 'older' isn't loaded; "
+                "skipped: older: api_key contains ${TS_DOCTOR_KEY}" in verdict.detail
+            )
         finally:
             reset_storage()
 
@@ -1514,6 +1656,34 @@ class TestSelectProvider:
         ):
             provider, _client, model = _select_provider()
         assert provider == "openai" and model == "my-model"
+
+    def test_an_env_key_is_offered_without_its_line_break(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A variable filled from a file keeps the file's line break, which is not part of the key.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-file" + chr(10))
+        with (
+            patch("builtins.input", side_effect=["1", "", ""]),
+            patch("openai.OpenAI", return_value=MagicMock()) as openai_cls,
+        ):
+            _select_provider()
+        assert openai_cls.call_args.kwargs["api_key"] == "sk-from-file"
+
+    def test_an_env_key_a_header_cannot_carry_is_not_offered(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "sk" + chr(1) + "keymarker")
+        with (
+            patch("builtins.input", side_effect=["3", "http://localhost:8000/v1", "my-model"]),
+            patch("getpass.getpass", return_value="none") as prompt,
+            patch("openai.OpenAI", return_value=MagicMock()) as openai_cls,
+        ):
+            _select_provider()
+        prompt.assert_called_once()
+        assert openai_cls.call_args.kwargs["api_key"] == "none"
+        out = capsys.readouterr().out
+        assert "$OPENAI_API_KEY is a value an HTTP header cannot carry" in out
+        assert "keymarker" not in out
 
 
 # ---------------------------------------------------------------------------

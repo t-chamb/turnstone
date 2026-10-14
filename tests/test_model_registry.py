@@ -16,7 +16,6 @@ from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import scripted_chat_client
 from turnstone.core import model_registry as mr_module
 from turnstone.core.model_registry import (
-    KEY_GUARD_DEFERRED_TO_LIFESPAN,
     DynamicAuthKeyError,
     ModelConcurrencyConfigError,
     ModelConfig,
@@ -25,6 +24,7 @@ from turnstone.core.model_registry import (
     _resolve_env_vars,
     detect_model,
     load_model_registry,
+    stored_definition_error,
 )
 from turnstone.core.model_turn import resolve_model_binding
 from turnstone.core.oauth.context import OAuthContext, oauth_context
@@ -339,10 +339,13 @@ class TestModelRegistry:
 
 
 class TestModelRegistryValidation:
-    def test_empty_models_with_default_raises(self) -> None:
-        # A stray default that can't resolve is a bug, not a valid state.
-        with pytest.raises(ValueError, match="not found in empty registry"):
-            ModelRegistry(models={}, default="x")
+    def test_empty_models_keep_a_configured_default(self) -> None:
+        # The default names what configuration says even when nothing loaded
+        # (#1359); resolving it raises rather than picking another model.
+        reg = ModelRegistry(models={}, default="x")
+        assert reg.default == "x"
+        with pytest.raises(UnknownModelAliasError):
+            reg.resolve()
 
     def test_empty_models_allowed_when_default_unset(self) -> None:
         # Degraded "no models configured yet" state — a server boots into this
@@ -351,25 +354,24 @@ class TestModelRegistryValidation:
         assert reg.count == 0
         assert reg.list_aliases() == []
 
-    def test_invalid_default_raises(self) -> None:
+    def test_unloaded_default_kept(self) -> None:
         models = {"a": ModelConfig("a", "x", "x", "x")}
-        with pytest.raises(ValueError, match="Default model 'bad'"):
-            ModelRegistry(models=models, default="bad")
+        reg = ModelRegistry(models=models, default="bad")
+        assert reg.default == "bad"
+        with pytest.raises(UnknownModelAliasError) as exc_info:
+            reg.resolve()
+        assert exc_info.value.alias == "bad"
 
     def test_invalid_fallback_raises(self) -> None:
         models = {"a": ModelConfig("a", "x", "x", "x")}
         with pytest.raises(ValueError, match="Fallback model 'bad'"):
             ModelRegistry(models=models, default="a", fallback=["bad"])
 
-    def test_invalid_agent_model_raises(self) -> None:
+    def test_unloaded_agent_and_task_models_kept(self) -> None:
         models = {"a": ModelConfig("a", "x", "x", "x")}
-        with pytest.raises(ValueError, match="Agent model 'bad'"):
-            ModelRegistry(models=models, default="a", agent_model="bad")
-
-    def test_invalid_task_model_raises(self) -> None:
-        models = {"a": ModelConfig("a", "x", "x", "x")}
-        with pytest.raises(ValueError, match="Task model 'bad'"):
-            ModelRegistry(models=models, default="a", task_model="bad")
+        reg = ModelRegistry(models=models, default="a", agent_model="bad", task_model="worse")
+        assert reg.agent_model == "bad"
+        assert reg.task_model == "worse"
 
 
 # ---------------------------------------------------------------------------
@@ -508,13 +510,16 @@ class TestLoadModelRegistry:
             reg = load_model_registry("http://x/v1", "x", "x")
         assert reg.agent_model == "cheap"
 
-    def test_invalid_agent_model_ignored(self) -> None:
+    def test_unloaded_agent_model_kept(self) -> None:
+        # Kept as configured, not dropped: resolving it fails instead of the
+        # task agent quietly running on another model (#1359).
         fake_cfg: dict[str, Any] = {
             "model": {"agent_model": "nonexistent"},
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.agent_model is None
+        assert reg.agent_model == "nonexistent"
+        assert not reg.has_alias("nonexistent")
 
     def test_task_model_from_config(self) -> None:
         fake_cfg: dict[str, Any] = {
@@ -531,13 +536,17 @@ class TestLoadModelRegistry:
         assert reg.task_model == "fast"
         assert reg.task_effort == "low"
 
-    def test_invalid_task_model_ignored(self) -> None:
+    def test_unloaded_task_model_kept(self) -> None:
+        # Kept, and it outranks agent_model as configured: no fall-through to
+        # another model because this one didn't load (#1359).
         fake_cfg: dict[str, Any] = {
-            "model": {"task_model": "alsonope"},
+            "models": {"cheap": {"base_url": "http://c/v1", "model": "c"}},
+            "model": {"task_model": "alsonope", "agent_model": "cheap"},
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.task_model is None
+        assert reg.task_model == "alsonope"
+        assert reg.resolve_agent_alias("task") == "alsonope"
 
     def test_invalid_effort_values_dropped_with_warning(self) -> None:
         """Typos in task_effort shouldn't silently flow to providers."""
@@ -570,13 +579,19 @@ class TestLoadModelRegistry:
             reg = load_model_registry("http://x/v1", "x", "x")
         assert reg.task_effort == "low"
 
-    def test_invalid_default_falls_back(self) -> None:
+    def test_unloaded_default_is_kept(self) -> None:
+        # A configured default that names no loaded model stays the default;
+        # whatever relies on it fails instead of running another model (#1359).
         fake_cfg: dict[str, Any] = {
             "model": {"default": "nonexistent"},
         }
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
-        assert reg.default == "default"
+        assert reg.default == "nonexistent"
+        assert reg.has_alias("default")  # the CLI-synthesized entry still loads
+        with pytest.raises(UnknownModelAliasError) as exc_info:
+            reg.resolve()
+        assert exc_info.value.alias == "nonexistent"
 
     def test_empty_model_name_skipped(self) -> None:
         """Config entries without a model name are skipped."""
@@ -1030,6 +1045,134 @@ class TestResolveEnvVars:
         assert _resolve_env_vars("") == ""
 
 
+class TestStoredDefinitionError:
+    def test_names_the_field_the_placeholder_and_what_to_do(self) -> None:
+        key_error = stored_definition_error({"api_key": "sk-${OPENAI_API_KEY}"})
+        assert key_error.startswith("api_key contains ${OPENAI_API_KEY}, which")
+        assert "enter the key itself" in key_error and "secret://" in key_error
+        url_error = stored_definition_error({"base_url": "https://${HOST}/v1"})
+        assert url_error.startswith("base_url contains ${HOST}, which")
+        assert "enter the URL itself" in url_error
+        assert "config.toml, where a URL that carries a credential belongs" in url_error
+
+    def test_an_api_key_reference_is_left_to_its_resolver(self) -> None:
+        assert stored_definition_error({"api_key": "secret://file/${TEAM}"}) == ""
+        # A base_url has no resolver, so a reference-shaped one is checked like any other.
+        assert stored_definition_error({"base_url": "secret://file/${HOST}/v1"})
+
+    @pytest.mark.parametrize(
+        "value", ["${A}", "x${A_1}y", "${A}${A}", "$A", "${}", "${1A}", "${A", "plain", ""]
+    )
+    def test_refuses_exactly_what_the_expansion_would_change(self, value: str) -> None:
+        """The check and ``_resolve_env_vars`` share one pattern, so a stored
+        value is refused when, and only when, expanding it would change it."""
+        with patch.dict("os.environ", {"A": "1", "A_1": "2"}):
+            would_expand = _resolve_env_vars(value) != value
+        assert bool(stored_definition_error({"api_key": value})) is would_expand
+
+
+class TestStoredPlaceholders:
+    """A database row is never expanded from the environment: one whose api_key
+    or base_url holds a ${VAR} is skipped and named, even with the variable set,
+    while config.toml entries and the CLI's default key keep their expansion."""
+
+    @staticmethod
+    def _row(**overrides: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "alias": "row",
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "https://models.example.com/v1",
+            "api_key": "sk-literal",
+            "context_window": 0,
+            "capabilities": "{}",
+            "enabled": True,
+        }
+        row.update(overrides)
+        return row
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("api_key", "${TS_STORED_VALUE}"),
+            ("base_url", "https://models.example.com/v1/${TS_STORED_VALUE}"),
+        ],
+    )
+    def test_row_is_skipped_named_and_never_probed(
+        self, monkeypatch: pytest.MonkeyPatch, field: str, value: str
+    ) -> None:
+        monkeypatch.setenv("TS_STORED_VALUE", "env-value")
+        seen: list[tuple[str, str]] = []
+
+        def record(provider: str, base_url: str, api_key: str, *a: Any, **kw: Any) -> Any:
+            seen.append((base_url, api_key))
+            return {"reachable": True, "model_found": True, "context_window": 4096}
+
+        monkeypatch.setattr(mr_module, "probe_model_endpoint", record)
+        storage = _MockStorage([self._row(**{field: value}), self._row(alias="ok")])
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(
+                storage=storage, allow_empty=True, detect_context_windows=True
+            )
+        assert reg.list_aliases() == ["ok"]
+        assert reg.skipped_aliases["row"].startswith(field + " contains ${TS_STORED_VALUE}")
+        assert seen and set(seen) == {("https://models.example.com/v1", "sk-literal")}
+
+    def test_config_entries_keep_their_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TS_CONFIG_KEY", "sk-from-env")
+        monkeypatch.setenv("TS_CONFIG_URL", "https://models.example.com/v1")
+        entry = {
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "${TS_CONFIG_URL}",
+            "api_key": "${TS_CONFIG_KEY}",
+            "context_window": 8192,
+        }
+        fake_cfg: dict[str, Any] = {"models": {"cfg": entry}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(allow_empty=True)
+        cfg = reg.get_config("cfg")
+        assert (cfg.base_url, cfg.api_key) == ("https://models.example.com/v1", "sk-from-env")
+
+    def test_the_cli_default_key_keeps_its_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A config.toml entry without a key takes the CLI's, which the operator supplies."""
+        monkeypatch.setenv("TS_CLI_KEY", "sk-from-env")
+        entry = {"model": "m1", "base_url": "http://x/v1", "context_window": 8192}
+        fake_cfg: dict[str, Any] = {"models": {"cfg": entry}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "${TS_CLI_KEY}", "x")
+        assert reg.get_config("cfg").api_key == "sk-from-env"
+
+    def test_only_a_row_still_skipped_after_config_toml_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A row whose alias config.toml serves is of no consequence: no ERROR for it."""
+        entry = {
+            "model": "m1",
+            "provider": "openai-compatible",
+            "base_url": "https://models.example.com/v1",
+            "api_key": "sk-from-config",
+            "context_window": 8192,
+        }
+        fake_cfg: dict[str, Any] = {"models": {"served": entry}}
+        storage = _MockStorage(
+            [
+                self._row(alias="served", api_key="${TS_STORED_VALUE}", context_window=8192),
+                self._row(alias="absent", api_key="${TS_STORED_VALUE}", context_window=8192),
+            ]
+        )
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.ERROR),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert set(reg.skipped_aliases) == {"absent"}
+        logged = [
+            _rendered(r) for r in caplog.records if "model_registry.alias_skipped" in _rendered(r)
+        ]
+        assert len(logged) == 1 and "absent" in logged[0]
+
+
 # ---------------------------------------------------------------------------
 # Registry-owned rerank lanes
 # ---------------------------------------------------------------------------
@@ -1373,20 +1516,32 @@ class TestRegistryReload:
         assert "a" in reg._clients  # unchanged endpoint, kept warm
         assert "b" not in reg._clients
 
-    def test_reload_validates_default(self) -> None:
+    def test_reload_keeps_an_unloaded_default(self) -> None:
+        # A reload whose default didn't load installs it as configured; a
+        # create that relies on it fails instead of using "a" (#1359).
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
-        with pytest.raises(ValueError, match="Default model"):
-            reg.reload(models_a, "nonexistent", app_state=_KEYED_STATE)
+        reg.reload(models_a, "nonexistent", app_state=_KEYED_STATE)
+        assert reg.has_alias("a")
+        assert reg.default == "nonexistent"
+        with pytest.raises(UnknownModelAliasError):
+            reg.resolve()
+
+    def test_reload_validates_fallback(self) -> None:
+        models_a = {"a": ModelConfig("a", "x", "x", "m")}
+        reg = ModelRegistry(models=models_a, default="a")
+        with pytest.raises(ValueError, match="Fallback model 'gone'"):
+            reg.reload(models_a, "a", ["gone"], app_state=_KEYED_STATE)
         # Registry should be unchanged after failed reload
         assert reg.has_alias("a")
         assert reg.default == "a"
 
-    def test_reload_to_empty_with_default_raises(self) -> None:
+    def test_reload_to_empty_keeps_the_default(self) -> None:
         models_a = {"a": ModelConfig("a", "x", "x", "m")}
         reg = ModelRegistry(models=models_a, default="a")
-        with pytest.raises(ValueError, match="not found in empty registry"):
-            reg.reload({}, "a", app_state=_KEYED_STATE)
+        reg.reload({}, "a", app_state=_KEYED_STATE)
+        assert reg.count == 0
+        assert reg.default == "a"
 
     def test_reload_to_empty_degraded(self) -> None:
         # Reloading down to zero models (default unset) is allowed: the
@@ -1440,12 +1595,6 @@ class TestReloadKeyGuard:
         keyless = SimpleNamespace(oauth_context=OAuthContext(token_store=None))
         reg.reload({"b": ModelConfig("b", "http://y/v1", "key", "m")}, "b", app_state=keyless)
         assert reg.has_alias("b")
-
-    def test_reload_boot_sentinel_defers_key_guard(self) -> None:
-        """Boot defers to ``initialize_mcp_crypto_state``, not a bypass."""
-        reg = ModelRegistry(models=self._static_models(), default="a")
-        reg.reload(self._dynamic_models(), "a", app_state=KEY_GUARD_DEFERRED_TO_LIFESPAN)
-        assert reg.has_dynamic_auth()
 
 
 class TestProfileMismatchVisibility:
@@ -4202,6 +4351,208 @@ class TestExtractContextWindow:
 # ---------------------------------------------------------------------------
 
 
+class TestDefaultNeverMovesOnALoad:
+    """#1359: the default comes from configuration and the defined models, never
+    from the set that loaded, so a definition left out of a load (a refused
+    secret reference, a stored ``${VAR}``) fails what relies on it instead of
+    handing the default to the next model."""
+
+    @staticmethod
+    def _row(alias: str, **overrides: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "alias": alias,
+            "model": "m-" + alias,
+            "provider": "openai-compatible",
+            "base_url": "https://models.example.com/v1",
+            "api_key": "sk-literal",
+            "context_window": 8192,
+            "capabilities": "{}",
+            "enabled": True,
+        }
+        row.update(overrides)
+        return row
+
+    def test_pick_default_alias(self) -> None:
+        from turnstone.core.model_registry import pick_default_alias
+
+        assert pick_default_alias("chosen", ["a", "default"]) == "chosen"
+        assert pick_default_alias("", ["a", "default"]) == "default"
+        assert pick_default_alias("", ["b", "a"]) == "b"
+        assert pick_default_alias("", []) == ""
+
+    def test_first_defined_stays_default_when_left_out(self) -> None:
+        storage = _MockStorage(
+            [self._row("alpha", api_key="${TS_STORED_VALUE}"), self._row("beta")]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.list_aliases() == ["beta"]
+        assert "alpha" in reg.skipped_aliases
+        assert reg.default == "alpha"
+        with pytest.raises(UnknownModelAliasError) as exc_info:
+            reg.resolve()
+        assert exc_info.value.alias == "alpha"
+        # The category every reader may see, the same one task_agent reports.
+        assert exc_info.value.reason == "its definition couldn't be loaded"
+        assert exc_info.value.retryable is False
+
+    def test_configured_default_left_out_stays_default(self) -> None:
+        storage = _MockStorage(
+            [self._row("alpha"), self._row("beta", api_key="${TS_STORED_VALUE}")]
+        )
+        fake_cfg: dict[str, Any] = {"model": {"default": "beta"}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "beta"
+        assert reg.has_alias("alpha")
+
+    def test_the_retryable_mark_follows_the_reason_kept(self) -> None:
+        # A stored row's key fails retryably, then the config.toml entry that
+        # overrides it fails for good: retrying can't help, so nothing says so.
+        from turnstone.core.http_headers import HeaderValueError
+        from turnstone.core.secret_refs import SecretBackendError
+
+        def _materialize(value: object) -> str:
+            if value == "secret://store/x":
+                raise SecretBackendError("store unreachable", retryable=True)
+            if value == "BAD":
+                raise HeaderValueError("literal key cannot be sent")
+            return str(value)
+
+        storage = _MockStorage([self._row("x", api_key="secret://store/x"), self._row("y")])
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "x": {"model": "m-x", "base_url": "https://models.example.com/v1", "api_key": "BAD"}
+            }
+        }
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            patch("turnstone.core.model_registry.materialize_api_key", _materialize),
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert "x" in reg.skipped_aliases
+        assert "x" not in reg.retryable_skips
+        assert reg.unavailable_reason("x") == ("its definition couldn't be loaded", False)
+
+    def test_config_tomls_kind_replaces_a_stored_rows(self) -> None:
+        # The default pick reads the definition in force: config.toml's entry,
+        # once it takes over the alias.
+        rerank = '{"supports_rerank": true}'
+        chat_entry = {"model": "m-a", "base_url": "https://models.example.com/v1", "api_key": "k"}
+        storage = _MockStorage([self._row("a", capabilities=rerank)])
+        with patch(
+            "turnstone.core.model_registry.load_config",
+            return_value={"models": {"a": chat_entry}},
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "a"
+
+        storage = _MockStorage([self._row("a"), self._row("b")])
+        rerank_entry = {
+            **chat_entry,
+            "model": "bge-reranker",
+            "capabilities": {"supports_rerank": True},
+        }
+        with patch(
+            "turnstone.core.model_registry.load_config",
+            return_value={"models": {"a": rerank_entry}},
+        ):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "b"
+
+    def test_nothing_loaded_still_names_the_default(self) -> None:
+        storage = _MockStorage([self._row("only", api_key="${TS_STORED_VALUE}")])
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.count == 0
+        assert reg.default == "only"
+
+    def test_a_model_named_default_wins_over_order(self) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "zeta": {"base_url": "http://z/v1", "model": "z"},
+                "default": {"base_url": "http://d/v1", "model": "d"},
+            }
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.default == "default"
+
+    def test_a_malformed_config_entry_counts_as_defined(self) -> None:
+        # The operator's first [models.*] entry is the default even when it
+        # can't load; the next entry doesn't inherit the role.
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "first": {"base_url": "http://f/v1"},
+                "second": {"base_url": "http://s/v1", "model": "s"},
+            }
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.default == "first"
+        assert reg.list_aliases() == ["second"]
+
+    def test_the_pick_skips_rerankers_and_speech_models(self) -> None:
+        # The setting a pick feeds outranks config.toml defaults, so a model
+        # that can't hold a chat never becomes the default on its own.
+        storage = _MockStorage(
+            [
+                self._row("a-rerank", capabilities='{"supports_rerank": true}'),
+                self._row("b-whisper", model="whisper-1"),
+                self._row("c-voice", capabilities='{"supports_speech_synthesis": true}'),
+                self._row("d-chat"),
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "d-chat"
+
+    def test_an_omni_model_counts_as_chat(self) -> None:
+        storage = _MockStorage(
+            [
+                self._row(
+                    "a-omni",
+                    model="gpt-4o-audio",
+                    capabilities='{"supports_audio_input": true, "supports_transcription": true}',
+                ),
+                self._row("b-chat"),
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "a-omni"
+
+    def test_only_non_chat_models_leave_no_default(self) -> None:
+        storage = _MockStorage([self._row("rerank", capabilities='{"supports_rerank": true}')])
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == ""
+
+    def test_a_configured_default_is_taken_as_given(self) -> None:
+        storage = _MockStorage(
+            [self._row("rerank", capabilities='{"supports_rerank": true}'), self._row("chat")]
+        )
+        fake_cfg: dict[str, Any] = {"model": {"default": "rerank"}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(storage=storage, allow_empty=True)
+        assert reg.default == "rerank"
+
+    def test_an_unloaded_routing_alias_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake_cfg: dict[str, Any] = {"model": {"default": "gone", "task_model": "lost"}}
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value=fake_cfg),
+            caplog.at_level(logging.WARNING),
+        ):
+            load_model_registry("http://x/v1", "x", "x")
+        logged = [
+            _rendered(r)
+            for r in caplog.records
+            if "model_registry.routing_alias_not_loaded" in _rendered(r)
+        ]
+        assert any("gone" in line for line in logged)
+        assert any("lost" in line for line in logged)
+
+
 class TestLoadModelRegistryDBOnly:
     """Tests for starting the server with models defined only in DB/config,
     without any CLI --model argument."""
@@ -4370,7 +4721,7 @@ class TestLoadModelRegistryDBOnly:
 
 
 # ---------------------------------------------------------------------------
-# server._effective_routing / _apply_routing_overrides
+# Routing settings read at use time (effective_default, resolve_agent_*)
 # ---------------------------------------------------------------------------
 
 
@@ -4378,65 +4729,19 @@ class _FakeCS:
     """Minimal ConfigStore stand-in: dict-backed get()."""
 
     def __init__(self, **values: str) -> None:
-        self._values = values
+        self._values = dict(values)
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._values.get(key, default if default is not None else "")
 
-
-class TestEffectiveRouting:
-    """Pure-function helper that overlays ConfigStore values on a base."""
-
-    def _models(self) -> dict[str, ModelConfig]:
-        return {
-            "default": ModelConfig("default", "x", "x", "m"),
-            "smart": ModelConfig("smart", "x", "x", "m"),
-            "fast": ModelConfig("fast", "x", "x", "m"),
-        }
-
-    def test_returns_base_when_cs_is_none(self) -> None:
-        from turnstone.server import _effective_routing
-
-        result = _effective_routing(None, self._models(), "default", "fast", "low")
-        assert result == ("default", "fast", "low")
-
-    def test_cs_alias_overrides_base(self) -> None:
-        from turnstone.server import _effective_routing
-
-        cs = _FakeCS(**{"model.task_alias": "smart"})
-        result = _effective_routing(cs, self._models(), "default", "fast", "low")
-        assert result == ("default", "smart", "low")
-
-    def test_cs_alias_silently_dropped_when_unknown(self) -> None:
-        from turnstone.server import _effective_routing
-
-        cs = _FakeCS(**{"model.task_alias": "nonexistent"})
-        result = _effective_routing(cs, self._models(), "default", "smart", None)
-        assert result == ("default", "smart", None)  # falls back to base
-
-    def test_cs_empty_string_treated_as_unset(self) -> None:
-        from turnstone.server import _effective_routing
-
-        cs = _FakeCS(
-            **{
-                "model.default_alias": "",
-                "model.task_alias": "",
-                "model.task_effort": "",
-            }
-        )
-        result = _effective_routing(cs, self._models(), "default", "fast", "low")
-        assert result == ("default", "fast", "low")
-
-    def test_cs_effort_overrides_base(self) -> None:
-        from turnstone.server import _effective_routing
-
-        cs = _FakeCS(**{"model.task_effort": "minimal"})
-        result = _effective_routing(cs, self._models(), "default", None, "high")
-        assert result == ("default", None, "minimal")
+    def set(self, key: str, value: str) -> None:
+        self._values[key] = value
 
 
-class TestApplyRoutingOverrides:
-    """Decides whether to call registry.reload based on effective vs current."""
+class TestRoutingSettingsAtUseTime:
+    """The ``model.*`` routing settings apply where they are read and are never
+    written into the registry, so a changed or cleared setting takes effect at
+    once, and an alias that isn't loaded is never swapped for another (#1359)."""
 
     def _registry(self, **kwargs: Any) -> ModelRegistry:
         return ModelRegistry(
@@ -4449,46 +4754,62 @@ class TestApplyRoutingOverrides:
             **kwargs,
         )
 
-    def test_no_reload_when_cs_matches_registry(self) -> None:
-        from turnstone.server import _apply_routing_overrides
+    def test_without_a_config_store_the_loader_values_apply(self) -> None:
+        reg = self._registry(task_model="fast", task_effort="low")
+        assert reg.effective_default(None) == "default"
+        assert reg.resolve_agent_alias("task", None) == "fast"
+        assert reg.resolve_agent_effort("task", None) == "low"
 
-        reg = self._registry(task_model="fast")
-        cs = _FakeCS(**{"model.task_alias": "fast"})
-        # Patch reload to detect calls
-        called = {"count": 0}
-        original_reload = reg.reload
-        reg.reload = lambda *a, **kw: (
-            called.update(count=called["count"] + 1)
-            or original_reload(  # type: ignore[method-assign]
-                *a, **kw
-            )
+    def test_settings_override_the_loader_values_without_touching_them(self) -> None:
+        reg = self._registry(task_model="fast", task_effort="low")
+        generation = reg.generation
+        cs = _FakeCS(
+            **{
+                "model.default_alias": "smart",
+                "model.task_alias": "smart",
+                "model.task_effort": "minimal",
+            }
         )
+        assert reg.effective_default(cs) == "smart"
+        assert reg.resolve_agent_alias("task", cs) == "smart"
+        assert reg.resolve_agent_effort("task", cs) == "minimal"
+        assert (reg.default, reg.task_model, reg.task_effort) == ("default", "fast", "low")
+        assert reg.generation == generation
 
-        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is False
-        assert called["count"] == 0
-
-    def test_reload_when_cs_differs(self) -> None:
-        from turnstone.server import _apply_routing_overrides
-
-        reg = self._registry()  # task_model=None
-        cs = _FakeCS(**{"model.task_alias": "fast"})
-        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is True
-        assert reg.task_model == "fast"
-
-    def test_no_reload_when_cs_is_none(self) -> None:
-        from turnstone.server import _apply_routing_overrides
-
+    def test_a_cleared_setting_takes_effect_at_once(self) -> None:
+        # The stale-override bug: a node layered the setting on its live
+        # default, so a cleared setting kept its old value until a Sync.
         reg = self._registry()
-        assert _apply_routing_overrides(reg, None, _KEYED_STATE) is False
+        cs = _FakeCS(**{"model.default_alias": "smart", "model.task_alias": "smart"})
+        assert reg.effective_default(cs) == "smart"
+        cs.set("model.default_alias", "")
+        cs.set("model.task_alias", "")
+        assert reg.effective_default(cs) == "default"
+        assert reg.resolve_agent_alias("task", cs) is None
 
-    def test_unknown_alias_does_not_trigger_reload(self) -> None:
-        """Invalid CS aliases are silently dropped — no spurious reload."""
-        from turnstone.server import _apply_routing_overrides
+    def test_an_unloaded_setting_is_kept_not_dropped(self) -> None:
+        reg = self._registry(task_model="fast")
+        cs = _FakeCS(**{"model.default_alias": "nonexistent", "model.task_alias": "gone"})
+        assert reg.effective_default(cs) == "nonexistent"
+        assert reg.resolve_agent_alias("task", cs) == "gone"
+        with pytest.raises(UnknownModelAliasError):
+            reg.resolve(reg.effective_default(cs))
 
-        reg = self._registry()
-        cs = _FakeCS(**{"model.task_alias": "nonexistent"})
-        assert _apply_routing_overrides(reg, cs, _KEYED_STATE) is False
-        assert reg.task_model is None  # unchanged
+    def test_blank_settings_are_unset(self) -> None:
+        reg = self._registry(task_model="fast", task_effort="low")
+        cs = _FakeCS(
+            **{"model.default_alias": "  ", "model.task_alias": "", "model.task_effort": ""}
+        )
+        assert reg.effective_default(cs) == "default"
+        assert reg.resolve_agent_alias("task", cs) == "fast"
+        assert reg.resolve_agent_effort("task", cs) == "low"
+
+    def test_task_settings_apply_only_to_the_task_kind(self) -> None:
+        reg = self._registry(agent_model="smart")
+        cs = _FakeCS(**{"model.task_alias": "fast", "model.task_effort": "low"})
+        assert reg.resolve_agent_alias("task", cs) == "fast"
+        assert reg.resolve_agent_alias("agent", cs) == "smart"
+        assert reg.resolve_agent_effort("agent", cs) is None
 
 
 # ---------------------------------------------------------------------------
@@ -5316,8 +5637,10 @@ class TestEntryWithoutEndpoint:
         assert sum("without a base_url" in _rendered(r) for r in caplog.records) == 2
 
     def test_db_row_with_unset_url_variable_is_skipped(
-        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Resolving to nothing would send the row to the provider's public
+        endpoint; a stored ${VAR} is skipped whether or not it is set."""
         monkeypatch.delenv("TURNSTONE_TEST_UNSET_URL", raising=False)
         storage = _MockStorage(
             [
@@ -5333,13 +5656,12 @@ class TestEntryWithoutEndpoint:
                 }
             ]
         )
-        with (
-            patch("turnstone.core.model_registry.load_config", return_value={}),
-            caplog.at_level(logging.WARNING),
-        ):
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry(storage=storage, allow_empty=True)
         assert reg.list_aliases() == []
-        assert any("${VAR} is unset" in _rendered(r) for r in caplog.records)
+        assert reg.skipped_aliases["row"].startswith(
+            "base_url contains ${TURNSTONE_TEST_UNSET_URL}"
+        )
 
     def test_table_provider_entry_that_relied_on_api_section_loads_with_warning(
         self, caplog: pytest.LogCaptureFixture
