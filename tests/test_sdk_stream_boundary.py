@@ -943,7 +943,7 @@ def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
 
 @pytest.mark.skipif(
     sys.platform == "darwin",
-    reason="macOS leaves the read blocked after the wire release until the read timeout",
+    reason="macOS leaves the read blocked after the wire release until the read timeout (#1350)",
 )
 @pytest.mark.parametrize(
     ("lane", "payload"),
