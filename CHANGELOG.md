@@ -728,6 +728,12 @@ frozen.
   carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
   return the display name and avatar as whoami does. The chip's old two-letter initials also broke
   on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
+- **Closing a model client mid-stream no longer leaves the stream hanging.** A model-registry reload
+  closes each provider's SDK client while a turn may still be streaming. The blocked read was left
+  waiting for the server's next byte on Linux and for the full read timeout on macOS, up to ten
+  minutes. Turnstone's SDK clients now shut each connection down before closing it, so the blocked
+  read fails at once with the retryable transport error that stream recovery already handles, on
+  every platform. (#1350)
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was
