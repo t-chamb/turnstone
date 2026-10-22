@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
+from typing import Any
 
 import anthropic
 import httpcore2
@@ -12,7 +14,12 @@ import httpx2
 import openai
 import pytest
 
-from turnstone.core.providers._http_client import _ShutdownBackend, shutdown_on_close
+from turnstone.core.providers._http_client import (
+    _ShutdownBackend,
+    _ShutdownStream,
+    _warn_left_unwrapped,
+    shutdown_on_close,
+)
 
 
 def _backends(client: httpx2.Client) -> list[httpcore2.NetworkBackend]:
@@ -51,10 +58,104 @@ def test_shutdown_on_close_is_idempotent() -> None:
         client.close()
 
 
-def test_shutdown_on_close_refuses_an_unknown_transport() -> None:
-    client = httpx2.Client(transport=httpx2.MockTransport(lambda request: httpx2.Response(200)))
-    with pytest.raises(TypeError, match="HTTPTransport"):
-        shutdown_on_close(client)
+def _unwrapped_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "will not wake" in r.getMessage()]
+
+
+def test_an_unknown_transport_leaves_the_client_as_built(caplog: pytest.LogCaptureFixture) -> None:
+    """A transport this module can't wrap fails safe to the SDK's own client, warned once."""
+    _warn_left_unwrapped.cache_clear()
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200))
+    with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._http_client"):
+        for _ in range(2):
+            client = httpx2.Client(transport=transport)
+            assert shutdown_on_close(client) is client
+            assert client.get("http://model.invalid/").status_code == 200
+    [message] = _unwrapped_warnings(caplog)
+    assert "MockTransport" in message
+
+
+def test_a_moved_private_attribute_leaves_the_client_as_built(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An httpx2 release that renames the pool's backend wraps nothing, not some transports."""
+    _warn_left_unwrapped.cache_clear()
+    client = httpx2.Client(mounts={"http://proxy.invalid": httpx2.HTTPTransport()})
+    default_backend = client._transport._pool._network_backend
+    renamed = next(iter(client._mounts.values()))._pool
+    renamed._backend = renamed.__dict__.pop("_network_backend")
+    try:
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.providers._http_client"):
+            assert shutdown_on_close(client) is client
+        assert client._transport._pool._network_backend is default_backend
+        [message] = _unwrapped_warnings(caplog)
+        assert "AttributeError" in message
+    finally:
+        renamed._network_backend = renamed._backend
+        client.close()
+
+
+class _HeldRead(httpcore2.NetworkStream):
+    """A stream whose read blocks until released, recording when it is closed."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self.reading = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        self.reading.set()
+        self.release.wait(timeout=5.0)
+        return b""
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        raise AssertionError("not written")
+
+    def close(self) -> None:
+        self.closed.set()
+
+    def get_extra_info(self, info: str) -> Any:
+        return self._sock if info == "socket" else None
+
+
+def test_close_during_a_read_shuts_down_now_and_closes_when_the_read_returns() -> None:
+    """Closing the descriptor under a read that has not yet started waiting leaves it
+    waiting on nothing until its timeout, so the close is left to the read on its way
+    out; the shutdown, which is what wakes the read, still happens at once."""
+    ours, peer = socket.socketpair()
+    peer.settimeout(5.0)
+    inner = _HeldRead(ours)
+    stream = _ShutdownStream(inner)
+    reader = threading.Thread(target=stream.read, args=(1,))
+    reader.start()
+    try:
+        assert inner.reading.wait(timeout=5.0)
+        stream.close()
+        assert peer.recv(1) == b"", "the shutdown reached the peer"
+        assert not inner.closed.is_set(), "the descriptor closed under the read"
+        inner.release.set()
+        reader.join(timeout=5.0)
+        assert inner.closed.is_set()
+    finally:
+        inner.release.set()
+        reader.join(timeout=5.0)
+        ours.close()
+        peer.close()
+
+
+def test_close_with_no_read_in_progress_closes_at_once_and_again_harmlessly() -> None:
+    ours, peer = socket.socketpair()
+    inner = _HeldRead(ours)
+    stream = _ShutdownStream(inner)
+    try:
+        stream.close()
+        assert inner.closed.is_set()
+        ours.close()
+        stream.close()
+    finally:
+        ours.close()
+        peer.close()
 
 
 def test_close_wakes_a_read_blocked_in_another_thread() -> None:

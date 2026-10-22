@@ -60,7 +60,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from turnstone.console.coordinator_client import (
     TASK_OPEN_STATUSES,
@@ -85,6 +85,7 @@ from turnstone.core.metacognition import (
     format_idle_children_nudge,
     format_idle_tasks_nudge,
 )
+from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import _TASKS_READ_ACTIONS
 from turnstone.core.storage._registry import get_storage, init_storage, reset_storage
 from turnstone.core.tool_advisory import make_system_turn
@@ -1087,7 +1088,12 @@ def _run_single_nudge(
         os.chdir(workdir)
 
     def _build_client() -> Any:
-        return OpenAI(base_url=base_url, api_key=api_key, timeout=float(test_timeout))
+        return OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=float(test_timeout),
+            http_client=shutdown_on_close(DefaultHttpxClient()),
+        )
 
     def _build_session(run_client: Any) -> tuple[Any, Any]:
         # A FRESH world per attempt — see the docstring's state-first
