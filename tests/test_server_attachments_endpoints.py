@@ -8,19 +8,22 @@ pending-list, GET /content, DELETE, auth isolation, and the extended
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, call
 
+import httpx2
 import pytest
 from starlette.testclient import TestClient
 
+from tests._helpers import opaque_png
+from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
+from turnstone.core.settings_registry import SETTINGS
+
 # Magic-byte-valid 1x1 PNG
-PNG_1x1 = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+PNG_1x1 = opaque_png()
 
 # Magic-byte-valid minimal WAV (RIFF....WAVE) for audio-kind uploads.
 WAV_12 = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 16
@@ -148,6 +151,31 @@ class TestUploadHappyPath:
         assert body["size_bytes"] == len(PNG_1x1)
         assert body["filename"] == "tiny.png"
         assert body["attachment_id"]
+
+    def test_upload_stores_a_transparent_image_flattened(self, app_client):
+        # #1445: providers each remove transparency their own way, so an image is flattened
+        # once, on upload, and the stored copy is what every model is sent and the id names.
+        import hashlib
+        from io import BytesIO
+
+        from PIL import Image
+
+        client, _ = app_client
+        src = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        src.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        uploaded = BytesIO()
+        src.save(uploaded, format="PNG")
+        aid = _upload(client, "ws-A", "userA", "title.png", uploaded.getvalue(), "image/png")
+        resp = client.get(
+            f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert aid == hashlib.sha256(resp.content).hexdigest()
+        stored = Image.open(BytesIO(resp.content))
+        assert stored.mode == "RGB"
+        assert stored.getpixel((0, 0)) == (0, 0, 0)
+        assert stored.getpixel((20, 10)) == (255, 255, 255)
 
     def test_upload_markdown_text(self, app_client):
         client, _ = app_client
@@ -609,6 +637,37 @@ class TestSendMessageAttachments:
         assert atts[0].attachment_id == aid
         assert atts[0].kind == "text"
 
+    def test_send_reads_the_owner_row_off_the_event_loop(self, app_client, monkeypatch):
+        """The send's attachment-owner check reads the workstream's row from
+        storage; it runs in a worker thread, so a slow or failing read can't
+        stall every request on the node."""
+        import asyncio
+
+        from turnstone.core.storage._registry import get_storage
+
+        client, mgr = app_client
+        self._wire_ws(mgr, "ws-A", "userA")
+        storage = get_storage()
+        real = storage.get_workstream
+        on_loop: list[bool] = []
+
+        def _spy(ws_id: str) -> Any:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return real(ws_id)
+
+        monkeypatch.setattr(storage, "get_workstream", _spy)
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/send", json={"message": "hi"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200
+        assert on_loop
+        assert not any(on_loop)
+
     def test_send_validates_and_threads_client_send_id(self, app_client):
         client, mgr = app_client
         captured, _ = self._wire_ws(mgr, "ws-A", "userA")
@@ -1017,11 +1076,23 @@ class TestServiceScopedActorFlow:
 
 
 class _VoiceConfigStore:
-    def __init__(self, **values: str) -> None:
+    """A ConfigStore stand-in for the voice endpoints.
+
+    A missing key returns the *registry* default, as the real store does
+    (``core/config_store.py``: ``get`` falls through to ``SETTINGS[key].default``).
+    Returning a bare ``""`` here instead would let a test install a state
+    production cannot reach, and a test written against such a state proves
+    nothing about production.
+    """
+
+    def __init__(self, **values: Any) -> None:
         self._values = dict(values)
 
-    def get(self, key: str, default: str = "") -> str:
-        return self._values.get(key, default)
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._values:
+            return self._values[key]
+        defn = SETTINGS.get(key)
+        return defn.default if defn is not None else default
 
 
 @pytest.fixture
@@ -1070,6 +1141,10 @@ def voice_app_client(tmp_path):
         default="voice",
     )
     mock_client = MagicMock()
+    # Every clone (a minted credential, synthesis's bounded attempt) comes back
+    # as this mock, so one surface scripts the backend for every route.
+    # test_audio.py pins that synthesis really sends through its clone.
+    mock_client.with_options.return_value = mock_client
     transcription_response = MagicMock()
     transcription_response.parse.return_value = MagicMock(text="hello from speech")
     transcription_manager = MagicMock()
@@ -1115,6 +1190,7 @@ def voice_app_client(tmp_path):
         yield client, mock_client
     finally:
         client.close()
+        app.state.tts.shutdown()  # the synthesis threads; the lifespan never ran
         reset_storage()
 
 
@@ -1204,6 +1280,84 @@ class TestSpeechToTextStream:
 
 
 class TestTextToSpeech:
+    def test_a_caller_that_leaves_stops_the_synthesis_quietly(self, voice_app_client, monkeypatch):
+        """A handler isn't cancelled when its caller leaves.  The watcher closes
+        the captured response, which unblocks the worker, and the handler answers
+        without raising: no 500, no error traceback, and its budget comes back."""
+        import turnstone.server as srv
+
+        monkeypatch.setattr(srv, "_TTS_DISCONNECT_POLL_S", 0.01)
+        client, mock_client = voice_app_client
+        manager = mock_client.audio.speech.with_streaming_response.create.return_value
+        closed = threading.Event()
+
+        def _read() -> bytes:
+            # A backend still streaming the clip: the read ends when the
+            # response is closed.
+            if not closed.wait(5):
+                raise AssertionError("the response was never closed")
+            raise RuntimeError("stream closed")
+
+        manager.__enter__.return_value.read.side_effect = _read
+        manager.__enter__.return_value.close.side_effect = closed.set
+
+        headers = {**_auth("userA"), "Content-Type": "application/json"}
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/api/tts",
+            "raw_path": b"/v1/api/tts",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            "client": ("127.0.0.1", 50000),
+            "server": ("testserver", 80),
+        }
+        body_sent = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal body_sent
+            if not body_sent:
+                body_sent = True
+                return {"type": "http.request", "body": b'{"text": "hello"}', "more_body": False}
+            return {"type": "http.disconnect"}  # the caller has gone
+
+        messages: list[dict[str, Any]] = []
+
+        async def send(message: dict[str, Any]) -> None:
+            messages.append(message)
+
+        asyncio.run(client.app(scope, receive, send))
+
+        assert closed.is_set()
+        assert messages[0]["status"] == 499
+        assert client.app.state.tts.in_flight == 0
+
+    def test_synthesis_runs_with_the_request_log_context(self, voice_app_client):
+        # The tts threads are a pool of their own, which doesn't carry the
+        # request's context the way asyncio.to_thread does unless it's copied.
+        from turnstone.core.log import ctx_user_id
+
+        client, mock_client = voice_app_client
+        create = mock_client.audio.speech.with_streaming_response.create
+        manager = create.return_value
+        seen: dict[str, str] = {}
+
+        def _create(**_kwargs: Any) -> Any:
+            seen["thread"] = threading.current_thread().name
+            seen["user_id"] = ctx_user_id.get()
+            return manager
+
+        create.side_effect = _create
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+
+        assert resp.status_code == 200, resp.text
+        assert seen["thread"].startswith("tts")
+        assert seen["user_id"] == "userA"
+
     def test_unconfigured_returns_503(self, app_client):
         client, _ = app_client
         resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
@@ -1229,6 +1383,42 @@ class TestTextToSpeech:
         client, _ = voice_app_client
         resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
         assert resp.status_code == 400
+
+    def test_a_full_cap_text_is_accepted(self, voice_app_client):
+        from turnstone.server import _TTS_TEXT_CAP
+
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "x" * _TTS_TEXT_CAP}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_a_play_starts_beside_one_and_is_refused_beside_two(self, voice_app_client):
+        # Refused, not queued: queue time would come out of the console's wait.
+        client, _ = voice_app_client
+        capacity = client.app.state.tts
+        assert capacity.try_admit()  # a play already rendering
+
+        beside_one = client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA"))
+        assert capacity.try_admit()  # and a second
+        beside_two = client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA"))
+
+        assert beside_one.status_code == 200, beside_one.text
+        assert beside_two.status_code == 429
+        assert beside_two.headers["retry-after"] == "5"
+        assert "busy" in beside_two.json()["error"]
+
+    def test_the_slot_is_released_after_a_failed_synthesis(self, voice_app_client):
+        client, mock_client = voice_app_client
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("backend down")
+
+        assert (
+            client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA")).status_code
+            == 502
+        )
+        # A failure must give its slot back, or the node refuses for ever.
+        assert client.app.state.tts.in_flight == 0
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
@@ -1290,7 +1480,17 @@ class TestVoiceBackendAuth:
             scopes="",
             grant_leg="entra",
         )
-        mock_client.with_options.assert_called_once_with(api_key="minted-token")
+        # The mint must reach the call as a clone, and nothing may replace it;
+        # synthesis then clones once more for its one bounded attempt.
+        expected = [call(api_key="minted-token")]
+        if route == "tts":
+            expected.append(
+                call(
+                    max_retries=0,
+                    timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
+                )
+            )
+        assert mock_client.with_options.call_args_list == expected
 
     @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
     def test_auth_failure_is_masked_and_never_dispatches(

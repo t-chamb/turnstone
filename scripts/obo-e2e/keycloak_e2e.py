@@ -46,7 +46,7 @@ import tempfile
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
+import httpx2
 
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import get_obo_access_token_classified
@@ -91,7 +91,7 @@ def aud_carries(token: str, want: str) -> tuple[bool, str]:
 
 
 class _CountingClient:
-    def __init__(self, inner: httpx.AsyncClient) -> None:
+    def __init__(self, inner: httpx2.AsyncClient) -> None:
         self._inner = inner
         self.posts = 0
 
@@ -102,14 +102,14 @@ class _CountingClient:
     async def aclose(self) -> None:
         await self._inner.aclose()
 
-    async def post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+    async def post(self, *args: Any, **kwargs: Any) -> httpx2.Response:
         self.posts += 1
         return await self._inner.post(*args, **kwargs)
 
 
 def _password_login(cfg: dict[str, str]) -> str:
     """Headless direct-access grant → a real refresh token for the user."""
-    resp = httpx.post(
+    resp = httpx2.post(
         cfg["KC_TOKEN_ENDPOINT"],
         data={
             "grant_type": "password",
@@ -347,11 +347,11 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
 class _RecordingGet:
     """Duck-typed GET client that records every URL discovery fetches."""
 
-    def __init__(self, inner: httpx.AsyncClient) -> None:
+    def __init__(self, inner: httpx2.AsyncClient) -> None:
         self._inner = inner
         self.urls: list[str] = []
 
-    async def get(self, url: Any, *args: Any, **kwargs: Any) -> httpx.Response:
+    async def get(self, url: Any, *args: Any, **kwargs: Any) -> httpx2.Response:
         self.urls.append(str(url))
         return await self._inner.get(url, *args, **kwargs)
 
@@ -362,8 +362,9 @@ async def _discovery_probe(cfg: dict[str, str]) -> None:
     A realm issuer carries a path, which is the shape that failed before
     this branch. Discovery must resolve it, land on a document that
     advertises S256, and report the endpoints of that realm. The realm is
-    loopback, which the SSRF check admits as the development lane, so no
-    allowance is patched in.
+    loopback, which the SSRF check admits as the development lane for an
+    issuer the operator typed; this call stands in for one, so it asks for
+    that lane and nothing else is patched in.
     """
     import time
 
@@ -380,6 +381,7 @@ async def _discovery_probe(cfg: dict[str, str]) -> None:
                 http_client=recorder,  # type: ignore[arg-type]
                 trusted_hosts=frozenset(),
                 deadline=time.monotonic() + _DISCOVERY_TOTAL_BUDGET,
+                allow_localhost=True,
             )
         except Exception as exc:
             record(

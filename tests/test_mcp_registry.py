@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx2
 import pytest
 
+from tests._http_failure_cases import UNREACHABLE_REPLIES
 from turnstone.core.mcp_registry import (
     MCPRegistryClient,
     MCPRegistryError,
@@ -67,6 +70,17 @@ def _server_entry(
     if packages is not None:
         entry["packages"] = packages
     return entry
+
+
+def _route_registry(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    """Have the registry client's constructor build its client on *handler*'s MockTransport.
+
+    Going through the constructor makes the client it builds the one whose errors are caught.
+    """
+    monkeypatch.setattr(
+        "turnstone.core.mcp_registry.httpx2.AsyncClient",
+        functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +257,22 @@ class TestMCPRegistryClientSearch:
                 pytest.raises(MCPRegistryError, match="500"),
             ):
                 await client.search()
+
+    @pytest.mark.anyio
+    @UNREACHABLE_REPLIES
+    async def test_search_request_failure(self, monkeypatch: pytest.MonkeyPatch, reply) -> None:
+        _route_registry(monkeypatch, reply)
+        async with MCPRegistryClient(base_url="https://registry.example") as client:
+            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
+                await client.search()
+
+    @pytest.mark.anyio
+    async def test_search_term_with_a_lone_surrogate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Encoding the query raises UnicodeEncodeError before anything is sent.
+        _route_registry(monkeypatch, lambda request: httpx2.Response(200, json={}))
+        async with MCPRegistryClient(base_url="https://registry.example") as client:
+            with pytest.raises(MCPRegistryError, match="HTTP request failed"):
+                await client.search(q="a" + chr(0xD800))
 
     @pytest.mark.anyio
     async def test_search_limit_clamped(self) -> None:

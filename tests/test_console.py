@@ -2,12 +2,20 @@
 
 import asyncio
 import json
+import logging
 import queue
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
 import pytest
 
+from tests._http_failure_cases import (
+    MAYBE_PROCESSED_REPLIES,
+    UNREACHABLE_REPLIES,
+    UNSENT_REPLIES,
+    refuse,
+)
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 from turnstone.console.server import _PROXY_AUTH_LOCAL_HANDLERS
 
@@ -1310,6 +1318,68 @@ class TestConsoleHTTPEndpoints:
         assert status == 404
         assert "error" in data
 
+    def test_get_node_detail_attaches_decoded_metadata(self, client, mock_collector):
+        """The metadata read runs in a worker thread, off the event loop."""
+        on_loop: list[bool] = []
+
+        def _get_node_metadata(node_id: str) -> list[dict[str, str]]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return [
+                {"key": "arch", "value": '"x86_64"', "source": "auto"},
+                {"key": "notes", "value": "not json", "source": "user"},
+            ]
+
+        storage = MagicMock()
+        storage.get_node_metadata.side_effect = _get_node_metadata
+        client.app.state.auth_storage = storage
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 200
+        assert data["metadata"] == [
+            {"key": "arch", "value": "x86_64", "source": "auto"},
+            {"key": "notes", "value": "not json", "source": "user"},
+        ]
+        assert on_loop == [False]
+
+    def test_get_node_detail_answers_503_when_its_metadata_cannot_be_read(
+        self, client, mock_collector
+    ):
+        """A failed metadata read is an error, not a node with no metadata."""
+        storage = MagicMock()
+        storage.get_node_metadata.side_effect = RuntimeError("storage down")
+        client.app.state.auth_storage = storage
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 503
+        assert data == {"error": "node metadata could not be read"}
+
+    def test_get_node_detail_shows_a_value_too_deep_to_parse_raw(
+        self, client, mock_collector, monkeypatch
+    ):
+        """A stored value nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It is shown raw, like any other value
+        that can't be parsed."""
+        real_loads = json.loads
+
+        def _loads(s: Any, *a: Any, **kw: Any) -> Any:
+            if s == '"deep"':
+                raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+            return real_loads(s, *a, **kw)
+
+        storage = MagicMock()
+        storage.get_node_metadata.return_value = [
+            {"key": "notes", "value": '"deep"', "source": "user"},
+        ]
+        client.app.state.auth_storage = storage
+        monkeypatch.setattr(json, "loads", _loads)
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
+        assert status == 200
+        assert data["metadata"] == [{"key": "notes", "value": '"deep"', "source": "user"}]
+
     def test_get_snapshot(self, client, mock_collector):
         status, data = self._get(client, "/v1/api/cluster/snapshot")
         assert status == 200
@@ -1490,7 +1560,7 @@ class TestConsoleWorkstreamCreation:
     def client_and_mock(self, mock_collector):
         """Returns (TestClient, mock_proxy_post) where mock_proxy_post is the
         patched proxy_client.post that captures outgoing HTTP calls."""
-        import httpx
+        import httpx2
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
@@ -1503,14 +1573,14 @@ class TestConsoleWorkstreamCreation:
 
         # Set up a mock proxy_client (lifespan doesn't run in TestClient)
         async def _mock_post(*args, **kwargs):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": "ws_new_123", "name": "test"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
         mock_post = MagicMock(side_effect=_mock_post)
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = mock_post
         app.state.proxy_client = mock_proxy
 
@@ -1538,13 +1608,13 @@ class TestConsoleWorkstreamCreation:
 
     @staticmethod
     def _node_answers(mock_post, status, body):
-        import httpx
+        import httpx2
 
         async def _post(*args, **kwargs):
-            return httpx.Response(
+            return httpx2.Response(
                 status,
                 json=body,
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
         mock_post.side_effect = _post
@@ -1584,6 +1654,33 @@ class TestConsoleWorkstreamCreation:
         resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
         assert resp.status_code == 503
         assert resp.json()["error"].startswith("The default model isn't loaded on node node-a")
+
+    @pytest.mark.parametrize(
+        ("failure", "body"),
+        [
+            ("refused", {"error": "Dispatch to node node-a failed"}),
+            (
+                "read-timeout",
+                {
+                    "error": (
+                        "no reply was read from node node-a, so the request may have been processed"
+                    ),
+                    "code": "upstream_no_reply",
+                },
+            ),
+        ],
+    )
+    def test_create_transport_failure(self, client_and_mock, failure, body):
+        # A create that outlasted the timeout may have made the workstream, so it isn't masked.
+        import httpx2
+
+        client, mock_post = client_and_mock
+        mock_post.side_effect = (
+            httpx2.ConnectError("refused") if failure == "refused" else httpx2.ReadTimeout("slow")
+        )
+        resp = client.post("/v1/api/cluster/workstreams/new", json={"node_id": "node-a"})
+        assert resp.status_code == 502
+        assert resp.json() == body
 
     def test_other_node_503s_stay_masked(self, client_and_mock):
         client, mock_post = client_and_mock
@@ -1811,14 +1908,14 @@ class TestConsoleProxy:
     def test_proxy_static_percent_encodes_each_valid_path_segment(self, monkeypatch):
         from types import SimpleNamespace
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"asset",
-            request=httpx.Request("GET", "http://n:1/static/nested/asset"),
+            request=httpx2.Request("GET", "http://n:1/static/nested/asset"),
         )
         calls = []
 
@@ -1826,7 +1923,7 @@ class TestConsoleProxy:
             calls.append((url, headers))
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -1854,17 +1951,17 @@ class TestConsoleProxy:
     ):
         from types import SimpleNamespace
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             304,
             headers={
                 "etag": '"current-build"',
                 "last-modified": "Wed, 12 Aug 2026 12:00:00 GMT",
             },
-            request=httpx.Request("GET", f"http://n:1/{mount}/{path}"),
+            request=httpx2.Request("GET", f"http://n:1/{mount}/{path}"),
         )
         calls = []
 
@@ -1872,7 +1969,7 @@ class TestConsoleProxy:
             calls.append((url, headers))
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -1897,14 +1994,14 @@ class TestConsoleProxy:
 
     @pytest.mark.parametrize("status_code", [404, 500])
     def test_proxy_vendor_static_error_is_never_immutable(self, status_code):
-        import httpx
+        import httpx2
 
         from turnstone.console.server import _proxy_static_response
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             status_code,
             content=b"transient failure",
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.19.0/missing.css"),
+            request=httpx2.Request("GET", "http://n:1/shared/katex-0.19.0/missing.css"),
         )
 
         resp = _proxy_static_response(upstream, "katex-0.19.0/missing.css")
@@ -1924,15 +2021,15 @@ class TestConsoleProxy:
     def test_proxy_vendor_static_preserves_stricter_upstream_policy(
         self, upstream_policy, expected
     ):
-        import httpx
+        import httpx2
 
         from turnstone.console.server import _proxy_static_response
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"asset",
             headers={"cache-control": upstream_policy},
-            request=httpx.Request("GET", "http://n:1/shared/katex-0.19.0/katex.js"),
+            request=httpx2.Request("GET", "http://n:1/shared/katex-0.19.0/katex.js"),
         )
 
         resp = _proxy_static_response(upstream, "katex-0.19.0/katex.js")
@@ -1951,6 +2048,168 @@ class TestConsoleProxy:
             json={"message": "hello", "ws_id": "ws1"},
         )
         assert resp.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/node/node-a/"),
+            ("GET", "/node/node-a/static/app.js"),
+            ("GET", "/node/node-a/v1/api/workstreams"),
+        ],
+        ids=["index", "static", "api-get"],
+    )
+    @UNREACHABLE_REPLIES
+    def test_proxy_unreachable_node_returns_502(self, client, method, path, reply):
+        import httpx2
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.request(method, path)
+        finally:
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+
+    def _proxy_post(self, client, reply):
+        import httpx2
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
+        client.app.state.proxy_client = proxy
+        try:
+            return client.post("/node/node-a/v1/api/workstreams/new", json={})
+        finally:
+            asyncio.run(proxy.aclose())
+
+    @UNSENT_REPLIES
+    def test_proxy_post_to_an_unreachable_node_returns_502(self, client, reply):
+        resp = self._proxy_post(client, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+
+    @MAYBE_PROCESSED_REPLIES
+    def test_proxy_post_with_no_reply_may_have_been_processed(self, client, reply):
+        resp = self._proxy_post(client, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": "no reply was read from the node, so the request may have been processed",
+            "code": "upstream_no_reply",
+        }
+
+    def test_a_watch_cancel_with_no_reply_may_have_been_processed(self, client):
+        import httpx2
+
+        from tests._http_failure_cases import time_out_reading
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(time_out_reading))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.post("/v1/api/admin/watches/abc123/cancel", json={"node_id": "node-a"})
+        finally:
+            asyncio.run(proxy.aclose())
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "upstream_no_reply"
+
+    def test_proxy_path_httpx2_cannot_send_returns_502(self, client):
+        import httpx2
+
+        # The console decodes %01 into the path it forwards, and httpx2 refuses a control
+        # character in a URL, so nothing is sent.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client.app.state.proxy_client = proxy
+        try:
+            resp = client.get("/node/node-a/v1/api/workstreams%01")
+        finally:
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "Node unreachable"}
+        assert sent == []
+
+    @pytest.mark.parametrize(
+        "forged",
+        [
+            # ESC, BEL and CR, which httpx2 won't put in a URL, so the request fails unsent.
+            "%1B%07%0DINFO%20forged",
+            # NEL, CSI and a line separator, which httpx2 percent-encodes and sends.
+            "%C2%85INFO%20forged%C2%9B2K%E2%80%A8",
+        ],
+        ids=["ascii-controls", "unicode-controls"],
+    )
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/node/node-a/static/app.js{forged}"),
+            ("GET", "/node/node-a/v1/api/workstreams{forged}"),
+            ("POST", "/node/node-a/v1/api/workstreams/new{forged}"),
+            ("GET", "/node/node-a/v1/api/workstreams/a{forged}/events"),
+        ],
+        ids=["static", "api-get", "api-post", "sse"],
+    )
+    def test_a_failed_request_logs_its_path_escaped(self, client, caplog, method, path, forged):
+        import httpx2
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(refuse))
+        client.app.state.proxy_client = proxy
+        client.app.state.proxy_sse_client = proxy
+        try:
+            with caplog.at_level(logging.DEBUG, logger="turnstone.console.server"):
+                client.request(
+                    method, path.format(forged=forged), json={} if method == "POST" else None
+                )
+        finally:
+            asyncio.run(proxy.aclose())
+
+        logged = [r.getMessage() for r in caplog.records if "forged" in r.getMessage()]
+        assert logged
+        assert all(ch.isprintable() for message in logged for ch in message)
+
+    def test_an_event_stream_error_logs_its_url_escaped(self, client, caplog):
+        import httpx2
+
+        def not_found(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(404, json={"error": "Unknown workstream"})
+
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(not_found))
+        client.app.state.proxy_sse_client = proxy
+        path = "/node/node-a/v1/api/workstreams/a%C2%85INFO%20forged%C2%9B2K%E2%80%A8/events"
+        try:
+            with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
+                client.get(path)
+        finally:
+            asyncio.run(proxy.aclose())
+
+        [message] = [
+            r.getMessage() for r in caplog.records if "proxy.sse.non_200" in r.getMessage()
+        ]
+        assert "forged" in message
+        assert all(ch.isprintable() for ch in message)
+
+    @UNREACHABLE_REPLIES
+    def test_proxy_sse_from_unreachable_node_ends_the_stream(self, client, reply):
+        import httpx2
+        from starlette.testclient import TestClient
+
+        sse_client = httpx2.AsyncClient(transport=httpx2.MockTransport(reply))
+        client.app.state.proxy_sse_client = sse_client
+        # The relay's headers are already sent when it connects upstream, so an
+        # exception escaping it would still read as an empty 200 unless raised here.
+        strict = TestClient(client.app, headers=_TEST_AUTH_HEADERS)
+        try:
+            resp = strict.get(f"/node/node-a/v1/api/workstreams/{'a' * 32}/events")
+        finally:
+            strict.close()
+            asyncio.run(sse_client.aclose())
+
+        assert resp.status_code == 200
+        assert resp.content == b""
 
     def test_proxy_api_per_ws_events_routes_to_sse_handler(self, client, mock_collector):
         """``/node/{node_id}/v1/api/workstreams/{ws_id}/events`` is the
@@ -1992,6 +2251,38 @@ class TestConsoleProxy:
             # form so the upstream URL is reconstructed correctly.
             sse_args = sse_mock.await_args
             assert sse_args.args[2] == f"workstreams/{ws_id}/events"
+
+    def test_proxy_api_routes_tts_through_the_departure_watch(self, client, mock_collector):
+        """A browser that leaves a read-aloud call has to reach the node, so
+        ``tts`` goes through ``_proxy_tts``; every other POST stays on
+        ``_proxy_post``."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        with (
+            patch(
+                "turnstone.console.server._proxy_tts",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as tts_mock,
+            patch(
+                "turnstone.console.server._proxy_post",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as post_mock,
+        ):
+            client.post("/node/node-a/v1/api/tts", json={"text": "hi"})
+            client.post("/node/node-a/v1/api/workstreams/new", json={})
+        assert tts_mock.await_count == 1
+        assert tts_mock.await_args.args[2] == "tts"
+        assert post_mock.await_count == 1
+        assert post_mock.await_args.args[2] == "workstreams/new"
 
     def test_proxy_api_global_events_still_routes_to_sse(self, client, mock_collector):
         """The bare ``events/global`` path was the only SSE path the
@@ -2499,7 +2790,7 @@ class TestProxyRewriting:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
@@ -2511,17 +2802,17 @@ class TestProxyRewriting:
             "literal replace() would silently inject nothing at all."
         )
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=index.encode(),
             headers={"content-type": "text/html; charset=utf-8"},
-            request=httpx.Request("GET", "http://n:1/"),
+            request=httpx2.Request("GET", "http://n:1/"),
         )
 
         async def _mock_get(*a, **kw):
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -2850,9 +3141,6 @@ class TestSSEProxy:
 
             headers = {}
 
-            async def is_disconnected(self):
-                return False
-
         async def _run():
             response = await _proxy_sse(
                 FakeRequest(), "http://fake:8080", "events", api_prefix="v1/api"
@@ -2907,9 +3195,6 @@ class TestSSEProxy:
 
             headers = {}
 
-            async def is_disconnected(self):
-                return False
-
         async def _run():
             response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
             chunks: list[bytes] = []
@@ -2921,61 +3206,142 @@ class TestSSEProxy:
 
         asyncio.run(_run())
 
+    def test_proxy_sse_closes_an_idle_upstream_through_uvicorn(self):
+        """Through uvicorn and the console's middleware, the relay closes its upstream connection
+        once the browser's connection closes, while the upstream has nothing more to send. This
+        also pins that uvicorn still reports an ASGI spec under which the response listens for
+        the disconnect."""
+        import httpx2
+        import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        from turnstone.console.server import _build_console_middleware, _proxy_sse
+
+        async def _run():
+            upstream_eof = asyncio.Event()
+
+            async def upstream(reader, writer):
+                await reader.readuntil(b"\r\n\r\n")
+                body = b"data: chunk1\n\n"
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                    b"transfer-encoding: chunked\r\n\r\n"
+                    + f"{len(body):x}\r\n".encode()
+                    + body
+                    + b"\r\n"
+                )
+                await writer.drain()
+                await reader.read()  # idle until the relay drops the connection
+                upstream_eof.set()
+                writer.close()
+
+            node = await asyncio.start_server(upstream, "127.0.0.1", 0)
+            node_url = f"http://127.0.0.1:{node.sockets[0].getsockname()[1]}"
+
+            async def relay(request):
+                return await _proxy_sse(request, node_url, "events")
+
+            # /health is a public path, so the auth middleware passes the request on without a
+            # token; it hands receive and send through the same way on an authenticated path.
+            app = Starlette(
+                routes=[Route("/health", relay)],
+                middleware=_build_console_middleware(["http://example.com"]),
+            )
+            app.state.proxy_sse_client = httpx2.AsyncClient(trust_env=False)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host="127.0.0.1",
+                    port=0,
+                    lifespan="off",
+                    log_level="warning",
+                    timeout_graceful_shutdown=1,
+                )
+            )
+            serving = asyncio.create_task(server.serve())
+            try:
+                while not server.started:
+                    await asyncio.sleep(0.01)
+                port = server.servers[0].sockets[0].getsockname()[1]
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                writer.write(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                received = b""
+                while b"chunk1" not in received:
+                    received += await asyncio.wait_for(reader.read(4096), 5)
+                writer.close()
+                await asyncio.wait_for(upstream_eof.wait(), 2)
+            finally:
+                server.should_exit = True
+                await serving
+                await app.state.proxy_sse_client.aclose()
+                node.close()
+                await node.wait_closed()
+
+        asyncio.run(_run())
+
     def test_proxy_sse_disconnect_handling(self):
-        """Proxy should stop when browser disconnects."""
+        """The relay stops, and closes its upstream stream, once the browser disconnects, even
+        while the upstream has nothing more to send."""
 
         from turnstone.console.server import _proxy_sse
 
-        class FakeResponse:
-            status_code = 200
-
-            async def aiter_bytes(self):
-                yield b"data: chunk1\n\n"
-                yield b"data: chunk2\n\n"  # should not be reached
-                yield b"data: chunk3\n\n"
-
-            async def aclose(self):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-        class FakeClient:
-            def stream(self, method, url, **kwargs):
-                return FakeResponse()
-
-        call_count = 0
-
-        class FakeRequest:
-            class url:  # noqa: N801
-                query = ""
-
-            class app:  # noqa: N801
-                class state:  # noqa: N801
-                    proxy_sse_client = FakeClient()
-                    proxy_auth_token = ""
-
-            headers = {}
-
-            async def is_disconnected(self):
-                nonlocal call_count
-                call_count += 1
-                return call_count > 1  # disconnect after first chunk
-
         async def _run():
-            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
-            chunks: list[bytes] = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-            body = b"".join(chunks)
-            assert b"chunk1" in body
-            # Should have stopped before chunk3
-            assert b"chunk3" not in body
+            first_sent = asyncio.Event()
+            upstream_closed = asyncio.Event()
 
-        asyncio.run(_run())
+            class FakeResponse:
+                status_code = 200
+
+                async def aiter_bytes(self):
+                    yield b"data: chunk1\n\n"
+                    # An upstream with nothing more to send, so only the disconnect can end the
+                    # relay.
+                    await asyncio.Event().wait()
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    upstream_closed.set()
+
+            class FakeClient:
+                def stream(self, method, url, **kwargs):
+                    return FakeResponse()
+
+            class FakeRequest:
+                class url:  # noqa: N801
+                    query = ""
+
+                class app:  # noqa: N801
+                    class state:  # noqa: N801
+                        proxy_sse_client = FakeClient()
+                        proxy_auth_token = ""
+
+                headers = {}
+
+            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
+            bodies: list[bytes] = []
+
+            async def receive():
+                await first_sent.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and message.get("body"):
+                    bodies.append(message["body"])
+                    first_sent.set()
+
+            # The ASGI spec version uvicorn reports, under which the response listens for the
+            # disconnect itself (the uvicorn test above checks the real server). Under 2.4 nothing
+            # reads the disconnect, so the relay waits on its idle upstream and this times out.
+            scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+            await asyncio.wait_for(response(scope, receive, send), timeout=5)
+            return bodies, upstream_closed.is_set()
+
+        bodies, upstream_closed = asyncio.run(_run())
+        assert bodies == [b"data: chunk1\n\n"]
+        assert upstream_closed
 
 
 # ---------------------------------------------------------------------------
@@ -3284,11 +3650,11 @@ class TestProxyGetHeaderPassThrough:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        import httpx
+        import httpx2
 
         from turnstone.console import server as csrv
 
-        upstream = httpx.Response(
+        upstream = httpx2.Response(
             200,
             content=b"<html>page</html>",
             headers={
@@ -3299,13 +3665,13 @@ class TestProxyGetHeaderPassThrough:
                 "cache-control": "private, no-store",
                 "server": "upstream-internal",  # hop metadata: must NOT pass
             },
-            request=httpx.Request("GET", "http://n:1/x"),
+            request=httpx2.Request("GET", "http://n:1/x"),
         )
 
         async def _mock_get(*a, **kw):
             return upstream
 
-        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client = MagicMock(spec=httpx2.AsyncClient)
         proxy_client.get = MagicMock(side_effect=_mock_get)
         request = SimpleNamespace(
             app=SimpleNamespace(state=SimpleNamespace(proxy_client=proxy_client)),
@@ -3325,3 +3691,217 @@ class TestProxyGetHeaderPassThrough:
             "server" not in {k.lower() for k in resp.headers}
             or resp.headers.get("server") != "upstream-internal"
         )
+
+
+class TestProxyTtsTimeout:
+    """The node's ``tts`` route answers only once the whole clip is synthesized,
+    so it gets a longer read deadline than the shared proxy client.  Every other
+    proxied POST keeps that client's own timeout, and the deadline is derived from
+    the live client rather than rebuilt from a constant.
+
+    These assert ``request.extensions["timeout"]``: that is the deadline httpx2
+    hands the transport and the one actually enforced, so a wrong kwarg cannot
+    pass the test.  (``MockTransport`` itself ignores timeouts, which is why the
+    check is made where the client materialises them rather than on a wall clock.)
+    """
+
+    @staticmethod
+    def _call(monkeypatch, path, timeout):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        seen: dict[str, float] = {}
+
+        async def _handler(request):
+            seen.update(request.extensions["timeout"])
+            return httpx2.Response(200, content=b"ok")
+
+        async def _body():
+            return b"{}"
+
+        async def _run():
+            async with httpx2.AsyncClient(
+                transport=httpx2.MockTransport(_handler), timeout=timeout
+            ) as client:
+                request = SimpleNamespace(
+                    app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+                    method="POST",
+                    body=_body,
+                    headers={"content-type": "application/json"},
+                    url=SimpleNamespace(query=""),
+                )
+                return await csrv._proxy_post(request, "http://n:1", path, api_prefix="v1/api")
+
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        resp = asyncio.run(_run())
+        assert resp.status_code == 200
+        return seen
+
+    def test_tts_read_deadline_is_extended(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console.server import _TTS_PROXY_READ_TIMEOUT_S
+
+        timeout = httpx2.Timeout(30.0)
+        applied = self._call(monkeypatch, "tts", timeout)
+        assert applied["read"] == _TTS_PROXY_READ_TIMEOUT_S
+        # Only the wait for the clip moves; reaching the node keeps the client's bound.
+        assert applied["connect"] == timeout.connect
+        assert applied["write"] == timeout.write
+        assert applied["pool"] == timeout.pool
+
+    def test_other_paths_keep_the_client_timeout(self, monkeypatch):
+        import httpx2
+
+        assert self._call(monkeypatch, "workstreams/ws-1/send", httpx2.Timeout(30.0)) == {
+            "connect": 30.0,
+            "read": 30.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+
+    def test_a_differently_built_client_is_followed(self, monkeypatch):
+        # Both proxy clients are built with _PROXY_CLIENT_TIMEOUT_S today; the
+        # derivation keeps whatever bounds a client is built with, rather than
+        # resetting connect/write/pool to that constant.
+        import httpx2
+
+        timeout = httpx2.Timeout(connect=7.0, read=9.0, write=11.0, pool=13.0)
+        applied = self._call(monkeypatch, "tts", timeout)
+        assert (applied["connect"], applied["write"], applied["pool"]) == (7.0, 11.0, 13.0)
+
+    def test_the_console_outwaits_a_full_cap_clip(self):
+        """The three numbers must stay in order, or the node accepts text the
+        console abandons, which is the bug this replaces.
+
+        A full-cap clip fits inside the node's backend timeout, and that timeout
+        ends before the console stops waiting, so the node frees the call and
+        answers its own error first.  ~107 chars/s is the slowest backend
+        measured, so the margin is real on anything faster.
+        """
+        from turnstone.console.server import _TTS_PROXY_READ_TIMEOUT_S
+        from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
+        from turnstone.server import _TTS_TEXT_CAP
+
+        slowest_measured_chars_per_second = 107
+        full_cap_clip_s = _TTS_TEXT_CAP / slowest_measured_chars_per_second
+        assert full_cap_clip_s <= _TTS_BACKEND_TIMEOUT_S < _TTS_PROXY_READ_TIMEOUT_S
+
+
+class TestProxyTtsDeparture:
+    """A browser that leaves a ``tts`` call must reach the node, which only stops
+    synthesizing when its own caller, the console, hangs up."""
+
+    @staticmethod
+    def _request(client, *, gone):
+        async def _body():
+            return b'{"text": "hello"}'
+
+        async def _is_disconnected():
+            return gone()
+
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+            method="POST",
+            body=_body,
+            headers={"content-type": "application/json"},
+            url=SimpleNamespace(query=""),
+            is_disconnected=_is_disconnected,
+        )
+
+    def test_a_departed_browser_cancels_the_node_call(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_TTS_DEPARTURE_POLL_S", 0.01)
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        node_saw: list[str] = []
+
+        async def _node(request):
+            node_saw.append("request")
+            try:
+                await asyncio.sleep(30)  # synthesizing
+            except asyncio.CancelledError:
+                node_saw.append("cancelled")
+                raise
+            return httpx2.Response(200, content=b"audio")
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = self._request(client, gone=lambda: bool(node_saw))
+                return await csrv._proxy_tts(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        resp = asyncio.run(_run())
+
+        assert node_saw == ["request", "cancelled"]
+        assert resp.status_code == 499
+
+    def test_a_browser_that_stays_gets_the_node_answer(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_TTS_DEPARTURE_POLL_S", 0.01)
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+
+        async def _node(request):
+            await asyncio.sleep(0.05)  # a few polls' worth
+            return httpx2.Response(200, content=b"audio", headers={"content-type": "audio/mpeg"})
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = self._request(client, gone=lambda: False)
+                return await csrv._proxy_tts(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        resp = asyncio.run(_run())
+
+        assert resp.status_code == 200
+        assert resp.body == b"audio"
+
+
+class TestProxyPostRetryAfter:
+    """A busy node's 429 names its wait in Retry-After, which the browser's
+    authFetch honours, so the console has to pass it on."""
+
+    @staticmethod
+    def _post(monkeypatch, retry_after):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+
+        async def _node(request):
+            return httpx2.Response(
+                429,
+                json={"error": "Speech synthesis is busy"},
+                headers={"Retry-After": retry_after},
+            )
+
+        async def _body():
+            return b"{}"
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = SimpleNamespace(
+                    app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+                    method="POST",
+                    body=_body,
+                    headers={"content-type": "application/json"},
+                    url=SimpleNamespace(query=""),
+                )
+                return await csrv._proxy_post(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        return asyncio.run(_run())
+
+    def test_delta_seconds_pass_through(self, monkeypatch):
+        resp = self._post(monkeypatch, "5")
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+
+    def test_anything_else_is_dropped(self, monkeypatch):
+        resp = self._post(monkeypatch, "Wed, 21 Oct 2026 07:28:00 GMT")
+        assert resp.status_code == 429
+        assert "retry-after" not in resp.headers

@@ -84,6 +84,7 @@ from turnstone.core.mcp_oauth import (
     is_user_scoped_auth,
 )
 from turnstone.core.oauth.context import oauth_context
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Sequence
@@ -506,7 +507,7 @@ def _error_answer(content: bytes) -> _ErrorAnswerError | None:
     (an integer code and a string message)."""
     try:
         body = json.loads(content)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
         return None
@@ -542,7 +543,8 @@ def _is_sdk_result_error(exc: BaseException) -> bool:
     which it raises as a plain ``RuntimeError``. Its text is the only discriminator, so
     ``test_an_input_request_is_breaker_neutral`` drives one through a real server.
     """
-    if isinstance(exc, ValidationError | UnexpectedClaimedResult):
+    # A cyclic output schema can exhaust the validator's recursion limit after a valid reply.
+    if isinstance(exc, ValidationError | UnexpectedClaimedResult | RecursionError):
         return True
     if type(exc) is RuntimeError:
         msg = str(exc)
@@ -578,11 +580,6 @@ class MCPShutdownError(RuntimeError):
 # spent. It bounds each read, not the request: a server that trickles its answer is cut off only
 # by the connection test's own bound, and a saved server's owner is left to finish on its own.
 _SESSION_END_TIMEOUT_S = 3.0
-# S8 (#679): httpx2.EventSource caps a single SSE event at 1 MiB by default,
-# which truncates large tool outputs (screenshots, multi-MB text/resource reads)
-# as a -32000 CONNECTION_CLOSED error. 16 MiB accommodates multi-MB tool results
-# while retaining a bounded frame ceiling against runaway streams.
-_MCP_MAX_SSE_EVENT_SIZE = 16 * 1024 * 1024
 # The SDK's own client defaults, kept on ours: 30 s to connect, write or wait for the pool, and
 # 300 s for a read, since a server may hold a response stream open.
 _MCP_HTTP_TIMEOUT_S = 30.0
@@ -610,7 +607,7 @@ def _jsonrpc_body(request: httpx2.Request) -> dict[str, Any] | None:
         return None
     try:
         body = json.loads(request.content)
-    except (ValueError, httpx2.RequestNotRead):
+    except (ValueError, httpx2.RequestNotRead, RecursionError):
         return None
     return body if isinstance(body, dict) else None
 
@@ -1986,7 +1983,7 @@ async def _probe_http_server(url: str, headers: dict[str, str], label: str) -> C
             streamable_http_client(
                 url,
                 http_client=http_client,
-                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                max_sse_event_size=MAX_SSE_EVENT_SIZE,
             ) as (read, write),
             ClientSession(read, write) as session,
         ):
@@ -2950,7 +2947,7 @@ class MCPClientManager:
 
         MUST run on the mcp-loop, and only touches scopes HOSTED on it: the
         ``gc.get_objects()`` walk is process-global, and in ``turnstone-server``
-        this process also runs FastAPI/httpx anyio scopes on the MAIN loop —
+        this process also runs FastAPI/httpx2 anyio scopes on the MAIN loop —
         cancelling another loop's ``call_soon`` handle or clearing a set that
         loop may be iterating is a cross-thread reach with no thread-safety
         contract. Foreign-loop orphans are that loop's problem to fix. The
@@ -3822,7 +3819,7 @@ class MCPClientManager:
                             streamable_http_client(
                                 cfg["url"],
                                 http_client=http_client,
-                                max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                                max_sse_event_size=MAX_SSE_EVENT_SIZE,
                             )
                         )
                 else:
@@ -4288,7 +4285,7 @@ class MCPClientManager:
                         streamable_http_client(
                             url,
                             http_client=http_client,
-                            max_sse_event_size=_MCP_MAX_SSE_EVENT_SIZE,
+                            max_sse_event_size=MAX_SSE_EVENT_SIZE,
                         )
                     )
                 # Stash stream refs so _pre_close_streams can unblock the SDK's
@@ -5721,8 +5718,8 @@ class MCPClientManager:
         only signal that reaches us in production). The ``HTTPStatusError`` fallback classifies an
         httpx2 status error raised outside the SDK; none is known to reach it today. The OAuth
         refresh (:func:`turnstone.core.mcp_oauth._refresh_and_persist`) wraps its HTTP errors in
-        ``OAuthRefreshError``, and must keep doing so: it still runs on httpx 1.x, whose errors no
-        classifier here recognizes.
+        ``OAuthRefreshError``, and must keep doing so: its client is httpx2 too, so an error it let
+        escape would read to the classifiers in this module as the MCP server's own failure.
         """
         if isinstance(exc, _CapturedHTTPError):
             capture = exc.capture
@@ -11335,7 +11332,7 @@ def _parse_pending_consent_envelope(
     """
     try:
         decoded = json.loads(result)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(decoded, dict):
         return None
@@ -11377,7 +11374,7 @@ def _is_structured_error(result: str) -> bool:
         return False
     try:
         decoded = json.loads(result)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return False
     if not isinstance(decoded, dict):
         return False
@@ -11595,7 +11592,7 @@ def _pool_cfg_from_row(row: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(headers_raw, str) and headers_raw:
         try:
             decoded = json.loads(headers_raw)
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             decoded = {}
         if isinstance(decoded, dict):
             for k, v in decoded.items():
@@ -11629,17 +11626,17 @@ def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any
             cfg["command"] = row.get("command", "")
             try:
                 cfg["args"] = json.loads(row.get("args", "[]"))
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["args"] = []
             try:
                 cfg["env"] = json.loads(row.get("env", "{}"))
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["env"] = {}
         else:
             cfg["url"] = row.get("url", "")
             try:
                 cfg["headers"] = json.loads(row.get("headers", "{}"))
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 cfg["headers"] = {}
         result[name] = cfg
     return result

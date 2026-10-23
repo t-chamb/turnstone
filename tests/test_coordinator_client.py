@@ -1,6 +1,6 @@
 """Tests for ``turnstone.console.coordinator_client.CoordinatorClient``.
 
-Uses an httpx MockTransport to intercept outbound requests so we verify
+Uses an httpx2 MockTransport to intercept outbound requests so we verify
 the URL map, headers, and body shape without standing up a real console.
 Read-op tests hit a real in-memory SQLite backend to confirm the
 storage-call path.
@@ -13,16 +13,24 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 import pytest
 
+from tests._http_failure_cases import (
+    MAYBE_PROCESSED_REPLIES,
+    UNREACHABLE_REPLIES,
+    UNSENT_REPLIES,
+)
 from turnstone.console.coordinator_client import (
     _ROUTE_PATHS,
     CoordinatorClient,
+    CoordinatorReadError,
     CoordinatorTokenManager,
+    load_task_envelope,
 )
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -117,23 +125,23 @@ def test_token_manager_rejects_nonpositive_ttl():
 
 
 def _mock_client(
-    handler: Callable[[httpx.Request], httpx.Response], sqlite_backend_factory
-) -> tuple[CoordinatorClient, list[httpx.Request]]:
-    """Build a CoordinatorClient with an httpx MockTransport recorder.
+    handler: Callable[[httpx2.Request], httpx2.Response], sqlite_backend_factory
+) -> tuple[CoordinatorClient, list[httpx2.Request]]:
+    """Build a CoordinatorClient with an httpx2 MockTransport recorder.
 
     Pre-registers the canonical test ws_ids (``ws-x``, ``ws-y``) under
     ``coord-1`` so the client-side tenant guard on send / close / cancel
     / delete passes.  The mutating-op tests want to verify the route
     map + body shape, not the guard.
     """
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def _trapping(req: httpx.Request) -> httpx.Response:
+    def _trapping(req: httpx2.Request) -> httpx2.Response:
         captured.append(req)
         return handler(req)
 
-    transport = httpx.MockTransport(_trapping)
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(_trapping)
+    http = httpx2.Client(transport=transport)
     storage = sqlite_backend_factory(":memory:")
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     storage.register_workstream(
@@ -154,9 +162,9 @@ def _mock_client(
     return client, captured
 
 
-def _ok_json(payload: dict) -> Callable[[httpx.Request], httpx.Response]:
-    def _h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
+def _ok_json(payload: dict) -> Callable[[httpx2.Request], httpx2.Response]:
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=payload)
 
     return _h
 
@@ -271,6 +279,131 @@ def test_spawn_omits_optional_empty_fields(sqlite_backend_factory):
     assert "target_node" not in body
 
 
+# ---------------------------------------------------------------------------
+# spawn resends a create the node's rate limiter refused (#1464)
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited(retry_after: str | None = "1", status: int = 429) -> httpx2.Response:
+    """A node rate limiter's refusal as the console relays it, headers and all."""
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    body = {"error": "Rate limit exceeded", "retry_after": 0.1}
+    return httpx2.Response(status, json=body, headers=headers)
+
+
+def _created() -> httpx2.Response:
+    return httpx2.Response(200, json={"ws_id": "c" * 32, "name": "child", "node_id": "n1"})
+
+
+def _in_turn(
+    *replies: Callable[[], httpx2.Response],
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """Answer each request with the next reply."""
+    pending = list(replies)
+    return lambda _req: pending.pop(0)()
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The waits the client sits out, recorded instead of slept."""
+    from turnstone.console import coordinator_client
+
+    slept: list[float] = []
+    monkeypatch.setattr(coordinator_client.time, "sleep", slept.append)
+    return slept
+
+
+def _spawn(client: CoordinatorClient, **kwargs: Any) -> dict[str, Any]:
+    return client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1", **kwargs)
+
+
+def test_spawn_resends_a_create_the_rate_limiter_refused(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["ws_id"] == "c" * 32
+    # The one-second wait, sat out in tenths that each check for a stop.
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+    assert captured[1].url == captured[0].url
+    assert captured[1].content == captured[0].content
+    assert captured[1].headers["Authorization"] == "Bearer test-token"
+
+
+def test_spawn_resends_only_once(sqlite_backend_factory, waits):
+    client, captured = _mock_client(
+        _in_turn(_rate_limited, _rate_limited, _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == 429
+    assert result["error"] == "Rate limit exceeded"
+    assert waits == [0.1] * 10
+    assert len(captured) == 2
+
+
+def test_spawn_does_not_resend_once_stopped_during_the_wait(sqlite_backend_factory, waits):
+    """A stop that lands during the wait cuts it short at the next tenth of a second."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: len(waits) >= 3)
+
+    assert result["status"] == 429
+    assert waits == [0.1] * 3
+    assert len(captured) == 1
+
+
+def test_spawn_does_not_wait_when_already_stopped(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client, resend_unless=lambda: True)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "status"),
+    [
+        # A node at capacity refuses a create with no wait to sit out.
+        (None, 429),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 429),
+        ("6", 429),
+        ("1000", 429),
+        ("1", 503),
+    ],
+)
+def test_spawn_does_not_resend_without_a_short_named_wait(
+    sqlite_backend_factory, waits, retry_after, status
+):
+    client, captured = _mock_client(
+        _in_turn(lambda: _rate_limited(retry_after, status), _created), sqlite_backend_factory
+    )
+    result = _spawn(client, resend_unless=lambda: False)
+
+    assert result["status"] == status
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_spawn_without_resend_unless_returns_the_refusal(sqlite_backend_factory, waits):
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = _spawn(client)
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
+def test_send_does_not_resend_a_refusal(sqlite_backend_factory, waits):
+    """Only creates resend: a send's refusal comes straight back."""
+    client, captured = _mock_client(_in_turn(_rate_limited, _created), sqlite_backend_factory)
+    result = client.send("ws-x", "hello")
+
+    assert result["status"] == 429
+    assert waits == []
+    assert len(captured) == 1
+
+
 def test_send_posts_to_send_route(sqlite_backend_factory):
     client, captured = _mock_client(
         _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
@@ -280,6 +413,35 @@ def test_send_posts_to_send_route(sqlite_backend_factory):
     assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/send"
     body = json.loads(captured[0].content)
     assert body == {"message": "hello"}
+
+
+def test_a_route_reply_too_deep_to_parse_comes_back_raw(sqlite_backend_factory, monkeypatch):
+    """A route reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It comes back as raw text, like any
+    other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client, _captured = _mock_client(
+        _ok_json({"status": 200}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    result = client.send("ws-x", "hello")
+    assert "raw" in result
+    assert result["status"] == 200
+
+
+@pytest.mark.parametrize("body", [b"null", b"[]", b'"queued"'])
+def test_a_route_reply_that_is_not_an_object_comes_back_raw(sqlite_backend_factory, body):
+    """A reply that parses to something other than an object comes back as raw
+    text, so a send the node accepted doesn't read as a failed call."""
+    client, _captured = _mock_client(
+        lambda _req: httpx2.Response(200, content=body),
+        sqlite_backend_factory=sqlite_backend_factory,
+    )
+    assert client.send("ws-x", "hello") == {"raw": body.decode(), "status": 200}
 
 
 def test_close_workstream_posts_to_close_route(sqlite_backend_factory):
@@ -336,8 +498,8 @@ def test_close_all_children_omits_empty_reason(sqlite_backend_factory):
 
 
 def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
-    def _boom(_req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": "internal"})
+    def _boom(_req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"error": "internal"})
 
     client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
@@ -345,14 +507,34 @@ def test_close_all_children_surfaces_http_error(sqlite_backend_factory):
     assert "error" in result
 
 
-def test_close_all_children_surfaces_transport_error(sqlite_backend_factory):
-    def _raise(_req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
-
-    client, _captured = _mock_client(_raise, sqlite_backend_factory=sqlite_backend_factory)
+@UNSENT_REPLIES
+def test_close_all_children_surfaces_transport_error(sqlite_backend_factory, reply):
+    client, _captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
     result = client.close_all_children()
     assert result["status"] == 0
-    assert "upstream unreachable" in result["error"]
+    assert result["error"].startswith("upstream unreachable: ")
+    assert "code" not in result
+
+
+@MAYBE_PROCESSED_REPLIES
+def test_a_post_with_no_reply_may_have_been_processed(sqlite_backend_factory, reply):
+    # A create that outlasts the client's timeout may still have made the child.
+    client, captured = _mock_client(reply, sqlite_backend_factory=sqlite_backend_factory)
+    result = client.spawn(initial_message="hi", parent_ws_id="coord-1", user_id="user-1")
+    assert len(captured) == 1
+    assert result["status"] == 0
+    assert result["code"] == UPSTREAM_NO_REPLY_CODE
+    assert result["error"].startswith("no reply was read from upstream (")
+    assert result["error"].endswith("), so the request may have been processed")
+
+
+def test_a_post_to_a_url_it_cannot_build_is_unreachable(sqlite_backend_factory):
+    client, captured = _mock_client(
+        lambda request: httpx2.Response(200, json={}), sqlite_backend_factory=sqlite_backend_factory
+    )
+    result = client._post_url("http://console.example.com/x\x01", {}, log_path="/x")
+    assert captured == []
+    assert result["error"].startswith("upstream unreachable: ")
 
 
 def test_delete_workstream_posts_to_delete_route(sqlite_backend_factory):
@@ -381,8 +563,8 @@ def test_approve_and_cancel_hit_their_routes(sqlite_backend_factory):
 
 
 def test_http_error_returns_structured_failure(sqlite_backend_factory):
-    def _boom(req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no route to host", request=req)
+    def _boom(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("no route to host", request=req)
 
     client, _captured = _mock_client(_boom, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
@@ -391,8 +573,8 @@ def test_http_error_returns_structured_failure(sqlite_backend_factory):
 
 
 def test_non_2xx_response_populates_error(sqlite_backend_factory):
-    def _h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"detail": "upstream down"})
+    def _h(req: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(500, json={"detail": "upstream down"})
 
     client, _c = _mock_client(_h, sqlite_backend_factory=sqlite_backend_factory)
     result = client.send("ws-x", "hi")
@@ -477,11 +659,11 @@ def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend
         user_id="user-1",
         name="minisforum-research",
     )
-    captured: list[httpx.Request] = []
+    captured: list[httpx2.Request] = []
 
-    def _trap(req: httpx.Request) -> httpx.Response:
+    def _trap(req: httpx2.Request) -> httpx2.Response:
         captured.append(req)
-        return httpx.Response(200, json={})
+        return httpx2.Response(200, json={})
 
     client = CoordinatorClient(
         console_base_url="http://console",
@@ -489,7 +671,7 @@ def test_mutating_ops_reject_child_name_with_id_pointer(tmp_path, sqlite_backend
         token_factory=lambda: "t",
         coord_ws_id="coord-1",
         user_id="user-1",
-        http_client=httpx.Client(transport=httpx.MockTransport(_trap)),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_trap)),
         child_event_bus=ChildEventBus(),
     )
     result = client.send("minisforum-research", "status?")
@@ -544,8 +726,8 @@ def populated_storage(tmp_path, sqlite_backend_factory):
 
 
 def _make_read_client(storage: SQLiteBackend) -> CoordinatorClient:
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,
@@ -571,6 +753,23 @@ def test_list_children_returns_only_interactive_children(populated_storage):
         assert r["parent_ws_id"] == "coord-1"
     # Well under limit and no filters → not truncated.
     assert result["truncated"] is False
+
+
+def test_list_children_says_to_retry_when_the_children_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read tells the model to retry instead of quoting the storage
+    error, which can carry SQL; the error stays chained for the logs."""
+    client = _make_read_client(populated_storage)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT ws_id FROM workstreams failed")
+
+    monkeypatch.setattr(populated_storage, "list_workstreams", _down)
+    with pytest.raises(CoordinatorReadError, match="list of your children could not be read") as e:
+        client.list_children("coord-1")
+    assert "SELECT" not in str(e.value)
+    assert str(e.value.__cause__) == "SELECT ws_id FROM workstreams failed"
 
 
 def test_list_children_excludes_cross_tenant_child(populated_storage):
@@ -773,12 +972,12 @@ def _make_client_with_cluster_response(
     """Build a CoordinatorClient whose mocked HTTP transport returns
     ``status`` + ``body`` for any ``/cluster/ws/.../detail`` GET."""
 
-    def _handler(request: httpx.Request) -> httpx.Response:
+    def _handler(request: httpx2.Request) -> httpx2.Response:
         if "/v1/api/cluster/ws/" in request.url.path and request.method == "GET":
-            return httpx.Response(status, json=body or {})
-        return httpx.Response(200, json={})
+            return httpx2.Response(status, json=body or {})
+        return httpx2.Response(200, json={})
 
-    http = httpx.Client(transport=httpx.MockTransport(_handler))
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,
@@ -834,6 +1033,31 @@ def test_inspect_degrades_to_storage_only_on_cluster_endpoint_503(populated_stor
         populated_storage, status=503, body={"error": "node unreachable"}
     )
     result = client.inspect("child-a")
+    assert "live" not in result
+    assert result["ws_id"] == "child-a"
+
+
+@UNREACHABLE_REPLIES
+def test_inspect_degrades_to_storage_only_when_the_console_is_unreachable(populated_storage, reply):
+    """A transport error on the live-state fetch, or a reply httpx2 can't follow, takes the
+    same degrade path."""
+    attempts: list[str] = []
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(request.url.path)
+        return reply(request)
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
+        child_event_bus=ChildEventBus(),
+    )
+    result = client.inspect("child-a")
+    assert attempts == ["/v1/api/cluster/ws/child-a/detail"]
     assert "live" not in result
     assert result["ws_id"] == "child-a"
 
@@ -1001,6 +1225,86 @@ def test_list_nodes_filters_stale_registrations_by_default(tmp_path, sqlite_back
     full = client.list_nodes(include_inactive=True)
     full_ids = {n["node_id"] for n in full["nodes"]}
     assert full_ids == {"node-live", "node-dead"}
+
+
+def test_list_nodes_raises_when_the_live_node_list_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """A failed liveness read is an error to retry, not every node that ever
+    registered offered as a live target.  ``include_inactive`` asks for every
+    registration, so it needs no liveness read."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(st, "list_services", _down)
+    for filters in (None, {"arch": "x86_64"}):
+        with pytest.raises(CoordinatorReadError, match="live nodes could not be read") as excinfo:
+            client.list_nodes(filters=filters)
+        assert str(excinfo.value.__cause__) == "storage down"
+    full = client.list_nodes(include_inactive=True)
+    assert {n["node_id"] for n in full["nodes"]} == {"node-live", "node-dead"}
+
+
+@pytest.mark.parametrize("filters", [None, {"arch": "x86_64"}])
+def test_list_nodes_shows_a_value_too_deep_to_parse_raw(
+    tmp_path, monkeypatch, sqlite_backend_factory, filters
+):
+    """A stored value nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It is listed raw, like any other value
+    that can't be parsed, instead of failing the whole cluster's listing."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto"), ("notes", "deep", "user")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _loads(s: Any, *a: Any, **kw: Any) -> Any:
+        if s == '"deep"':
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return json.loads(s, *a, **kw)
+
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_loads, dumps=json.dumps))
+    (node,) = client.list_nodes(filters=filters)["nodes"]
+    assert node["metadata"]["notes"]["value"] == '"deep"'
+    assert node["metadata"]["arch"]["value"] == "x86_64"
+
+
+@pytest.mark.parametrize(
+    ("read", "filters"),
+    [
+        ("filter_nodes_by_metadata", {"arch": "x86_64"}),
+        ("get_node_metadata", {"arch": "x86_64"}),
+        ("get_all_node_metadata", None),
+    ],
+)
+def test_list_nodes_says_to_retry_when_node_metadata_cannot_be_read(
+    tmp_path, monkeypatch, sqlite_backend_factory, read, filters
+):
+    """A failed metadata read tells the model to retry instead of quoting the
+    storage error, which can carry SQL; the error stays chained for the logs."""
+    st = sqlite_backend_factory(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+
+    def _down(*_a: Any, **_kw: Any) -> Any:
+        raise RuntimeError("SELECT node_id FROM node_metadata failed")
+
+    monkeypatch.setattr(st, read, _down)
+    with pytest.raises(CoordinatorReadError, match="node metadata could not be read") as excinfo:
+        client.list_nodes(filters=filters)
+    assert "SELECT" not in str(excinfo.value)
+    assert str(excinfo.value.__cause__) == "SELECT node_id FROM node_metadata failed"
 
 
 def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
@@ -1280,6 +1584,42 @@ def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_sto
     assert calls == []
 
 
+def test_inspect_raises_when_the_history_cannot_be_read(populated_storage, monkeypatch):
+    """A failed history read is an error the model can retry, not an
+    empty history that reads as a child that produced nothing."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's history could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+@pytest.mark.parametrize("state", ["closed", "error"])
+def test_inspect_raises_when_a_terminal_childs_config_cannot_be_read(
+    populated_storage, monkeypatch, state
+):
+    """A terminal child's close reason and last error come from its
+    config row, so a failed read of it is an error rather than a child
+    that has neither."""
+    populated_storage.update_workstream_state("child-a", state)
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == (
+        "the workstream's close reason and last error could not be read. "
+        "Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
 def test_inspect_live_falls_back_to_persisted_tokens(populated_storage):
     """live block carries tokens=0 for an idle child whose node hasn't
     published a fresh tick — fall back to SUM(usage_events) so the
@@ -1324,6 +1664,115 @@ def test_inspect_live_keeps_nonzero_live_tokens(populated_storage):
     )
     result = client.inspect("child-a")
     assert result["live"]["tokens"] == 17
+
+
+def test_inspect_live_leaves_tokens_out_when_the_persisted_sum_cannot_be_read(
+    populated_storage, monkeypatch
+):
+    """A failed read of the persisted sum is not a zero: the live block
+    leaves the count out rather than report a child that spent nothing,
+    and is cached like the other failures, so a burst of inspects reads
+    the sum once."""
+    calls: list[str] = []
+
+    def _broken(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "sum_workstream_tokens", _broken)
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={"persisted": {"ws_id": "child-a"}, "live": {"state": "idle", "tokens": 0}},
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert client.inspect("child-a")["live"] == {"state": "idle"}
+    assert calls == ["child-a"]
+
+
+def test_inspect_raises_when_the_row_cannot_be_read(populated_storage, monkeypatch):
+    """The row read reports the same retryable error as inspect's other
+    reads, not the storage exception's own text."""
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(populated_storage, "get_workstream", _broken)
+    client = _make_read_client(populated_storage)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.inspect("child-a")
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
+def test_inspect_reads_the_tail_its_message_limit_needs(populated_storage, monkeypatch):
+    """inspect bounds its history read to the tail it returns, and reads
+    the whole history only when the bounded read comes back short."""
+    for i in range(30):
+        populated_storage.save_message("child-a", "user", f"message {i}")
+    limits: list[int | None] = []
+    real = populated_storage.load_messages
+
+    def _spy(ws_id: str, **kwargs: Any) -> Any:
+        limits.append(kwargs.get("limit"))
+        return real(ws_id, **kwargs)
+
+    monkeypatch.setattr(populated_storage, "load_messages", _spy)
+    client = _make_read_client(populated_storage)
+    tail = client.inspect("child-a", message_limit=5)["messages"]
+    assert [m["content"] for m in tail] == [f"message {i}" for i in range(25, 30)]
+    assert limits == [18]
+    limits.clear()
+    assert len(client.inspect("child-a", message_limit=50)["messages"]) == 30
+    assert limits == [108, None]
+
+
+def test_inspect_asks_the_detail_route_for_no_messages(populated_storage):
+    """inspect uses only the detail route's live block, so it asks the route
+    for no message tail."""
+    limits: list[str | None] = []
+
+    def _handler(request: httpx2.Request) -> httpx2.Response:
+        limits.append(request.url.params.get("limit"))
+        return httpx2.Response(200, json={"live": {"state": "idle", "tokens": 7}})
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(_handler)),
+        child_event_bus=ChildEventBus(),
+    )
+    assert client.inspect("child-a")["live"] == {"state": "idle", "tokens": 7}
+    assert limits == ["0"]
+
+
+def test_inspect_reads_a_detail_reply_too_deep_to_parse_as_no_live_block(
+    populated_storage, monkeypatch
+):
+    """A detail reply nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels, 3.14 when the C
+    stack runs out), so only the patched decoder reaches it here.  It leaves
+    the live block out, like any other reply that can't be parsed."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    client = CoordinatorClient(
+        console_base_url="http://x",
+        storage=populated_storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=httpx2.Client(
+            transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json={"live": {}}))
+        ),
+        child_event_bus=ChildEventBus(),
+    )
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    assert "live" not in client.inspect("child-a")
 
 
 # ---------------------------------------------------------------------------
@@ -1594,19 +2043,61 @@ def test_inspect_rejects_forged_cross_tenant_hex_row(hex_storage):
     assert "messages" not in result
 
 
-def test_ws_ref_validation_survives_roster_query_failure(hex_storage, monkeypatch):
-    """Storage failure during the roster read degrades hints to empty
-    but validation still errors honestly (never resolves blind)."""
+def test_ws_ref_validation_raises_when_the_roster_cannot_be_read(hex_storage, monkeypatch):
+    """A non-hex id is checked against the roster.  When that read fails the
+    call raises the read error: it never resolves blind, and it doesn't
+    reject an id it could not check or report the coordinator childless."""
     client = _make_read_client(hex_storage)
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("storage down")
 
     monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
-    result = client.send("not-a-real-id", "hi")
-    assert result["status"] == 404
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.send("not-a-real-id", "hi")
+    assert str(excinfo.value) == (
+        "the list of your children could not be read. Retry after storage recovers."
+    )
+
+
+@pytest.mark.parametrize("verb", ["inspect", "wait"])
+def test_unresolvable_id_carries_no_roster_it_could_not_read(hex_storage, monkeypatch, verb):
+    """An id that names no child is decided by a row read that succeeded.
+    When only the roster read fails, the error leaves the roster and its
+    suggestions out rather than report the coordinator has no children."""
+    client = _make_read_client(hex_storage)
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "list_workstreams", _boom)
+    if verb == "inspect":
+        result = client.inspect(MISSING_HEX)
+    else:
+        result = client.wait_for_workstream([MISSING_HEX], timeout=5, mode="all")
     assert "no workstream matching" in result["error"]
-    assert result["children"] == []
+    assert "children" not in result
+    assert "children_truncated" not in result
+    assert "did_you_mean" not in result
+
+
+def test_a_failed_ownership_read_raises_but_the_trusted_send_check_asks(hex_storage, monkeypatch):
+    """A mutating verb checks ownership with a row read.  When it fails the
+    verb raises the read error rather than answer that the child isn't
+    among the coordinator's children.  The trusted-send check only decides
+    whether to ask first, so it answers False and the send asks for
+    approval, the fail-closed answer."""
+    client = _make_read_client(hex_storage)
+    assert client._is_own_subtree(REAL_CHILD_HEX) is True
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(hex_storage, "get_workstream", _boom)
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.close_workstream(REAL_CHILD_HEX)
+    assert str(excinfo.value) == "the workstream could not be read. Retry after storage recovers."
+    assert client._is_own_subtree(REAL_CHILD_HEX) is False
 
 
 def test_uppercase_full_hex_ref_case_folds(hex_storage):
@@ -1763,8 +2254,8 @@ def _make_read_client_with_bus(storage, bus) -> CoordinatorClient:
     Caller owns the bus so the test can call ``bus.notify(ws_id)`` to
     simulate the dispatch-sink wake-up.
     """
-    transport = httpx.MockTransport(lambda r: httpx.Response(200))
-    http = httpx.Client(transport=transport)
+    transport = httpx2.MockTransport(lambda r: httpx2.Response(200))
+    http = httpx2.Client(transport=transport)
     return CoordinatorClient(
         console_base_url="http://x",
         storage=storage,
@@ -2182,6 +2673,37 @@ def test_wait_caller_event_wakes_a_wait_with_no_registered_ids(populated_storage
     assert elapsed < 1.0, f"the wake did not end the block: {elapsed}s"
 
 
+@pytest.mark.parametrize(
+    ("method", "first_failing_call"),
+    [("get_workstreams_batch", 2), ("sum_workstream_tokens_batch", 1)],
+)
+def test_wait_ends_with_the_read_error_when_a_tick_cannot_read(
+    populated_storage, monkeypatch, method, first_failing_call
+):
+    """A tick whose read fails ends the wait with the read error: rows it
+    could not read are not missing children, and token counts it could not
+    read are not a change since the caller's snapshot.  (The first rows read
+    is the ownership pre-read, which only arms the wake.)"""
+    real = getattr(populated_storage, method)
+    calls: list[Any] = []
+
+    def _fails(ws_ids: Any) -> Any:
+        calls.append(ws_ids)
+        if len(calls) >= first_failing_call:
+            raise RuntimeError("storage down")
+        return real(ws_ids)
+
+    monkeypatch.setattr(populated_storage, method, _fails)
+    client = _make_read_client(populated_storage)
+    since = {"child-b": {"state": "running", "tokens": 1234, "updated": ""}}
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        client.wait_for_workstream(["child-b"], timeout=5, mode="all", since=since)
+    assert str(excinfo.value) == (
+        "the workstreams being waited on could not be read. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+
+
 # ---------------------------------------------------------------------------
 # wait_for_workstream — last-message bundling
 # ---------------------------------------------------------------------------
@@ -2318,6 +2840,25 @@ def test_wait_for_workstream_error_falls_back_to_assistant_when_no_last_error(po
     result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
     snap = result["results"]["child-a"]
     assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_whose_last_error_cannot_be_read_has_no_message(
+    populated_storage, monkeypatch
+):
+    """A failed last-error read is ``message: null``, the wait's mark for
+    a message it couldn't read.  The assistant tail would report the
+    child's last turn as if no error text were stored."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config("child-a", {"last_error": "RateLimitError: 429"})
+    _fail_config_reads(monkeypatch, populated_storage)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True  # an incomplete wait nulls every message anyway
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
 
 
 def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
@@ -2665,6 +3206,91 @@ def test_tasks_mutations_refuse_corrupt_envelope(tmp_path, sqlite_backend_factor
     remove_result = client.tasks_remove("coord-1", task_id="x")
     assert "error" in remove_result
     assert "corrupt" in remove_result["error"]
+
+
+def _fail_config_reads(monkeypatch, storage: SQLiteBackend) -> None:
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+
+
+def test_load_task_envelope_raises_on_a_failed_read(tmp_path, monkeypatch, sqlite_backend_factory):
+    """A read that failed is never an empty envelope; a caller that wants
+    one catches the raise and chooses it (#1416)."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    _fail_config_reads(monkeypatch, st)
+    with pytest.raises(RuntimeError, match="storage down"):
+        load_task_envelope(st, "coord-1")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda c, ids: c.tasks_add("coord-1", title="new"), id="add"),
+        pytest.param(
+            lambda c, ids: c.tasks_update("coord-1", task_id=ids[0], status="done"),
+            id="update",
+        ),
+        pytest.param(lambda c, ids: c.tasks_remove("coord-1", task_id=ids[0]), id="remove"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=[]), id="reorder-empty"),
+        pytest.param(lambda c, ids: c.tasks_reorder("coord-1", task_ids=ids[::-1]), id="reorder"),
+        pytest.param(lambda c, ids: c.tasks_get("coord-1"), id="get"),
+    ],
+)
+def test_tasks_failed_read_raises_and_leaves_the_stored_list(
+    call, tmp_path, monkeypatch, sqlite_backend_factory
+):
+    """#1416: a task call whose storage read fails acts on nothing.  An
+    empty list stands in for none of them: an add or a reorder to ``[]``
+    would save over the stored list, update and remove would answer
+    "task not found", reorder would name an empty current set, and a
+    list would answer that there are no tasks.  The error is written for
+    the model, with the storage exception kept as its cause."""
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    ids = [client.tasks_add("coord-1", title=title)["id"] for title in ("first", "second")]
+    read_stored = st.load_workstream_config
+    stored = read_stored("coord-1")["tasks"]
+    _fail_config_reads(monkeypatch, st)
+
+    with pytest.raises(CoordinatorReadError) as excinfo:
+        call(client, ids)
+
+    assert str(excinfo.value) == (
+        "the stored task list could not be read; no task was changed. Retry after storage recovers."
+    )
+    assert str(excinfo.value.__cause__) == "storage down"
+    assert read_stored("coord-1")["tasks"] == stored
+
+
+def test_tasks_envelope_nested_too_deeply_is_corrupt(tmp_path, monkeypatch, sqlite_backend_factory):
+    """JSON nested deeper than the parser can follow raises
+    ``RecursionError``: Python 3.13 at about 10,000 levels, 3.14 when the
+    thread's C stack runs out.  The read succeeded, so it is a corrupt
+    envelope the mutators refuse to overwrite, not a storage failure to
+    retry.  The seed is a valid envelope, so only the patched decoder can
+    make it read as corrupt."""
+    import types
+
+    from turnstone.console import coordinator_client as cc_module
+
+    def _too_deep(*_a, **_kw):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    seed = json.dumps({"version": 1, "tasks": [{"id": "tsk_a", "title": "kept"}]})
+    st.save_workstream_config("coord-1", {"tasks": seed})
+    client = _make_read_client(st)
+    monkeypatch.setattr(cc_module, "json", types.SimpleNamespace(loads=_too_deep, dumps=json.dumps))
+
+    assert load_task_envelope(st, "coord-1") == ({"version": 1, "tasks": []}, True)
+    result = client.tasks_add("coord-1", title="new")
+    assert "corrupt" in result["error"]
+    assert st.load_workstream_config("coord-1")["tasks"] == seed
 
 
 def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch, sqlite_backend_factory):

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx2
 import pytest
 
 # discord.utils.escape_markdown passes 'count' as positional to re.sub,
@@ -147,14 +149,14 @@ class TestDiscordConfig:
 def _make_real_bot():
     """Construct a TurnstoneBot around a real ``commands.Bot`` (no gateway).
 
-    Storage is mocked and the module's httpx client is patched out; the
+    Storage is mocked and the module's httpx2 client is patched out; the
     underlying discord client object is real so tests can assert against
     the actual connection-state defaults every message create inherits.
     """
     from turnstone.channels.discord.bot import TurnstoneBot
     from turnstone.channels.discord.config import DiscordConfig
 
-    with patch("turnstone.channels.discord.bot.httpx.AsyncClient", return_value=AsyncMock()):
+    with patch("turnstone.channels.discord.bot.httpx2.AsyncClient", return_value=AsyncMock()):
         return TurnstoneBot(
             DiscordConfig(bot_token="token-test"), "http://localhost:8080", MagicMock()
         )
@@ -1474,6 +1476,176 @@ class TestIsSafeImageUrl:
         self._patch_resolver(monkeypatch, ["fd00:ec2::23"])
         assert _run(_is_safe_image_url("http://ecs-meta.example.com/")) is False
 
+    def test_resolves_the_name_the_fetch_dials(self, monkeypatch):
+        """This host's IDNA 2003 form resolves to a public address and its IDNA 2008 form, which
+        the fetch dials, to loopback. The resolver stand-in encodes a str host with IDNA 2003, as
+        CPython's getaddrinfo does, so judging the Unicode name would check the wrong host."""
+        import socket
+
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        addresses = {
+            "strasse.example.com": "203.0.113.5",
+            "xn--strae-oqa.example.com": "127.0.0.1",
+        }
+
+        def fake(host, port, family=0, *args, **kwargs):  # noqa: ARG001
+            name = (host.encode("idna") if isinstance(host, str) else host).decode("ascii")
+            return [(family, 0, 0, "", (addresses[name], 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake)
+        url = "http://stra" + chr(0xDF) + "e.example.com/Items/abc/Images/Primary"
+        assert _run(_is_safe_image_url(url)) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://" + chr(0x2603) + ".example.com/poster.png",
+            "http://[fe80::1%" + chr(0xFC) + "]/poster.png",
+        ],
+        ids=["not-idna-2008", "non-ascii-zone"],
+    )
+    def test_a_host_the_fetch_cannot_send_is_rejected(self, monkeypatch, url):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["203.0.113.5"])
+        assert _run(_is_safe_image_url(url)) is False
+
+
+_THUMBNAIL_URL = "http://media.example.com/Items/abc/Images/Primary"
+
+
+def _fetch_through(monkeypatch, handler, *, resolves_to="203.0.113.5", **kwargs):
+    """Run _fetch_thumbnail through a real httpx2 client whose transport is *handler*."""
+    from turnstone.channels._formatter import _fetch_thumbnail
+
+    TestIsSafeImageUrl._patch_resolver(monkeypatch, [resolves_to])
+
+    async def fetch():
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+            return await _fetch_thumbnail(http, _THUMBNAIL_URL, **kwargs)
+
+    return _run(fetch())
+
+
+async def _two_chunks():
+    yield b"x" * 8
+    yield b"x" * 8
+
+
+class TestFetchThumbnail:
+    """_fetch_thumbnail through a real httpx2 client."""
+
+    def test_returns_the_image_and_its_filename(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        assert _fetch_through(monkeypatch, handler) == (b"png", "poster.png")
+        assert [(r.method, str(r.url)) for r in requests] == [("GET", _THUMBNAIL_URL)]
+
+    @pytest.mark.parametrize(
+        ("status", "headers", "content"),
+        [
+            (404, {"content-type": "image/png"}, b""),
+            (200, {"content-type": "text/html"}, b"<html>"),
+            # A short body declaring a long one, so only the declared length can refuse it.
+            (200, {"content-type": "image/jpeg", "content-length": "100"}, b"xxxx"),
+            (200, {"content-type": "image/jpeg"}, _two_chunks),
+        ],
+        ids=["not-found", "not-an-image", "declared-too-large", "streamed-too-large"],
+    )
+    def test_returns_none_for_a_response_it_cannot_use(self, monkeypatch, status, headers, content):
+        def handler(request):
+            # A generator streams a chunked body that declares no length.
+            body = content() if callable(content) else content
+            return httpx2.Response(status, headers=headers, content=body)
+
+        assert _fetch_through(monkeypatch, handler, max_bytes=8) is None
+
+    def test_a_url_the_guard_refuses_is_never_requested(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        assert _fetch_through(monkeypatch, handler, resolves_to="127.0.0.1") is None
+        assert requests == []
+
+    def test_a_transport_error_returns_none(self, monkeypatch):
+        def handler(request):
+            raise httpx2.ConnectError("refused", request=request)
+
+        assert _fetch_through(monkeypatch, handler) is None
+
+
+class TestBotServerCredential:
+    """Each SSE connection adds the server token itself, so the bot's shared client carries no
+    credential, and thumbnails, fetched from hosts that tool results name, have a client of their
+    own."""
+
+    @staticmethod
+    def _make_bot(monkeypatch, handler):
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.channels.discord.config import DiscordConfig
+
+        client_cls = httpx2.AsyncClient
+        monkeypatch.setattr(
+            "turnstone.channels.discord.bot.httpx2.AsyncClient",
+            functools.partial(client_cls, transport=httpx2.MockTransport(handler)),
+        )
+        return TurnstoneBot(
+            DiscordConfig(bot_token="token-test"),
+            "http://localhost:8080",
+            MagicMock(),
+            api_token="static-token",
+        )
+
+    def test_a_static_token_reaches_the_sse_request(self, monkeypatch):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(404)
+
+        bot = self._make_bot(monkeypatch, handler)
+
+        async def listen():
+            try:
+                await asyncio.wait_for(bot._sse_listener("abcdef0123456789", MagicMock()), 2)
+            finally:
+                await bot.router.aclose()
+                await bot._http_client.aclose()
+                await bot._media_http.aclose()
+
+        assert "authorization" not in bot._http_client.headers
+        _run(listen())
+        assert [r.url.path for r in requests] == ["/v1/api/workstreams/abcdef0123456789/events"]
+        assert requests[0].headers["authorization"] == "Bearer static-token"
+
+    def test_a_thumbnail_fetch_carries_no_credential(self, monkeypatch):
+        from turnstone.channels._formatter import _fetch_thumbnail
+
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx2.Response(200, headers={"content-type": "image/png"}, content=b"png")
+
+        bot = self._make_bot(monkeypatch, handler)
+        TestIsSafeImageUrl._patch_resolver(monkeypatch, ["203.0.113.5"])
+
+        async def fetch():
+            async with bot._http_client, bot._media_http as http:
+                return await _fetch_thumbnail(http, _THUMBNAIL_URL)
+
+        assert bot._media_http is not bot._http_client
+        assert _run(fetch()) == (b"png", "poster.png")
+        assert "authorization" not in requests[0].headers
+
 
 class TestBuildMediaEmbed:
     """Tests for try_build_media_embed and embed builders."""
@@ -1528,6 +1700,28 @@ class TestBuildMediaEmbed:
         http = MagicMock()
         result = _run(try_build_media_embed("tool", "plain text", http=http))
         assert result is None
+
+    def test_thumbnail_is_fetched_and_attached(self, monkeypatch):
+        import json
+
+        from turnstone.channels._formatter import try_build_media_embed
+
+        TestIsSafeImageUrl._patch_resolver(monkeypatch, ["203.0.113.5"])
+        output = json.dumps(
+            {"name": "Test Movie", "type": "Movie", "id": "abc", "thumbnail_url": _THUMBNAIL_URL}
+        )
+
+        def handler(request):
+            return httpx2.Response(200, headers={"content-type": "image/webp"}, content=b"webp")
+
+        async def build():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as http:
+                return await try_build_media_embed("mcp__media__get_item", output, http=http)
+
+        embed, file = _run(build())
+        assert file.filename == "poster.webp"
+        assert file.fp.read() == b"webp"
+        assert embed.thumbnail.url == "attachment://poster.webp"
 
     def test_season_episode_string_values(self):
         """Season/episode numbers as strings should not raise."""
@@ -1775,9 +1969,21 @@ class TestToolResultEvent:
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
         bot._http_client = MagicMock()
+        bot._media_http = MagicMock()
         bot._should_auto_approve = MagicMock(return_value=False)
         _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
+
+    def test_a_media_result_is_fetched_through_the_media_client(self):
+        from turnstone.sdk.events import ToolResultEvent
+
+        bot = self._make_bot()
+        build = AsyncMock(return_value=None)
+        with patch("turnstone.channels._formatter.try_build_media_embed", build):
+            _run(bot._on_ws_event("ws-1", AsyncMock(), ToolResultEvent(ws_id="ws-1", name="m")))
+
+        build.assert_awaited_once()
+        assert build.await_args.kwargs["http"] is bot._media_http
 
     def test_marks_info_done_and_sends_result(self):
         from turnstone.sdk.events import ToolResultEvent

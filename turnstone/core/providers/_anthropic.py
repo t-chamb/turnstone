@@ -32,6 +32,7 @@ from turnstone.core.providers._protocol import (
     serialized_tool_chars,
     snap_reasoning_effort,
 )
+from turnstone.core.tools import nested_deeper_than
 from turnstone.core.trajectory import materialize_attachments
 
 if TYPE_CHECKING:
@@ -1235,7 +1236,7 @@ class AnthropicProvider:
                     args_str = fn.get("arguments", "{}")
                     try:
                         args_obj = json.loads(args_str)
-                    except (json.JSONDecodeError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         args_obj = {}
                     content_blocks.append(
                         {
@@ -1725,7 +1726,7 @@ class AnthropicProvider:
                     rb = raw_blocks[event.index]
                     try:
                         rb["input"] = json.loads(rb.pop("_input_json"))
-                    except (json.JSONDecodeError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         rb.pop("_input_json", None)
 
                 # When a server tool block completes, emit search query info
@@ -1735,7 +1736,7 @@ class AnthropicProvider:
                     try:
                         parsed = json.loads(info["input_json"])
                         query = parsed.get("query", "")
-                    except (json.JSONDecodeError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         pass  # best-effort query extraction for status
                     sc.info_delta = f"[Searching: {query}]" if query else "[Searching...]"
 
@@ -1998,6 +1999,12 @@ def _block_to_dict(block: Any) -> dict[str, Any]:
     on ``web_search_tool_result`` blocks, which must be passed back verbatim
     on subsequent turns for citation resolution.
     """
+    # Whole-block inputs bypass the SDK's delta parser and its 200-level limit. Apply the same
+    # bound before capturing them for replay, whose recursive copies cannot handle deep input.
+    if getattr(block, "type", "") in ("tool_use", "server_tool_use") and nested_deeper_than(
+        getattr(block, "input", None), 200
+    ):
+        raise ValueError("Tool input nested more than 200 levels deep")
     if hasattr(block, "model_dump"):
         return block.model_dump(exclude_none=True)  # type: ignore[no-any-return]
     # Fallback: extract known attributes

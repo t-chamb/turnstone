@@ -458,7 +458,7 @@ class TestCompatFactory:
             assert_built_with(mock_anthropic_cls, base_url="http://vllm-host:8000")
 
         # A base_url that strips to nothing stays verbatim so the typo
-        # fails loudly in httpx instead of silently targeting the SDK's
+        # fails loudly in httpx2 instead of silently targeting the SDK's
         # prod default.
         mock_anthropic_cls.reset_mock()
         create_client("anthropic-compatible", base_url="/v1", api_key="")

@@ -13,10 +13,12 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import grants as oauth_grants
+from turnstone.core.oauth import http as oauth_http
 from turnstone.core.oauth import ssrf as oauth_ssrf
 from turnstone.core.oauth.context import oauth_context
 from turnstone.core.oauth.ssrf import (
@@ -425,7 +427,7 @@ def validate_discovered_endpoint(
 async def discover_oidc(
     config: OIDCConfig,
     *,
-    client: httpx.AsyncClient | None = None,
+    client: httpx2.AsyncClient | None = None,
 ) -> OIDCConfig:
     """Fetch OIDC discovery document and return updated config with endpoints.
 
@@ -459,11 +461,16 @@ async def discover_oidc(
             resp.raise_for_status()
             doc = resp.json()
         else:
-            async with httpx.AsyncClient(timeout=10.0) as transient:
+            async with oauth_http.make_http_client() as transient:
                 resp = await transient.get(url)
                 resp.raise_for_status()
                 doc = resp.json()
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
+    except httpx2.InvalidURL as exc:
+        # The issuer passed the guard, but the discovery URL built from it can't be sent (too long,
+        # say): a configuration error, terminal like a rejected issuer.
+        log.warning("OIDC issuer URL rejected: %s", exc)
+        return dataclasses.replace(config, enabled=False, discovery_retryable=False)
+    except (*REQUEST_FAILURES, ValueError, KeyError, RecursionError) as exc:
         # ValueError covers json.JSONDecodeError (subclass). Retryable: the
         # IdP being unreachable at boot says nothing about the config.
         log.warning("OIDC discovery failed for %s: %s", config.issuer, exc, exc_info=True)
@@ -509,9 +516,15 @@ async def discover_oidc(
                 allow_private=config.allow_private_network,
             )
         except OIDCError as exc:
-            # Config error (discovered endpoint fails SSRF/validation), not a
-            # transient outage — latch terminal so rediscovery stops re-probing.
-            log.warning("OIDC discovered %s rejected (url=%s): %s", name, endpoint_url, exc)
+            # Config error (discovered endpoint fails SSRF/validation), not a transient outage —
+            # latch terminal so rediscovery stops re-probing. The URL is the IdP's and may hold
+            # the control characters that got it refused, so it is logged escaped.
+            log.warning(
+                "OIDC discovered %s rejected (url=%s): %s",
+                name,
+                oauth_ssrf.sanitize_log_text(endpoint_url),
+                exc,
+            )
             return dataclasses.replace(config, enabled=False, discovery_retryable=False)
 
     if userinfo_endpoint:
@@ -526,7 +539,7 @@ async def discover_oidc(
         except OIDCError as exc:
             log.warning(
                 "OIDC discovered userinfo_endpoint rejected (url=%s): %s",
-                userinfo_endpoint,
+                oauth_ssrf.sanitize_log_text(userinfo_endpoint),
                 exc,
             )
             # Config error — latch terminal (see the issuer-rejection branch).
@@ -550,13 +563,13 @@ async def discover_oidc(
 async def fetch_jwks(
     jwks_uri: str,
     *,
-    client: httpx.AsyncClient | None = None,
+    client: httpx2.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Fetch the JWKS key set from the IdP.
 
     Returns the parsed JSON document (``{"keys": [...]}``) .  Called during
     startup discovery and on-demand when an unknown ``kid`` is encountered
-    (key rotation).  Uses ``httpx.AsyncClient`` — never blocks the event loop.
+    (key rotation).  Uses ``httpx2.AsyncClient`` — never blocks the event loop.
 
     A long-lived ``client`` may be supplied to share connection pooling;
     when ``None`` a transient client is used.
@@ -569,11 +582,11 @@ async def fetch_jwks(
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
         else:
-            async with httpx.AsyncClient(timeout=10.0) as transient:
+            async with oauth_http.make_http_client() as transient:
                 resp = await transient.get(jwks_uri)
                 resp.raise_for_status()
                 result = resp.json()
-    except (httpx.HTTPError, ValueError) as exc:
+    except (*REQUEST_FAILURES, ValueError, RecursionError) as exc:
         # ValueError covers json.JSONDecodeError (subclass).
         raise OIDCError(f"JWKS fetch failed: {exc}") from exc
     if not isinstance(result, dict):
@@ -620,7 +633,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
     # Use a transient client for discovery so the long-lived client is only
     # installed once we know OIDC will actually be enabled.  The disable
     # branches below would otherwise leak sockets until shutdown.
-    async with httpx.AsyncClient(timeout=10.0) as transient_client:
+    async with oauth_http.make_http_client() as transient_client:
         # Discovery is operator-controlled config; any unexpected failure
         # must disable OIDC rather than escape and bring down the service.
         try:
@@ -654,7 +667,7 @@ async def initialize_oidc_state(app_state: Any) -> None:
         app_state.oidc_http_client = None
         return
 
-    http_client = httpx.AsyncClient(timeout=10.0)
+    http_client = oauth_http.make_http_client()
     app_state.oidc_http_client = http_client
 
     try:
@@ -726,7 +739,7 @@ async def maybe_rediscover_oidc(app_state: Any) -> None:
         # failure clears it back to False).
         #
         # Wrapped in ``except Exception`` exactly like the boot path
-        # (initialize_oidc_state): discover_oidc catches httpx/ValueError/OIDC
+        # (initialize_oidc_state): discover_oidc catches httpx2/ValueError/OIDC
         # errors, but the runtime SSRF/DNS validation can raise something outside
         # that set, and this runs inside get_obo_access_token_classified — which
         # promises a TokenLookupResult, never a raise. An unexpected failure just
@@ -822,7 +835,7 @@ async def exchange_code(
     redirect_uri: str,
     code_verifier: str,
     *,
-    client: httpx.AsyncClient | None = None,
+    client: httpx2.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Exchange authorization code for tokens at the token endpoint.
 
@@ -843,7 +856,7 @@ async def exchange_code(
         if client is not None:
             resp = await client.post(config.token_endpoint, data=data, timeout=10.0)
         else:
-            async with httpx.AsyncClient(timeout=10.0) as transient:
+            async with oauth_http.make_http_client() as transient:
                 resp = await transient.post(config.token_endpoint, data=data)
     except Exception as exc:
         raise OIDCError(f"Token exchange request failed: {exc}") from exc

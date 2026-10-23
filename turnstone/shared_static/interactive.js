@@ -510,6 +510,7 @@ class Pane {
     this._ttsAudio = null;
     this._ttsBtnActive = null;
     this._ttsSeq = 0;
+    this._ttsAbort = null; // AbortController of the play being synthesized
     this._createDOM();
   }
 
@@ -3442,18 +3443,28 @@ class Pane {
     // Serialize: a monotonic token guards against an earlier (slower) request
     // resolving after a newer one — which would double-play and leak the blob.
     const token = ++this._ttsSeq;
+    // A newer play replaces one still being synthesized: abort that request so
+    // the node stops working on a clip nobody will hear.
+    if (this._ttsAbort) this._ttsAbort.abort();
+    const controller = new AbortController();
+    this._ttsAbort = controller;
     btn.classList.add("is-busy");
     btn.disabled = true;
     authFetch(this._base + "/v1/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
+      signal: controller.signal,
     })
       .then((r) => {
         if (!r.ok) {
-          return r.json().then((b) => {
-            throw new Error((b && b.error) || "Speech synthesis failed");
-          });
+          // A proxy in front may answer with an HTML error page.
+          return r
+            .json()
+            .catch(() => null)
+            .then((b) => {
+              throw new Error((b && b.error) || "Speech synthesis failed");
+            });
         }
         return r.blob();
       })
@@ -3469,17 +3480,24 @@ class Pane {
         btn.classList.add("is-playing");
         btn.setAttribute("aria-pressed", "true");
         voiceAnnounce("Playing response.");
-        audio.addEventListener("ended", () => this._stopTTS());
-        audio.addEventListener("error", () => this._stopTTS());
-        audio.play().catch(() => this._stopTTS());
+        // Only the clip still playing may stop playback: a replaced clip's late
+        // events would otherwise stop, and abort, the play that replaced it.
+        const stopIfCurrent = () => {
+          if (this._ttsAudio === audio) this._stopTTS();
+        };
+        audio.addEventListener("ended", stopIfCurrent);
+        audio.addEventListener("error", stopIfCurrent);
+        audio.play().catch(stopIfCurrent);
       })
       .catch((err) => {
+        if (controller.signal.aborted) return; // replaced or stopped, at any step
         showToast(
           err && err.message ? err.message : "Speech synthesis failed",
           "error",
         );
       })
       .finally(() => {
+        if (this._ttsAbort === controller) this._ttsAbort = null;
         btn.classList.remove("is-busy");
         btn.disabled = false;
       });
@@ -3487,6 +3505,10 @@ class Pane {
 
   _stopTTS() {
     this._ttsSeq++; // invalidate any in-flight request
+    if (this._ttsAbort) {
+      this._ttsAbort.abort(); // and stop the node synthesizing it
+      this._ttsAbort = null;
+    }
     if (this._ttsAudio) {
       try {
         this._ttsAudio.pause();

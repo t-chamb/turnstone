@@ -8,8 +8,9 @@ owner. The console deletes coordinators itself, because it holds their leases.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -25,6 +26,7 @@ from tests.test_console_routing_proxy import (
 )
 from turnstone.console.router import NodeRef
 from turnstone.console.server import route_workstream_delete
+from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.storage import WorkstreamLeaseHeldError
 
 _HELD = WorkstreamLeaseHeldError("ws", holder_node_id="node-b", retry_after_ms=1500).as_dict()
@@ -32,14 +34,12 @@ _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
 
 
 def _scripted_post(*responses: tuple[int, dict[str, Any]]) -> Any:
-    from unittest.mock import MagicMock
-
     remaining = list(responses)
 
-    async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
+    async def _post(*args: Any, **kwargs: Any) -> httpx2.Response:
         status, body = remaining.pop(0)
-        return httpx.Response(
-            status, json=body, request=httpx.Request("POST", args[0] if args else "http://t")
+        return httpx2.Response(
+            status, json=body, request=httpx2.Request("POST", args[0] if args else "http://t")
         )
 
     return MagicMock(side_effect=_post)
@@ -80,6 +80,81 @@ def test_verb_proxy_passes_a_lease_refusal_through() -> None:
     assert resp.json()["code"] == "workstream_lease_held"
     assert len(_upstream_urls(app, method="request")) == 1
     router.force_refresh.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("first", "rerouted"),
+    [
+        ((503, {"error": "workstream could not be read", "code": "workstream_unreadable"}), True),
+        ((503, {"error": "busy"}), False),
+    ],
+    ids=["unreadable-row", "other-503"],
+)
+def test_verb_proxy_reroutes_once_when_a_node_cannot_read_the_row(
+    first: tuple[int, dict[str, Any]], rerouted: bool
+) -> None:
+    """A node that can't read the workstream's row to check access refuses
+    before the verb acts, so the proxy re-routes once, as on a 404: the node
+    holding the workstream may not need that read.  Other 503s pass through."""
+    router = _make_mock_router()
+    router.route.side_effect = [
+        NodeRef("node-a", "http://a:8080"),
+        NodeRef("node-b", "http://b:8080"),
+    ]
+    app = _make_app(router=router)
+    _wire_proxy(app, _scripted_post(first, (200, {"status": "ok"})))
+    resp = _post(app, "/v1/api/route/workstreams/moved/send", {"message": "hi"})
+
+    if rerouted:
+        assert resp.status_code == 200
+        assert _upstream_urls(app, method="request") == [
+            "http://a:8080/v1/api/workstreams/moved/send",
+            "http://b:8080/v1/api/workstreams/moved/send",
+        ]
+        router.force_refresh.assert_called_once()
+    else:
+        assert resp.status_code == 503
+        assert len(_upstream_urls(app, method="request")) == 1
+        router.force_refresh.assert_not_called()
+
+
+_UNREADABLE_ROW = {"error": "workstream could not be read", "code": "workstream_unreadable"}
+
+
+@pytest.mark.parametrize("failing", ["refresh", "route"])
+@pytest.mark.parametrize(
+    ("first", "expected"),
+    [
+        ((404, {"error": "Unknown workstream"}), {"error": "routing failed"}),
+        ((503, _UNREADABLE_ROW), _UNREADABLE_ROW),
+    ],
+    ids=["not-found", "unreadable-row"],
+)
+def test_verb_proxy_never_passes_on_a_404_it_could_not_check_again(
+    first: tuple[int, dict[str, Any]], expected: dict[str, Any], failing: str
+) -> None:
+    """When a re-route can't read membership or the route again, a 404 would
+    read as closed to a channel, so the proxy answers its own recorded 503
+    instead (a failed membership read was a plain-text 500).  Any other
+    answer passes through."""
+    router = _make_mock_router()
+    if failing == "refresh":
+        router.force_refresh.side_effect = RuntimeError("storage down")
+    else:
+        router.route.side_effect = [
+            NodeRef("node-a", "http://a:8080"),
+            NoAvailableNodeError("Cannot resolve workstream execution requirement"),
+        ]
+    app = _make_app(router=router)
+    _wire_proxy(app, _scripted_post(first))
+    recorded = MagicMock(wraps=app.state.console_metrics.record_route)
+    app.state.console_metrics.record_route = recorded
+    resp = _post(app, "/v1/api/route/workstreams/moved/send", {"message": "hi"})
+
+    assert resp.status_code == 503
+    assert resp.json() == expected
+    assert len(_upstream_urls(app, method="request")) == 1
+    assert [c.args[:2] for c in recorded.call_args_list] == [("send", 503)]
 
 
 # -- delete proxy ----------------------------------------------------------------
@@ -155,6 +230,26 @@ def test_delete_proxy_does_not_retry_other_conflicts() -> None:
     assert resp.status_code == 409
     assert len(_upstream_urls(app, method="post")) == 1
     router.force_refresh.assert_not_called()
+
+
+def test_delete_proxy_passes_on_a_conflict_too_deep_to_parse(monkeypatch: Any) -> None:
+    """A 409 body nested deeper than the JSON parser can follow raises
+    ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+    patched decoder reaches it here.  It reads as no lease refusal, and the
+    node's 409 passes through without a re-route."""
+
+    def _too_deep(*_a: Any, **_kw: Any) -> Any:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    router = _make_mock_router()
+    app = _make_app(router=router)
+    _wire_proxy(app, _scripted_post((409, _HELD)))
+    monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+    resp = _post(app, "/v1/api/route/workstreams/delete", {"ws_id": "moved"})
+
+    assert resp.status_code == 409
+    assert len(_upstream_urls(app, method="post")) == 1
+    router.route.assert_called_once()
 
 
 # -- coordinator delete on the console -------------------------------------------

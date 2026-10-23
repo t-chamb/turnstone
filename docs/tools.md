@@ -247,7 +247,7 @@ base64-encoded image data for supported image formats.
 | `offset`  | integer | no       | Line number to start from (1-based, default: 1). Text files only. |
 | `limit`   | integer | no       | Maximum number of lines to read. Omit for full file. Text files only. |
 
-- **What it does**: For text files, reads and returns content with line numbers. For PNG, JPEG and WebP images, returns image data as multi-part content when the model supports vision, or a text description when it does not. The image type comes from the file's content, not its extension, and only those three formats are sent, since vision providers do not all accept others: a GIF, BMP, TIFF or ICO file, or any other content under an image extension, returns an error. SVG files are read as text. Images larger than 4 MB are rejected, as are paths that are not regular files. Must be called before `edit_file` on the same path (the session tracks which files have been read).
+- **What it does**: For text files, reads and returns content with line numbers. For PNG, JPEG and WebP images, returns image data as multi-part content when the model supports vision, or a text description when it does not. The image type comes from the file's content, not its extension, and only those three formats are sent, since vision providers do not all accept others: a GIF, BMP, TIFF or ICO file, or any other content under an image extension, returns an error. SVG files are read as text. Images larger than 4 MB are rejected, as are paths that are not regular files. An image with transparent areas is sent, and stored with the result, as an uploaded image is: with them filled with white, black or mid grey, whichever the content's edges stand out on most, since providers otherwise remove transparency each their own way. Must be called before `edit_file` on the same path (the session tracks which files have been read).
 - **Vision support**: Controlled by `ModelCapabilities.supports_vision`. All commercial OpenAI and Anthropic models have vision enabled. Local models (vLLM, llama.cpp, NIM) default to off — enable via `[models.*.capabilities] supports_vision = true` in config.toml.
 - **Auto-approve**: Yes.
 - **Agent availability**: `task_agent`.
@@ -337,7 +337,10 @@ Fetch a web page or PDF and extract specific information from it.
 | `question` | string | yes      | What to extract or answer from the page or PDF. |
 
 - **What it does**: Fetches the URL and uses the LLM to answer the question from
-  the fetched content. HTML is stripped to plain text. A response whose bytes
+  the fetched content. HTML is stripped to plain text. A PNG, JPEG, GIF or WebP
+  image, or other binary content that isn't a PDF (a NUL character among the
+  first 8,192 characters of its decoded text), is refused with an error giving
+  its size and, if known, its type; nothing is extracted. A response whose bytes
   begin with PDF magic uses the attachment PDF ladder: native document input
   when the active model supports it, ordered page images for a vision model,
   configured perception, then local text extraction. If none can read the PDF,

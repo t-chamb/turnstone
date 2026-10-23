@@ -71,7 +71,7 @@ turnstone/
     storage/          Pluggable storage, atomic fork/create lifecycle, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker
-    ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
+    ratelimit.py      Per-user token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
     web.py            Web utilities (HTML stripping, SSRF prevention)
@@ -87,7 +87,7 @@ turnstone/
     server.py         AsyncTurnstoneServer + TurnstoneServer (HTTP client)
     console.py        AsyncTurnstoneConsole + TurnstoneConsole (HTTP client)
     events.py         SSE event dataclasses with type registry
-    _base.py          Shared httpx async client, auth, error handling
+    _base.py          Shared httpx2 async client, auth, error handling
     _sync.py          Background event loop for sync wrappers
     _types.py         TurnResult + TurnstoneAPIError
   console/
@@ -1087,7 +1087,7 @@ stdio spawn hook (#1226). `test_private_names_still_behave_as_relied_on` and
 
 **Registry discovery:** The console admin panel provides a registry discovery
 surface backed by the official MCP Registry (registry.modelcontextprotocol.io).
-`MCPRegistryClient` (`turnstone/core/mcp_registry.py`) is a standalone httpx
+`MCPRegistryClient` (`turnstone/core/mcp_registry.py`) is a standalone httpx2
 async client that queries the registry's v0.1 API for server discovery. Search
 results are annotated with installed status by cross-referencing the
 `mcp_servers` table. Installation creates a DB row with `registry_name`,
@@ -1237,8 +1237,7 @@ client runs on HTTPX2, so a mid-body connection death escapes
 `messages.stream()` as an `httpx2` transport error and `transport_guarded`
 normalizes it into the retryable `IncompleteStreamError` exactly as for the
 OpenAI v3 lanes; anything handed to the client (`http_client`, timeouts,
-transports) must be an `httpx2` object — the SDK rejects the legacy `httpx`
-family at construction. SDK v1 also removed the typed `temperature` /
+transports) must be an `httpx2` object. SDK v1 also removed the typed `temperature` /
 `top_p` / `top_k` parameters, so the capability-gated temperature rides the
 request's `extra_body` (None still omits the field; enabled thinking still
 forces 1.0), and an operator `server_compat.extra_body` pin of the same key
@@ -2271,19 +2270,42 @@ degraded ──(any success)─────────────────�
 
 ### Rate Limiting
 
-`RateLimiter` (`turnstone/core/ratelimit.py`) enforces per-client-IP request
-limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
-`requests_per_second` (refill rate) and `burst` (bucket capacity) from
-`[ratelimit]` config.
+`RateLimiter` (`turnstone/core/ratelimit.py`) limits each signed-in user's
+requests to a node, and each client address's requests to public paths, using
+a token-bucket algorithm. Each key gets a `TokenBucket` with
+`requests_per_second` (refill rate) and `burst` (bucket capacity) from the
+`ratelimit.*` settings. The table holds at most `MAX_BUCKETS` keys; a new key
+past that evicts the least recently used bucket rather than being refused, so
+many addresses on public paths can't lock signed-in users out.
 
-- Applied via `RateLimitMiddleware` after authentication but before route dispatch.
-- `/health` and `/metrics` are exempt (monitoring must always be reachable).
-- **X-Forwarded-For support**: when `trusted_proxies` is configured (comma-separated
-  CIDRs), the middleware parses the `X-Forwarded-For` header using the
-  rightmost-untrusted approach. IPv4-mapped IPv6 addresses are normalized.
-  The direct client IP must be in the trusted set before XFF is considered.
+- Applied via `RateLimitMiddleware` after authentication but before route
+  dispatch, so `bucket_key` keys a signed-in request on its user id. A user
+  keeps one bucket per node whether the request comes direct or through the
+  console, which forwards each caller's own identity; a coordinator's requests
+  carry its creator's. The console's service identities (`console-proxy` for
+  the scheduler, `console-collector`) and the channel gateway's get a bucket
+  each the same way.
+- A request to a public path (login, the auth status, setup and OIDC paths)
+  carries no user, even from a signed-in caller, and is keyed on its client
+  address.
+- `/health` and `/metrics` are exempt (monitoring must always be reachable), as
+  are `/openapi.json`, `/docs`, the page (`/`) and its static files (`/static/`,
+  `/shared/`): one page load fetches more than 60 files, each revalidated on
+  every load, and a refused script or stylesheet isn't retried. So is a cancel
+  (`/v1/api/workstreams/{ws_id}/cancel`, `/v1/api/watches/{watch_id}/cancel`):
+  it stops work, and a Stop has to land however drained its caller's bucket is.
+- **X-Forwarded-For support** for address keys: when `trusted_proxies` is
+  configured (comma-separated CIDRs), the middleware parses the
+  `X-Forwarded-For` header using the rightmost-untrusted approach. IPv4-mapped
+  IPv6 addresses are normalized. The direct client IP must be in the trusted
+  set before XFF is considered.
 - On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
-  `{"error": "Rate limit exceeded", "retry_after": N}`.
+  `{"error": "Rate limit exceeded", "retry_after": N}`. The limiter answers
+  before any handler runs, so a coordinator's `CoordinatorClient` sends a
+  refused create once more after that wait (when it's 5 seconds or less),
+  unless the coordinator is stopped first, which cuts the wait short. The
+  browser's `authFetch` retries a refused API call after that wait too, up to
+  twice.
 - The `turnstone_ratelimit_rejected_total` counter is incremented on each
   rejection.
 
@@ -2561,7 +2583,7 @@ Monitoring (2 daemon threads)        Control + Proxy (async Starlette)
 | every 60 seconds |                 |   → POST to target server  |
 +------------------+                 +----------------------------+
 | SSE manager      |                 | GET /node/{node_id}/       |
-| asyncio loop     |                 |   → httpx.AsyncClient      |
+| asyncio loop     |                 |   → httpx2.AsyncClient     |
 | 1 task per node  |                 |     proxy to server_url    |
 | /events/global   |                 | GET /node/{id}/v1/api/workstreams/{ws_id}/events |
 | snapshot+deltas  |                 |   → SSE stream proxy                              |
@@ -2596,7 +2618,7 @@ The console has two write-path capabilities:
    these.
 
 2. **Reverse proxy** — serves each node's server UI through the console port at
-   `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
+   `/node/{node_id}/`. Uses `httpx2.AsyncClient` to proxy HTTP and SSE traffic.
    A JS shim is injected into the server's `app.js` to override `fetch()` and
    `EventSource()`, routing root-relative URLs through the proxy prefix. This
    eliminates the need for direct network access to individual server nodes.
@@ -2691,7 +2713,7 @@ typed event dataclasses.
 - `TurnstoneServer` / `AsyncTurnstoneServer` — server API (workstreams, chat, streaming)
 - `TurnstoneConsole` / `AsyncTurnstoneConsole` — console API (cluster overview, nodes, workstreams)
 
-**Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx
+**Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx2
 setup, auth headers, `_request()` (REST) and `_stream_sse()` (SSE). Sync
 clients delegate through `_SyncRunner` which maintains a persistent background
 event loop on a daemon thread.

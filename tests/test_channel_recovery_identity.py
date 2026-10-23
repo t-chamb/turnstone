@@ -6,7 +6,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-import httpx
+import httpx2
 import pytest
 
 from tests._helpers import wait_until
@@ -111,8 +111,8 @@ async def test_retained_channel_cannot_adopt_another_users_workstream(app_client
                 assert storage.get_workstream(source) is not None
                 install_alias()
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app),
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
         base_url="http://server.example",
         headers=service,
         event_hooks={"request": [before_request]},

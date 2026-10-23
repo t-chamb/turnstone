@@ -260,6 +260,25 @@ frozen.
 
 ### Changed
 
+- **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
+  and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
+  node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
+  now costs about one timeout, and the children bound for healthy nodes are still created. A Stop
+  or force-cancel holds back only a child whose create hasn't been sent, which once the batch has
+  started is usually none of them. The console's cancel cascade reaches only the children it had
+  registered when the Stop landed, so the batch cancels each child whose create returns after the
+  stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
+  children can be created in any order (`results` stays keyed by input index). With a node's rate
+  limiting on, a batch's creates arrive together and count against their creator's bucket; a
+  create the limiter refuses is sent once more after the wait it names, and a second refusal is
+  reported as denied (#1464).
+- **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
+  model whether a rejected tool call reflects a lasting preference now follows each batch a person
+  rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
+  open-task reminder. A rejection during a wake-driven turn gets no note, and it used to start the
+  cooldown anyway, so a rejection in the next `memory.nudge_cooldown` seconds got none either. In
+  the CLI, an approval prompt left unanswered (its input closed, or Ctrl+D) no longer counts as a
+  person's rejection, also when a tool policy refused another call in the same batch.
 - **A console exits when it can't start the TLS certificate authority it has enabled, or when a
   setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
   failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
@@ -292,6 +311,47 @@ frozen.
   on it can still forward, is now an ordinary protocol error: a call that gets one keeps its
   session, is not counted by the circuit breaker and reconnects nothing, and a connection test or a
   failed connect shows the server's own message.
+- **OIDC sign-in and OAuth run on httpx2 (#1011)** — the identity provider's discovery, keys and
+  code exchange at sign-in, and every OAuth request for MCP servers and models (discovery, client
+  registration, code exchange, refresh, revocation, and the on-behalf-of and client-credential
+  mints) now go through httpx2. Certificates are verified against the operating system's trust
+  store instead of certifi's bundle. A deployment that trusted its identity provider's or
+  authorization server's private CA through a modified `certifi` bundle must install that CA's
+  root certificate in the system store (an intermediate CA on its own no longer verifies), or point
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` at a bundle holding the public roots as well as the private CA.
+  Those variables apply to every httpx2 client in the process, and strict X.509 checks and
+  `SSLKEYLOGFILE` apply only while one of them is set. The proxy variables still apply; `NO_PROXY`
+  now also matches IPv4 and IPv6 CIDR ranges and bracketed IPv6 addresses, and ignores an entry it
+  can't parse or that carries a path, so list such a host without its path. These requests send a
+  `python-httpx2` User-Agent and also accept zstd-compressed responses, and when something lowers
+  httpx2's log level (for example `ANTHROPIC_LOG=info`) they now log request lines, which show
+  only each URL's scheme, host and port.
+- **The rest of Turnstone's HTTP clients run on httpx2, and `httpx`, `httpx-sse` and `certifi` are
+  no longer dependencies (#1011)** — web search through SearXNG, the reranker, skill sources, the
+  MCP registry, notifications to channel gateways, the CLI's `/cluster` commands, the console's
+  connections to its nodes (the routing proxy, the event relay, the cluster collector and the
+  coordinator's client), the channel adapters and the Python SDK now go through httpx2, as OAuth
+  does (above): certificates are verified against the operating system's trust store instead of
+  certifi's bundle, `SSL_CERT_FILE` and `SSL_CERT_DIR` still override it, the proxy variables still
+  apply with httpx2's reading of `NO_PROXY`, and requests send a `python-httpx2` User-Agent and also
+  accept zstd. When something lowers httpx2's log level (for example `ANTHROPIC_LOG=info`), these
+  clients log request lines too, showing only each URL's scheme, host and port; a program that
+  quieted the `httpx` logger for the SDK quiets `httpx2` instead. The cluster collector, the channel
+  adapters and the SDK accept one server-sent event of up to 16 MiB, as the MCP client does; a
+  larger event ends the stream, which the collector and the adapters reconnect (`httpx-sse` had no
+  limit). A node whose snapshot is over the limit, which a large backlog of pending approvals with
+  big tool arguments could produce, shows as unreachable in the console until the backlog shrinks.
+  Code run from Turnstone's Python environment that imports `httpx`, `httpx_sse` or `certifi`, such
+  as an MCP server started with that environment's Python, must now install them itself.
+- **The Python SDK runs on httpx2 and takes only an httpx2 client** *(BREAKING)* — `httpx_client=`
+  must be an `httpx2.AsyncClient`; an `httpx` client, or anything else, raises `TypeError` when the
+  SDK client is built rather than failing later mid-request or mid-stream. A request that fails in
+  transport raises one of `turnstone.sdk.REQUEST_FAILURES`: httpx2's own errors
+  (`httpx2.ConnectError`, `httpx2.SSEError` for an event stream it can't read, and the rest of
+  `httpx2.HTTPError`), and those httpx2 raises outside that family, for a redirect it can't follow
+  (`httpx2.InvalidURL`, `UnicodeError`) or a TLS alert after the handshake (`ssl.SSLError`). Code
+  that catches `httpx.HTTPError` or `httpx_sse.SSEError` around SDK calls must catch
+  `REQUEST_FAILURES` instead.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
@@ -595,6 +655,11 @@ frozen.
 
 ### Removed
 
+- **The tool-error memory nudge is gone (#1454).** A failed tool call no longer gets "A tool just
+  returned an error. Before retrying, check your memories" after its result; the model gets the
+  error result alone. Persisted `tool_error` turns in existing transcripts still render.
+  `turnstone.core.memory.count_structured_memories`, `turnstone.core.metacognition.should_nudge`
+  and the `memory_count` keyword of `nudge_allowed` are removed.
 - **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
   to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
   list, healthy backends first, possibly on another provider; the turn now fails on its own model
@@ -641,6 +706,81 @@ frozen.
 
 ### Fixed
 
+- **A node with rate limiting on gives each signed-in user their own bucket (#1464)** — it keyed
+  its buckets on the request's address, and the console forwards every caller's request from its
+  own, so every request the console forwarded to a node, from every user and coordinator, drew on
+  one bucket sized for a single client, and one busy user could starve the rest. A signed-in
+  request now draws on its user's bucket, whether it comes direct or through the console, and a
+  coordinator's on its creator's. A request to a public path, such as sign-in, is still limited
+  per client address, through `ratelimit.trusted_proxies`. A user's bucket now carries all of that
+  user's page loads, so the default `ratelimit.burst` rises from 20 to 50: reloading a page that
+  restores eight workstream panes makes about 30 API requests. A full table of buckets now evicts
+  the least recently used one instead of refusing every new caller.
+- **A node with rate limiting on no longer limits its page and static files (#1464)** — one load
+  of the node's page fetches more than 60 files (the page, its scripts and stylesheets, and the
+  modules they import), each revalidated on every load, so at the default burst of 20 half or more
+  of them were refused, a refused script or stylesheet isn't retried, and the page couldn't load,
+  whether opened directly or through the console. `/`, `/static/` and `/shared/` are now exempt,
+  like `/health` and `/metrics`.
+- **A Stop always lands on a node with rate limiting on (#1464)** — a coordinator's Stop cancels
+  each of its children on its creator's bucket, which the children's own creates may just have
+  drained, and a cancel the limiter refused left that child running. A cancel is no longer
+  limited: `/v1/api/workstreams/{ws_id}/cancel` and `/v1/api/watches/{watch_id}/cancel` are exempt.
+- **A coordinator sends a create the node's rate limiter refused once more (#1464)** — with rate
+  limiting on, `spawn_batch` sends every child's create at once, and a create past its creator's
+  burst was refused and reported as denied. A create the limiter refuses, from `spawn_batch` or
+  `spawn_workstream`, is now sent once more after the wait the refusal names, unless the
+  coordinator is stopped first, which cuts the wait short; the limiter answers before any handler
+  runs, so the refused create made nothing. A refusal that names no wait, or one longer than 5
+  seconds, comes back as before. Like `spawn_batch`, `spawn_workstream` now cancels a child whose
+  create returns after a Stop, which the console's cancel cascade can't reach, and audits the
+  cancel as `coordinator.cancel_cascaded` with `src: spawn_workstream`.
+- **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
+  both, the client certificate was dropped without a warning, so a node that requires one, such as
+  a node with TLS on, refused the handshake.
+- **The console answers 502 for a request to a node it can't build** — a node's redirect to a
+  `Location` that can't be parsed or whose host isn't valid IDNA, or a request path holding a
+  percent-encoded control character, raised past the console's error handling: proxied and routed
+  requests answered a bare 500 without recording route metrics, the event relay broke off after
+  its 200, a coordinator's inspect lost its fallback to stored state and its other calls to the
+  console raised instead of reporting it unreachable, and a node answering the startup scope check
+  that way, or with a body in a charset Python can't decode, stopped the console from starting.
+- **The MCP registry search and skill-source downloads fail cleanly on a request they can't
+  build** — a redirect to a `Location` that can't be parsed or whose host isn't valid IDNA, or a
+  search term or path holding a lone surrogate, raised past their error handling: the console's
+  registry search answered 500 instead of 502, and one bundled file like that failed a whole skill
+  install instead of being skipped.
+- **A TLS alert after the handshake fails a request like any other** — a TLS 1.3 server that refuses
+  the client's certificate says so after the handshake, and an async client could get that alert at
+  its first read as a raw `ssl.SSLError`, which the code making the request didn't catch: the
+  console answered 500 instead of 502, or failed to start when a node answered its startup scope
+  check that way, and OAuth, OIDC, the MCP registry search and skill sources raised past their own
+  error handling.
+- **Console logs no longer carry control characters from a request path or a node's reply** — a
+  proxied request that failed logged its path with any percent-encoded control characters decoded,
+  at debug, or at warning when the node answered an event stream with an error; the cluster
+  collector logged a node's 4xx reply, and the node id in a snapshot that named another node, at
+  warning as sent. With text-format logs, a signed-in user or a compromised node could forge a log
+  line or send terminal escapes. Paths and node ids are logged escaped, and every reply preview
+  replaces the characters that aren't printable, C1 controls and Unicode line separators included.
+- **`turnstone-doctor` survives a health reply nested too deeply.** A node, or a URL the doctor was
+  asked to probe, answering with JSON nested tens of thousands of levels deep stopped the version
+  scan before its report, and the `http_health` tool's indented output grew with the square of the
+  nesting depth. Such a reply now reads as unparseable, and the tool shows a reply as compact JSON.
+- **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
+  identity provider's discovery document, an MCP server's challenge or metadata, or an
+  authorization server's metadata could name an endpoint holding a control character (a stray
+  trailing newline, say), a lone surrogate, or a host that isn't valid IDNA 2008. The address
+  checks accepted it and the request then failed with an error OAuth didn't handle: a JWKS URL
+  like that stopped the node, console or CLI from starting; the MCP consent callback and client
+  registration answered 500; a challenge like that ended discovery before the server's
+  origin-level document was tried; an MCP token lookup raised instead of returning a retryable
+  failure; and a model token mint failed without recording a cause. Such a URL is now refused like
+  any other rejected endpoint, also in a field that is sent only on some paths or never (an
+  identity provider's `userinfo_endpoint`, an authorization server's `revocation_endpoint`): OIDC
+  sign-in turns off with the configuration error logged until the next start, consent fails with
+  the discovery error, and the challenge is skipped. A URL that reaches a request anyway fails like
+  an unreachable endpoint.
 - **A node or console that can't read its settings at startup exits instead of running on the
   defaults (#1406).** When the settings query failed after the database migrations had run (a
   dropped connection, a failover, a timeout), the process ran on every setting's default until
@@ -688,6 +828,24 @@ frozen.
 - **Saving a model definition with `max_tokens` set to `Infinity` answers 400.** The JSON body
   parsed it as a float that `int()` can't convert, and the create and update endpoints answered
   500.
+- **A long speech-synthesis reply no longer shows "Node unreachable".** `POST /v1/api/tts` answers
+  only once the whole clip is synthesized, so a slow or local backend outlasted the console's
+  shared 30-second proxy timeout and the user saw a connection error for a node that was working
+  fine. The console now allows 90 seconds for the `tts` answer and only for that wait: connecting,
+  writing, and the pool keep the shared bound, and every other forwarded request is unchanged. A
+  proxy in front of the console has to allow 90 seconds without data on this route; the AWS ECS
+  module's load balancer now allows 120 (its `idle_timeout` was the 60-second default), and the
+  browser shows a readable error when a proxy answers with an HTML page instead.
+- **Speech synthesis no longer ties up the node, or keeps going for nobody (#1424).** Each clip
+  held a worker from the pool the service heartbeat shares, so a few slow clips could make the
+  console mark a working node offline. The backend call was retried twice, each time for the
+  whole clip, and synthesis ran to the end after the caller had left. A node now synthesizes at
+  most two clips at once, on threads of its own, and refuses a third with 429 and `Retry-After`;
+  the console now passes a node's `Retry-After` on, and the browser waits it out and retries. The
+  backend call is one attempt, bounded at 80 seconds of silence, so a transient backend error now
+  fails the play. A play that is replaced, or whose pane or tab closes, cancels its request, and
+  the console passes the departure on, so the node stops reading the clip at the backend's next
+  chunk.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the
@@ -1173,9 +1331,218 @@ frozen.
 - **A node's workstream list in the console puts running workstreams first.** It ranked running
   workstreams below idle ones, the opposite of the cluster API's `sort=state`, so on a long list
   they fell off the first page.
+- **Images with transparent areas are flattened when they are attached (#1445).** A PNG or WebP went
+  to the model with its alpha channel, which vision models can't take, so each provider removed it
+  its own way: filling transparent areas with white or with black, or dropping the channel and
+  showing whatever colour the transparent pixels stored. White text on a transparent background
+  vanished wherever transparency became white, and dark text wherever it became black. An uploaded
+  image, and an image `read_file` returns, now has its transparent areas filled with white, black or
+  mid grey, whichever the content's edges stand out on most (mid grey when they are both light and
+  dark), and is stored that way: its preview and download show the flattened image, and every model
+  is sent the same pixels. The stored copy keeps the image's format, colour profile and kind of
+  colour (palette, grey or full colour), and a lossless WebP stays lossless. Images over 8.4
+  megapixels, animated images, colour-keyed PNGs that aren't 8-bit, and any image whose flattened
+  copy would outgrow the 4 MiB image cap are stored as uploaded. A process flattens one image at a
+  time, so a burst of uploads queues instead of flattening all at once; an image whose header
+  declares no transparency skips the queue. The queue has no length limit, and a workstream create
+  waiting its turn holds its workstream slot. On a node, rate limiting (`ratelimit.enabled`: per
+  signed-in user, off by default) bounds how fast one user can add to the queue; the console's
+  coordinator uploads, open only to coordinator admins, have no rate limit. Images already in a
+  conversation are left as they are, so it keeps sending what it sent and its history and cached
+  prompt prefix don't change; attach such an image again to have it flattened.
+- **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
+  fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
+  that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them
+  U+FFFD. The result wasn't empty, so the extraction model was asked about it and answered from the
+  noise or made an answer up. `web_fetch` now returns an error naming the content's type and size
+  (for example `an image (image/png, 3,081 bytes)`) and makes no extraction call. A PNG, JPEG, GIF
+  or WebP image is recognised by its bytes; other content is binary when the first 8,192 characters
+  of its decoded text hold a NUL character. The error names the media type the server declared
+  when it is well formed. UTF-16 text still reads as text when it declares its byte order
+  (`utf-16le` or `utf-16be`), and when it starts with a byte order mark, which now outranks the
+  declared charset, as in browsers. A page served with its `Content-Type` in capitals, such as
+  `text/HTML`, now has its markup stripped like any other. A PDF that begins with the PDF header
+  is handled as before; one with bytes before its header, which was never recognised as a PDF, is
+  now refused as binary when its first 8,192 characters hold a NUL, as compressed content nearly
+  always does, instead of being decoded as text.
+- **A coordinator's task list survives a storage read that fails during a `tasks` call (#1416).**
+  A task add after a failed read saved its one task over the stored list, and a reorder with no
+  ids saved an empty list; an update or remove answered "task not found" and a list answered that
+  there were no tasks. Every `tasks` action now tells the model that the stored list couldn't be
+  read and nothing was changed, and to retry. The tasks pane's read answers 503 when it fails, so
+  the pane keeps the list it last showed instead of emptying. A list nested too deeply to parse
+  now reads as corrupt, like any other unparseable list: the pane shows it empty and changes to it
+  are refused.
+- **A server node no longer reports a workstream it can't read as missing.** A node route that
+  checks access to a workstream, such as its history, close or send, answers 503 with the code
+  `workstream_unreadable` instead of 404 "Workstream not found" when it has to read the
+  workstream's row and the read fails. Slack and Discord took that 404 for an already-closed
+  workstream and unlinked the channel; they now report the error and keep the link. The console's
+  route proxy tries the node that holds the workstream on the coded 503, as it does on a 404. When
+  that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
+  answers 503 instead of passing on a 404 it couldn't check. A failed membership read there, or on
+  any routed request while the console knows no live node, answers 503 instead of a plain-text
+  500. The node's API spec and reference list the coded 503.
+- **Every coordinator route checks a coordinator the same way, an outage included.** The console's
+  coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
+  read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
+  a storage outage can't be used to tell which ids name coordinators in a private project. The
+  routes coordinators share with other workstreams, such as history, answered that read with a 500
+  before.
+- **Coordinator tools report a failed read instead of a missing or changed child.**
+  `wait_for_workstream` ends with an error to retry when it can't read its children's states or
+  token counts; it used to report them as not among the coordinator's children, or as changed since
+  the caller's snapshot. A send, close, cancel or delete whose ownership check can't read the child
+  answers an error to retry instead of "no workstream matching". When the list of the coordinator's
+  children can't be read, an id that has to be checked against it gets an error to retry, and an
+  error that only shows the list as a hint leaves it out instead of showing it empty.
+  `inspect_workstream` reports a failed read of a child's history, or of a finished child's close
+  reason and last error, as an error to retry instead of an empty history or a child with neither,
+  and a failed read of the child itself now says to retry instead of quoting the storage error. It
+  leaves a child's live token count out when the persisted count can't be read, instead of showing
+  0. A `wait_for_workstream` result for an errored child whose last error can't be read has
+  `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
+  turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
+  offering every node that ever registered, and says to retry instead of quoting the storage error
+  when it can't read their metadata. A stored node value nested too deeply to parse is listed raw
+  instead of failing the whole listing. `close_all_children` reports a reply it can't read as an
+  error instead of "closed 0". That error, and a spawn whose reply carries no ws_id, tell the model
+  to check `list_workstreams` before retrying, since the children may already have changed, and
+  `list_workstreams` says to retry instead of quoting the storage error when it can't read them. A
+  coordinator reopened while its children can't be read no longer takes them for none:
+  `close_all_children` answers an error to retry instead of "closed 0", and a cancel records that
+  it couldn't reach them instead of cascading to nobody.
+- **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
+  503 when one of its reads fails, where it reported zeros that read as a healthy, idle
+  coordinator. The cluster detail route answers 503 when it can't read the message tail it was
+  asked for, instead of an empty tail. History and export answer 503 instead of 404 when their own
+  row read fails after the access check passed, and history answers 503 when it can't read a saved
+  workstream's settings, where it showed stored reasoning that the model's settings may hide. The
+  coordinator page's tasks and children panes say they couldn't be loaded, instead of "no tasks
+  yet" or "no children spawned yet", until one of their loads succeeds; children that live updates
+  add in the meantime are marked as only part of the list. The cluster node detail route answers
+  503 when it can't read the node's metadata, instead of showing none.
+- **Inspecting a child and checking access on a node cost less.** `inspect_workstream` reads the
+  messages it returns, plus some slack, instead of the child's whole history and its attachments,
+  and asks the console for no message tail it would discard. On a server node, the access check
+  behind send, speech to text and the command route reads the workstream's row in a worker thread,
+  so a slow database no longer stalls every request on the node. The console's create proxy and
+  node detail route read storage in a worker thread too.
+- **JSON nested too deeply to parse is treated as malformed (#1456).** Python 3.13's JSON parser
+  raises `RecursionError` instead of a decode error for input nested about 10,000 levels deep, and
+  3.14 raises it when a thread's stack runs out. Most of the package's parse guards caught only the
+  decode error, so such input got past them: a request body answered a 500 where malformed JSON
+  answers 400, and a stored value, a reply from a node or provider, a command's output or a model's
+  tool arguments failed a read that handles an unparseable one. Every parse guard now treats input
+  too deep to parse as malformed, and a test keeps new guards covered. A stored setting nested too
+  deeply reads as invalid, as a malformed one does, instead of failing a node's startup. A skill's
+  `allowed_tools` that can't be parsed, or isn't a flat list of names, grants no tools: it was split
+  on commas, so a value too deep for one node's parser could grant tools nobody listed. Workstream
+  create, the re-enable approval card, the skill scanner and the skills tool now read it one way;
+  the card says when it can't be read, and a comma-separated value from before the JSON form scores
+  and lists like its JSON form.
+- **Request bodies of the wrong shape answer 400.** Admin token creation read a body it couldn't
+  parse as `{}` and minted a token with the default scopes; it now answers 400, as it does for a
+  body that isn't a JSON object and for fields of the wrong type. That includes a number or boolean
+  token name, which it used to store as text, and an `expires_days` that isn't a whole number of
+  days of at least 1: `false` minted a token that had already expired. Login, first-time setup,
+  admin user creation and the channel notify hook answer 400 instead of 500 for a body that isn't a
+  JSON object or holds a field of the wrong type, and the notify hook's malformed-body error reads
+  "Invalid JSON body". The console reference's token example sends `scopes` as the comma-separated
+  string the API takes.
+- **A request whose reply never came is no longer reported as unreachable.** A coordinator's
+  requests to the console, and the console's proxies to a node, called every transport failure
+  unreachable, a reply that timed out included. Both wait 30 seconds, so a create that took longer
+  could still make the child, and a model told the upstream was unreachable could spawn it again.
+  They now say unreachable only when the request never reached a handler that could act on it (a
+  connection that never opened, a request that couldn't be built or encoded, or a redirect from
+  something in front of the node); any other failure says no reply was read, so the request may have
+  been processed, and carries the code `upstream_no_reply`. `spawn_workstream` and `spawn_batch` add
+  that the coordinator should check with `list_workstreams` before retrying, after such a failure
+  and after any 5xx answer, since a gateway in front of the node can time out while the node
+  finishes. The console's create, verb, delete, attachment, node and watch-cancel proxies answer
+  this way, and the launcher's create, which said only that the dispatch failed, now says when the
+  workstream may exist. The task scheduler reads the same rule, so a firing whose create couldn't be
+  encoded is held for retry instead of recorded as unresolved.
+- **A model's tool arguments nested more than 100 levels deep read as malformed.** Arguments that
+  deep still parse, but break code that walks them one level at a time: three MCP calls nested 255
+  levels or more opened a static MCP server's circuit breaker for every session on the node, and on
+  a Python 3.13 node whose threads run on 2 MiB stacks an argument about 8,300 levels deep crashed
+  the process. The model is told the arguments couldn't be parsed and to retry.
+- **Handle deep values and recursive output schemas (#1458).** Complete tool inputs over 200 levels
+  deep are refused before replay capture, matching the streamed-input limit. Capabilities too deep
+  to compare count as changed for authorization and prevent calibration writes. A recursive MCP
+  output schema fails its tool call without opening the server's circuit breaker for other tools.
+- **Treat oversized JSON integers as malformed input (#1459).** Integers beyond the conversion
+  limit now receive the usual parse-error handling: invalid notification targets return 400,
+  malformed tool arguments fail replay validation, and SSE readers skip invalid events. Corrupt
+  heuristic-rule patterns reject a reload and preserve the cached rules; new sessions refuse to
+  start until those patterns are repaired. Pattern arrays must contain valid regex strings, and
+  unreadable scheduler locks prevent dispatch rather than allowing a takeover. Admin edits still
+  save and notify nodes when another corrupt rule prevents a local reload, with a warning that
+  allows administrators to repair rules one at a time.
+- **A force-cancelled `wait_for_workstream` stops.** A force-cancel gives the session a fresh
+  cancel event for its next turn, and the wait read the session's current one, so an abandoned wait
+  went on polling until its timeout, up to 600 seconds. It now checks the turn it belongs to.
 
 ### Security
 
+- **No connection relies on the `certifi` bundle, which trusted the root of the compromised
+  eMudhra CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
+  (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a
+  forged certificate for any host. Connections that don't name a CA of their own now verify against
+  the operating system's trust store (#1011), so a native install must update that store (Debian
+  13: `ca-certificates` 20250419+deb13u1, DSA-6572-1). `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces
+  the store for most of them, so a deployment that sets one must also remove the root from that
+  bundle; the Vault secret backend without `ca_cert`, certificate enrollment and the CA certificate
+  fetches ignore those variables and keep using the system store. Either way, restart Turnstone
+  afterwards: a running process keeps the roots it has already loaded.
+- **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
+  refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
+  update that removes the root from the system store. Its `pip`, which loads its own `certifi`
+  bundle beside the system store, moves to 26.2.2 or later, and its `uv`, which `uvx` uses to
+  fetch packages, moves to 0.13.4; both drop the root from their bundled lists. A virtual
+  environment made with `python -m venv` still starts with the base image's pip 26.2.1, which
+  trusts the root, until its pip is upgraded. Node.js, which `npx` uses, now checks the system
+  store instead of its built-in list, which still has the root: the image sets
+  `NODE_OPTIONS=--use-openssl-ca`, so a `NODE_OPTIONS` set at run time, in the container's
+  environment or in an MCP server's `env`, must keep that flag. Node also follows `SSL_CERT_FILE`
+  and `SSL_CERT_DIR` now. Images published before this release still trust the root.
+- **A remote MCP server can no longer have the console send plain-http requests to its loopback
+  ports.** The OAuth address check's localhost development lane (plain http to a localhost name
+  that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,
+  so with the private-network setting off a server could still have the console send blind
+  requests to any port and path on its own loopback, and time them to learn which ports answer.
+  A URL a remote document names now gets that lane only when the server URL the operator typed
+  is itself a localhost URL; otherwise it is judged like any other address. A server reached
+  through a localhost URL keeps the lane for every URL its documents name, so one that isn't a
+  local development server (a remote server behind a local forwarder, say) can still name the
+  console's loopback ports. A remote MCP server whose authorization server runs on the console's
+  host needs that server's Authorization Server URL set to it.
+- **A media tool's thumbnail URL can no longer reach the host's own services or cloud metadata
+  through an internationalized host name.** The channel thumbnail guard judged such a name as the
+  system resolver encodes it (IDNA 2003), while the fetch connects to the name's IDNA 2008 form,
+  and for some names (one holding `ß`, say) those are two different hosts. A tool result could
+  name such a host to get a GET, with a path of its choosing, sent to loopback or a cloud metadata
+  address over plain http; the answer reached the channel only when it was a 200 image. The guard
+  now resolves the name the fetch connects to, and refuses a URL whose host can't be sent.
+- **A compressed OAuth response can no longer exhaust memory.** The OAuth client checked a
+  response body's size only after reading and decompressing all of it, so a few hundred bytes of
+  brotli from an MCP server, or from the authorization server its metadata names, could decode to
+  gigabytes first and take the console or node down for every user; connecting to such a server
+  or refreshing a token against it set it off. Bytes sent after the end of a gzip stream piled up
+  the same way while decoding to nothing. The client now stops reading a body past 256 KiB
+  decoded, past 512 KiB received, or once the request's read timeout has passed while reading it,
+  and each request keeps its own, smaller or equal, size limit.
+- **The OAuth address check judges the host the client connects to.** It resolved an
+  internationalized host name the way the system resolver encodes it (IDNA 2003), while the HTTP
+  client connects to the name's IDNA 2008 form, and for some names (one holding `ß`, say) those
+  are two different hosts. An MCP server's metadata or challenge could name such a host, so the
+  check passed on one name's public address while the client connected to the other's internal
+  one: a TCP connection and TLS handshake to an internal host and port of the server's choosing,
+  which failed certificate verification before any request was sent. The check now resolves the
+  name the client connects to, and reads `[oidc] trusted_endpoint_hosts` the same way, so a host
+  there may be written in Unicode or as its `xn--` name.
 - **A user's bearer replaces the operator's Authorization header on per-user MCP servers.** On an
   `oauth_user` or `oauth_obo` server whose headers held an Authorization header spelled otherwise
   than `Authorization` (`authorization`, say), each user's connection sent that header beside the

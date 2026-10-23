@@ -2,6 +2,7 @@
 
 import ast
 import base64
+import codecs
 import contextlib
 import json
 import logging
@@ -16,6 +17,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from tests._helpers import opaque_png
 from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import (
     FakeAnthropicBlock,
@@ -207,8 +209,6 @@ def _send_with_mocks(session, responses, mock_execute, **extra_patches):
         stack.enter_context(_patch.object(session, "_update_token_table"))
         stack.enter_context(_patch.object(session, "_print_status_line"))
         stack.enter_context(_patch.object(session, "_emit_state"))
-        stack.enter_context(_patch.object(session, "_visible_memory_count", return_value=0))
-        stack.enter_context(_patch.object(session, "_apply_post_execute_advisories"))
         save_msg = stack.enter_context(_patch("turnstone.core.session.save_message"))
         yield save_msg
 
@@ -412,6 +412,49 @@ class TestSkillCommand:
 
 
 class TestChatSessionConstruction:
+    @pytest.mark.parametrize("patterns", ["[broken", "null", "[1]", '["["]', "overlong-integer"])
+    def test_invalid_rules_prevent_startup_without_custom_restrictions(self, tmp_db, patterns):
+        from tests._deep_json import overlong_integer
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import evaluate_heuristic
+
+        storage = get_storage()
+        storage.create_heuristic_rule(
+            rule_id="deny-read",
+            name="deny-read",
+            tool_pattern="read_file",
+            risk_level="critical",
+            confidence=1.0,
+            tier="critical",
+            recommendation="deny",
+        )
+        if patterns == "overlong-integer":
+            patterns = "[" + overlong_integer() + "]"
+        storage.create_heuristic_rule(
+            rule_id="broken-rule",
+            name="broken-rule",
+            tool_pattern="bash",
+            arg_patterns=patterns,
+            risk_level="low",
+            confidence=1.0,
+            recommendation="approve",
+        )
+        config_store = ConfigStore(storage)
+
+        with pytest.raises(ValueError, match="Invalid argument patterns.*broken-rule"):
+            _make_session(config_store=config_store)
+
+        storage.update_heuristic_rule("broken-rule", arg_patterns='["^echo safe$"]')
+        session = _make_session(config_store=config_store)
+        assert session._rule_registry is not None
+        verdict = evaluate_heuristic(
+            "read_file",
+            {"path": "report"},
+            "read_file",
+            rules=session._rule_registry.heuristic_rules,
+        )
+        assert verdict.recommendation == "deny"
+
     def test_system_messages_created(self, tmp_db):
         session = _make_session()
         assert len(session.system_messages) >= 1
@@ -3732,6 +3775,29 @@ class TestExecReadImage:
         url = output[1]["image_url"]["url"]
         assert url.startswith("data:image/jpeg;base64,")
         assert base64.b64decode(url.split(",", 1)[1]) == img.read_bytes()
+
+    def test_a_transparent_image_is_sent_flattened(self, tmp_db, tmp_path):
+        """As an upload is, on the way in: providers each remove transparency their own way,
+        losing white on a transparent background, and a task agent sends these parts as they
+        are."""
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = tmp_path / "title.png"
+        picture = Image.new("RGBA", (40, 20), (255, 255, 255, 0))
+        picture.paste((255, 255, 255, 255), (10, 5, 30, 15))
+        picture.save(img, format="PNG")
+
+        output = self._read_with_vision(img)
+        assert isinstance(output, list)
+        assert f"({img.stat().st_size:,} bytes)" in output[0]["text"], "the file's own size"
+        url = output[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        sent = Image.open(BytesIO(base64.b64decode(url.split(",", 1)[1])))
+        assert sent.mode == "RGB"
+        assert sent.getpixel((0, 0)) == (0, 0, 0)
+        assert sent.getpixel((20, 10)) == (255, 255, 255)
 
     def test_non_image_content_returns_error(self, tmp_db, tmp_path):
         """A failed download saved under an image name is not sent as an image."""
@@ -7879,7 +7945,7 @@ class TestBatchEvaluateOutputs:
                     session._queued_messages.clear()
                 session._nudge_queue.clear()
                 session.queue_message("successor queued message", queue_msg_id="q-successor")
-                session._queue_tool_advisory("tool_error", "successor tool advisory")
+                session._queue_tool_advisory("denial", "successor tool advisory")
 
                 history_at_handoff = dicts_from_turns(session.messages)
                 saves_at_handoff = save_message.call_count
@@ -7899,7 +7965,7 @@ class TestBatchEvaluateOutputs:
         assert session._tool_error_flags["call-shared"] is True
         assert session._tool_status["call-shared"] is EffectStatus.COMMITTED
         assert list(session._queued_messages) == ["q-successor"]
-        assert _tool_pending(session) == [("tool_error", "successor tool advisory")]
+        assert _tool_pending(session) == [("denial", "successor tool advisory")]
 
     def test_output_warning_publication_is_atomic_against_successor_claim(self) -> None:
         """The guard UI commit and generation handoff have one total order.
@@ -9022,8 +9088,6 @@ class TestCoordinatorMemoryScope:
         assert "ws_note" not in visible
         assert "user_note" not in visible
         assert "global_note" not in visible
-        # And the count agrees.
-        assert coord._visible_memory_count() == 0
 
         # Sanity: an IC session with the same user/ws_id sees those
         # memories — proving the rows exist in storage and the coord
@@ -9236,7 +9300,6 @@ class TestCoordinatorMemoryScope:
             scope_id="user-9",
         )
         assert coord._visible_scopes() == []
-        assert coord._visible_memory_count() == 0
         assert self._visible(coord) == []
         assert self._search(coord, "leak") == []
 
@@ -10848,8 +10911,8 @@ class TestMetacognitiveBuffers:
 
     def test_queue_tool_advisory_stashes_tuple(self, tmp_db):
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "check memories")
-        assert _tool_pending(session) == [("tool_error", "check memories")]
+        session._queue_tool_advisory("denial", "check memories")
+        assert _tool_pending(session) == [("denial", "check memories")]
 
     def test_emit_user_nudges_appends_system_turn_after_user(self, tmp_db):
         """User-channel nudges drain into a first-class ``system`` turn
@@ -10900,7 +10963,7 @@ class TestMetacognitiveBuffers:
         """System message must not include nudge text even with both buffers populated."""
         session = _make_session()
         session._queue_user_advisory("correction", "USER_NUDGE_MARK")
-        session._queue_tool_advisory("tool_error", "TOOL_NUDGE_MARK")
+        session._queue_tool_advisory("denial", "TOOL_NUDGE_MARK")
         session._init_system_messages()
         joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
         assert "USER_NUDGE_MARK" not in joined
@@ -10908,7 +10971,7 @@ class TestMetacognitiveBuffers:
         # And the buffers are not drained by system rebuild — they wait
         # for their respective drain points (next user turn / tool batch).
         assert _user_pending(session) == [("correction", "USER_NUDGE_MARK")]
-        assert _tool_pending(session) == [("tool_error", "TOOL_NUDGE_MARK")]
+        assert _tool_pending(session) == [("denial", "TOOL_NUDGE_MARK")]
 
     def test_collect_advisories_drains_tool_buffer_on_last_result(self, tmp_db):
         """Tool-channel metacog nudges drain on the last result as
@@ -10916,17 +10979,17 @@ class TestMetacognitiveBuffers:
         appends each as a first-class ``{"role": "system"}`` turn after
         the tool batch."""
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "ALERT")
+        session._queue_tool_advisory("denial", "ALERT")
         specs = session._collect_advisories(
             assessment=None, func_name="bash", received=None, result_index=1, result_count=1
         )
-        assert specs == [("tool_error", "ALERT", {})]
+        assert specs == [("denial", "ALERT", {})]
         # Buffer drained.
         assert _tool_pending(session) == []
 
     def test_collect_advisories_holds_tool_buffer_until_last_result(self, tmp_db):
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "CHECK_MEMORY")
+        session._queue_tool_advisory("denial", "CHECK_MEMORY")
         specs = session._collect_advisories(
             assessment=None, func_name="bash", received=None, result_index=1, result_count=2
         )
@@ -11206,7 +11269,6 @@ class TestMetacognitiveBuffers:
             stack.enter_context(patch.object(session, "_update_token_table"))
             stack.enter_context(patch.object(session, "_print_status_line"))
             stack.enter_context(patch.object(session, "_emit_state"))
-            stack.enter_context(patch.object(session, "_visible_memory_count", return_value=0))
             with pytest.raises(RuntimeError, match="provider blew up"):
                 session.send("bob's turn")
 
@@ -11283,11 +11345,11 @@ class TestMetacognitiveBuffers:
         # drain it.
         assert "q1" in session._queued_messages
 
-    def test_tool_error_nudge_appends_system_turn_after_tool_batch(self, tmp_db):
-        """A tool-channel ``tool_error`` nudge queued during a batch is
-        emitted as a first-class ``{"role": "system", "_source":
-        "tool_error"}`` turn AFTER the (clean) tool message — driving the
-        full ``send`` loop, not just ``_collect_advisories`` in isolation."""
+    def test_tool_advisory_appends_system_turn_after_tool_batch(self, tmp_db):
+        """A tool-channel advisory becomes a system turn after the clean tool message.
+
+        Drive the full send loop, including the validated system-turn builder and drain.
+        """
         session = _make_session()
         responses = [
             make_result(
@@ -11304,11 +11366,9 @@ class TestMetacognitiveBuffers:
         ]
 
         def mock_execute(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
-            # Queue a tool-channel nudge during the batch (what
-            # _apply_post_execute_advisories does on tool_error).
             assert principal_id == ""
-            session._queue_tool_advisory("tool_error", "you hit an error; check memory")
-            return [("call_x", "boom")], None
+            session._queue_tool_advisory("denial", "consider saving the user's feedback")
+            return [("call_x", "denied")], None
 
         with _send_with_mocks(session, responses, mock_execute):
             session._title_generated = True
@@ -11318,29 +11378,25 @@ class TestMetacognitiveBuffers:
         msgs = dicts_from_turns(session.messages)
         roles = [m.get("role") for m in msgs]
         assert roles == ["user", "assistant", "tool", "system", "assistant"], (
-            f"expected the tool_error nudge as a system turn after the tool, got {roles!r}"
+            f"expected the advisory as a system turn after the tool, got {roles!r}"
         )
-        assert msgs[2]["content"] == "boom"  # clean tool output
+        assert msgs[2]["content"] == "denied"  # clean tool output
         sys_turn = msgs[3]
-        assert sys_turn["_source"] == "tool_error"
-        assert sys_turn["content"] == "you hit an error; check memory"
+        assert sys_turn["_source"] == "denial"
+        assert sys_turn["content"] == "consider saving the user's feedback"
 
     def test_denial_nudge_queues_on_tool_channel(self, tmp_db):
-        """A denial responds to the tool batch the user just rejected — the
-        producer must queue it on the TOOL channel so it drains through
-        ``_collect_advisories`` alongside the denied results (the same seam
-        tool_error / repeat use), not sit on the user channel until the next
-        user-message seam — by which point the model has already reacted to
-        the denial without the nudge.
+        """A denial responds to the tool batch the user just rejected. The producer must queue
+        it on the TOOL channel so it drains through ``_collect_advisories`` alongside the denied
+        results. Waiting for the next user-message seam would let the model react to the denial
+        without the nudge.
 
-        Drives the REAL ``_execute_tools`` two-phase gate with real
-        ``_nudges_enabled`` / ``should_nudge`` gating; only the prepare
-        step and the UI approval are stubbed."""
+        Drives the REAL ``_execute_tools`` two-phase gate with real ``_nudges_enabled`` gating;
+        only the prepare step and the UI approval are stubbed."""
         from turnstone.core.metacognition import format_nudge
 
         session = _make_session()
-        # ``should_nudge`` skips the very first message — give the session
-        # the natural pre-batch shape (user turn + assistant tool-call turn).
+        # The natural pre-batch shape: a user turn and the assistant tool-call turn.
         session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
         session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
 
@@ -11354,7 +11410,6 @@ class TestMetacognitiveBuffers:
         with (
             patch.object(session, "_safe_prepare_tool", return_value=item),
             patch.object(session.ui, "approve_tools", return_value=(False, "use /tmp instead")),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             tool_calls = [
                 {
@@ -11392,8 +11447,9 @@ class TestMetacognitiveBuffers:
                 "Approval timed out after 5s",
                 "timeout",
             ),
+            ("Denied by user", None, "no_input"),
         ],
-        ids=["deny-rule", "policies-unreadable", "nobody-answered"],
+        ids=["deny-rule", "policies-unreadable", "nobody-answered", "cli-input-closed"],
     )
     def test_a_refusal_no_person_made_queues_no_denial_nudge(
         self, tmp_db, denial_msg, reason, refused_by
@@ -11416,7 +11472,6 @@ class TestMetacognitiveBuffers:
         with (
             patch.object(session, "_safe_prepare_tool", return_value=item),
             patch.object(session.ui, "approve_tools", side_effect=refuse),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             results, _feedback = session._execute_tools(
                 [
@@ -11430,6 +11485,62 @@ class TestMetacognitiveBuffers:
 
         assert results == [("call_1", denial_msg)]
         assert session._nudge_queue.pending(channel="tool") == []
+
+    @staticmethod
+    def _deny_one_call(session, call_id: str) -> None:
+        """Run one approval-gated call through the REAL ``_execute_tools`` and deny it."""
+        item = {
+            "call_id": call_id,
+            "func_name": "notify",
+            "needs_approval": True,
+            "execute": lambda p: (p["call_id"], "EXECUTED — must not happen"),
+        }
+        with (
+            patch.object(session, "_safe_prepare_tool", return_value=item),
+            patch.object(session.ui, "approve_tools", return_value=(False, "not that file")),
+        ):
+            results, _feedback = session._execute_tools(
+                [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "notify", "arguments": "{}"},
+                    }
+                ]
+            )
+        assert results == [(call_id, "Denied by user: not that file")]
+
+    def test_a_second_rejection_right_after_the_first_gets_its_nudge(self, tmp_db):
+        """No cooldown: a second rejection right after the first still gets its nudge."""
+        from turnstone.core.metacognition import format_nudge
+
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+
+        self._deny_one_call(session, "call_1")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
+        session._nudge_queue.clear()  # delivered with the first batch's results
+
+        self._deny_one_call(session, "call_2")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
+
+    def test_a_rejection_during_a_wake_turn_leaves_the_next_nudge_intact(self, tmp_db):
+        """#924: a wake turn queues no advisory, and its rejection must not suppress the nudge
+        for the next rejection a person makes."""
+        from turnstone.core.metacognition import format_nudge
+
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "do the thing"}))
+        session.messages.append(turn_from_dict({"role": "assistant", "content": "calling"}))
+
+        session._wake_source_tag = "system_nudge"
+        self._deny_one_call(session, "call_1")
+        assert session._nudge_queue.pending(channel="tool") == []
+
+        session._wake_source_tag = ""
+        self._deny_one_call(session, "call_2")
+        assert session._nudge_queue.pending(channel="tool") == [("denial", format_nudge("denial"))]
 
     def test_queued_message_appends_system_turn_after_tool_batch(self, tmp_db):
         """A queued message arriving during a tool batch becomes a
@@ -11904,160 +12015,59 @@ class TestMetacognitiveBuffers:
         assert _user_pending(session) == []
 
     def test_cancel_handler_clears_tool_advisory_buffer(self, tmp_db):
-        """A tool_error advisory queued before a cancel must not
-        leak into the next generation's batch."""
+        """A denial advisory queued before a cancel must not leak into the next generation's
+        batch."""
         from turnstone.core.session import GenerationCancelled
 
         session = _make_session()
-        session._queue_tool_advisory("tool_error", "leftover")
-        with (
-            patch.object(session, "_visible_memory_count", return_value=0),
-            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
-        ):
+        session._queue_tool_advisory("denial", "leftover")
+        with patch.object(session, "_stream_response", side_effect=GenerationCancelled()):
             session.send("user input")
 
         # Buffer cleared by the cancel handler — no leak into next send().
         assert _tool_pending(session) == []
 
 
-class TestApplyPostExecuteAdvisories:
-    """End-to-end coverage of the per-batch advisory hook in _run_loop —
-    the tool-error nudge.  Drives ``_apply_post_execute_advisories``
-    directly, simulating the post-_execute_tools state.
-    """
+class TestPostExecuteBoundary:
+    def test_tool_error_reaches_next_request_without_a_memory_nudge(self, tmp_db):
+        from tests._session_helpers import scripted_session
+        from turnstone.core.memory import save_structured_memory
+        from turnstone.core.workstream import WorkstreamKind
 
-    @staticmethod
-    def _prime(session) -> None:
-        """Enable nudges and bump message_count above the should_nudge floor.
-
-        ``should_nudge`` skips nudging on message_count <= 1; in production
-        the per-batch hook runs after at least a user→assistant exchange,
-        so seed two messages to mirror that.
-        """
-        session._mem_cfg.nudges = True
-        session.messages.append(turn_from_dict({"role": "user", "content": "hi"}))
-        session.messages.append(turn_from_dict({"role": "assistant", "content": "ok"}))
-
-    def test_force_successor_refuses_old_post_execute_advisory_commit(self, tmp_db) -> None:
-        """An abandoned tool batch cannot mutate successor metacog state.
-
-        The predecessor pauses immediately before the generation publication
-        fence for ``_apply_post_execute_advisories``.  Stop and a force claim
-        then install deliberately distinct successor-owned cooldown and nudge
-        state.  Releasing the predecessor must refuse the whole old advisory
-        transaction rather than partially recording its cooldown or queuing
-        its tool-error nudge.
-        """
-        session = _make_session()
-        session._title_generated = True
-        session._mem_cfg.nudges = True
-        old_results: list[tuple[str, str | list[dict[str, Any]]]] = [
-            ("call-old", "old tool failure")
-        ]
-        responses = [
-            make_result(
-                "calling tool",
-                tool_calls=[
-                    {
-                        "id": "call-old",
-                        "type": "function",
-                        "function": {
-                            "name": "bash",
-                            "arguments": '{"command":"false"}',
-                        },
-                    }
-                ],
-            )
-        ]
-        advisory_commit_entered = threading.Event()
-        release_advisory_commit = threading.Event()
-        original_apply = session._apply_post_execute_advisories
-        original_publish = session._publish_for_generation
-        old_generation: list[int] = []
-
-        def execute_old(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
-            del principal_id
-            old_generation.append(my_generation)
-            session._tool_error_flags["call-old"] = True
-            return old_results, None
-
-        def block_old_advisory_publish(
-            origin_generation: int,
-            publish,
-            *,
-            allow_cancelled: bool = True,
-        ) -> bool:
-            target = getattr(publish, "func", None)
-            if getattr(target, "__func__", None) is ChatSession._apply_post_execute_advisories:
-                advisory_commit_entered.set()
-                if not release_advisory_commit.wait(2):
-                    raise RuntimeError("test advisory commit was not released")
-            return original_publish(
-                origin_generation,
-                publish,
-                allow_cancelled=allow_cancelled,
-            )
-
-        send_errors: list[BaseException] = []
-
-        def send_old() -> None:
-            try:
-                session.send("run the old tool batch")
-            except BaseException as exc:
-                send_errors.append(exc)
-
-        with (
-            _send_with_mocks(session, responses, execute_old),
-            patch.object(session, "_apply_post_execute_advisories", original_apply),
-            patch.object(
-                session,
-                "_publish_for_generation",
-                side_effect=block_old_advisory_publish,
-            ),
-            patch.object(session, "_nudges_enabled", return_value=True),
-            patch.object(session, "_visible_memory_count", return_value=3),
+        memory, _ = save_structured_memory(
+            "tool_guidance", "Inspect the tool result.", description="Tool failure guidance"
+        )
+        assert memory is not None
+        with scripted_session(WorkstreamKind.INTERACTIVE, ["tool", "answer"], ui=NullUI()) as (
+            session,
+            ui,
+            requests,
         ):
-            worker = threading.Thread(target=send_old)
-            worker.start()
-            try:
-                assert advisory_commit_entered.wait(2)
-                session.cancel()
-                abandoned, persistence_error = session.force_abandon_generation(
-                    target_is_current=lambda: True,
-                    clear_target=lambda: True,
-                    publish_abandoned=lambda: None,
-                )
-                assert abandoned is True
-                assert persistence_error is None
-                successor_generation = session._generation
+            session._mem_cfg.nudges = True
+            with patch.object(ui, "on_system_turn", wraps=ui.on_system_turn) as system_turn:
+                session.send("Run the lookup tool.")
 
-                session._metacog_state.clear()
-                session._metacog_state["successor-marker"] = 123.0
-                session._nudge_queue.clear_channels({"any", "quiet", "tool", "user", "wake"})
-                session._queue_tool_advisory("successor", "successor-owned advisory")
-                metacog_snapshot = dict(session._metacog_state)
-                nudge_snapshot = session._nudge_queue.pending()
+            tool_turns = [turn for turn in session.messages if turn.role is Role.TOOL]
+            assert len(tool_turns) == 1
+            result = tool_turns[0]
+            assert result.is_error is True
+            assert "Tool 'lookup' is not available now." in result.text
+            assert len(requests) == 2
+            wire_results = [msg for msg in requests[1]["messages"] if msg["role"] == "tool"]
+            assert len(wire_results) == 1
+            assert wire_results[0]["tool_call_id"] == result.tool_call_id
+            assert wire_results[0]["content"] == result.text
+            assert all(turn.source != "tool_error" for turn in session.messages)
+            assert all(call.args[1] != "tool_error" for call in system_turn.call_args_list)
 
-                release_advisory_commit.set()
-            finally:
-                release_advisory_commit.set()
-                worker.join(2)
-
-        assert not worker.is_alive()
-        assert send_errors == []
-        assert old_generation and successor_generation == old_generation[0] + 1
-        assert session._generation == successor_generation
-        assert session._metacog_state == metacog_snapshot
-        assert session._nudge_queue.pending() == nudge_snapshot
-        assert nudge_snapshot == [("successor", "successor-owned advisory")]
-
-    def test_a_flagged_tool_result_queues_the_tool_error_nudge(self, tmp_db) -> None:
-        """Through the run loop: a batch whose executor flags a result as an
-        error reaches the advisory with ``has_tool_error`` set, and the
-        tool-error nudge is queued for the drain pass."""
+    @pytest.mark.parametrize("reason", ["stop", "close", "publication_latch"])
+    def test_stop_or_close_during_tool_execution_admits_no_result(
+        self, tmp_db, monkeypatch, reason
+    ):
+        """``publication_latch`` sets only the latch close installs first: the fence must refuse
+        on it alone, which ``_check_cancelled`` would not, since it never reads the latch."""
         session = _make_session()
         session._title_generated = True
-        session._mem_cfg.nudges = True
         responses = [
             make_result(
                 "calling tool",
@@ -12065,47 +12075,30 @@ class TestApplyPostExecuteAdvisories:
                     {
                         "id": "call-1",
                         "type": "function",
-                        "function": {"name": "bash", "arguments": '{"command":"false"}'},
+                        "function": {"name": "bash", "arguments": "{}"},
                     }
                 ],
             ),
-            make_result("done"),
+            make_result("must not continue"),
         ]
-        original_apply = session._apply_post_execute_advisories
 
-        def execute(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
-            del principal_id, my_generation
-            session._tool_error_flags["call-1"] = True
-            return [("call-1", "command failed")], None
+        def execute(_tool_calls, **_kwargs):
+            if reason == "stop":
+                session._cancel_event.set()
+            elif reason == "close":
+                session.close_publication()
+            else:
+                monkeypatch.setattr(session, "_publication_shutdown", True)
+            return [("call-1", "finished")], None
 
         with (
             _send_with_mocks(session, responses, execute),
-            patch.object(session, "_apply_post_execute_advisories", original_apply),
-            patch.object(session, "_nudges_enabled", return_value=True),
-            patch.object(session, "_visible_memory_count", return_value=3),
-            patch.object(
-                session, "_queue_tool_advisory", wraps=session._queue_tool_advisory
-            ) as queue_tool_advisory,
+            patch.object(session, "_admit_tool_result", wraps=session._admit_tool_result) as admit,
         ):
-            session.send("run the tool")
+            session.send("Run the tool.")
 
-        assert "tool_error" in [c.args[0] for c in queue_tool_advisory.call_args_list]
-
-    def test_tool_error_nudge_fires_when_memories_exist(self, tmp_db):
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=3):
-            session._apply_post_execute_advisories(has_tool_error=True)
-        assert any(t == "tool_error" for t, _ in _tool_pending(session))
-
-    def test_tool_error_nudge_skipped_with_zero_memories(self, tmp_db):
-        """Without memories the tool_error nudge has nothing useful to point
-        at — should_nudge gates it off."""
-        session = _make_session()
-        self._prime(session)
-        with patch.object(session, "_visible_memory_count", return_value=0):
-            session._apply_post_execute_advisories(has_tool_error=True)
-        assert all(t != "tool_error" for t, _ in _tool_pending(session))
+        admit.assert_not_called()
+        assert len(responses) == 1
 
 
 class TestUpdateTokenTableMsgsParam:
@@ -12291,7 +12284,6 @@ class TestUserAdvisoryCancelClear:
         session = _make_session()
         session._queue_user_advisory("denial", "leftover")
         with (
-            patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("user input")
@@ -12301,7 +12293,6 @@ class TestUserAdvisoryCancelClear:
         session = _make_session()
         session._queue_user_advisory("correction", "leftover")
         with (
-            patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=KeyboardInterrupt()),
             contextlib.suppress(KeyboardInterrupt),
         ):
@@ -12312,7 +12303,6 @@ class TestUserAdvisoryCancelClear:
         session = _make_session()
         session._queue_user_advisory("completion", "leftover")
         with (
-            patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
@@ -12356,7 +12346,6 @@ class TestUserAdvisoryCancelClear:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.send("first message")
 
@@ -12393,7 +12382,7 @@ class TestDeliverWakeNudge:
         session = _make_session()
         # Queue has only a tool-channel entry — wake's user-seam drain
         # won't match.  Bail before synthesizing an empty user turn.
-        session._queue_tool_advisory("tool_error", "stale")
+        session._queue_tool_advisory("denial", "stale")
         before_len = len(session.messages)
         with patch.object(session, "_stream_response") as turn:
             session.deliver_wake_nudge_from_queue()
@@ -12402,7 +12391,7 @@ class TestDeliverWakeNudge:
         assert turn.call_count == 0
         # Tool entry still queued (would orphan in production today; the
         # bail just protects against the empty-envelope failure mode).
-        assert _tool_pending(session) == [("tool_error", "stale")]
+        assert _tool_pending(session) == [("denial", "stale")]
         # Wake tag never set.
         assert session._wake_source_tag == ""
 
@@ -12429,7 +12418,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         # Queue drained.
@@ -12466,7 +12454,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         # The nudge drained onto the synthetic turn...
@@ -12489,7 +12476,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         user_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "user"]
@@ -12506,7 +12492,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         # `finally` block resets the tag; production code outside the
@@ -12514,21 +12499,17 @@ class TestDeliverWakeNudge:
         assert session._wake_source_tag == ""
 
     def test_skips_metacog_check_on_synthetic_send(self, tmp_db):
-        """Wake-channel content with regex-matching trigger words must
-        NOT re-fire correction / completion nudges on top of the
-        envelope.  The ``_wake_source_tag`` guard at the top of
-        ``_check_metacognitive_nudge`` covers this; verify by enqueuing
-        text that *would* trigger ``detect_correction`` (contains
-        "don't") and asserting no fresh ``correction`` entry lands in
-        the queue post-wake.
+        """A wake whose queued nudge text holds a correction trigger word ("don't") must not leave a
+        fresh ``correction`` nudge behind: the wake sends an empty user turn, so nothing runs
+        detection on the queued text.  ``test_plan_skips_detection_inside_a_wake_turn`` pins the
+        planner's own wake guard.
         """
         session = _make_session()
         session._title_generated = True
         # The body contains "don't" — would match the strong-correction
         # `\bdon'?t\b` pattern if re-detected.
         session._nudge_queue.enqueue("idle_children", "don't do that next time", "any")
-        # Force enough memory + message context that should_nudge would
-        # otherwise fire a fresh correction nudge.
+        # Supply enough message context that nudge_allowed would otherwise pass a correction.
         session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
         with (
             patch.object(session, "_stream_response", return_value=make_result("ok")),
@@ -12536,13 +12517,21 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=10),
         ):
             session.deliver_wake_nudge_from_queue()
         # No fresh correction entry was enqueued during the wake send.
         # (The original entry was drained onto the wake turn, not
         # re-queued.)
         assert all(t != "correction" for t, _ in _user_pending(session))
+
+    def test_plan_skips_detection_inside_a_wake_turn(self, tmp_db):
+        """The planner's wake guard: inside a wake-driven turn even a strong correction plans
+        nothing."""
+        session = _make_session()
+        session.messages.append(turn_from_dict({"role": "user", "content": "earlier"}))
+        assert session._plan_metacognitive_nudge("No, don't do that.") is not None
+        session._wake_source_tag = "system_nudge"
+        assert session._plan_metacognitive_nudge("No, don't do that.") is None
 
     def test_flushed_user_msg_during_wake_does_not_inherit_source_tag(self, tmp_db):
         """A real user message queued via ``queue_message`` while a wake
@@ -12587,7 +12576,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
 
@@ -12610,7 +12598,6 @@ class TestDeliverWakeNudge:
         session = _make_session()
         session._nudge_queue.enqueue("idle_children", "leftover", "any")
         with (
-            patch.object(session, "_visible_memory_count", return_value=0),
             patch.object(session, "_stream_response", side_effect=RuntimeError("boom")),
             contextlib.suppress(RuntimeError),
         ):
@@ -12643,7 +12630,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         rows = get_storage().load_messages(session._ws_id)
@@ -12669,7 +12655,6 @@ class TestDeliverWakeNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         rows = get_storage().load_messages(session._ws_id)
@@ -15157,6 +15142,210 @@ class TestWebFetchPdf:
         report.assert_not_called()
 
 
+def _guarded_fetch_response(body: bytes, content_type: str | None) -> Any:
+    """A response built as ``fetch_with_ssrf_guard`` builds it, so the text
+    route decodes *body* the way it does in production."""
+    import httpx2
+
+    headers = {} if content_type is None else {"content-type": content_type}
+    return httpx2.Response(
+        200,
+        headers=headers,
+        content=body,
+        request=httpx2.Request("GET", "https://example.com/file"),
+    )
+
+
+def _jpeg_bytes() -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (8, 8), (0, 128, 255)).save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def _zip_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("notes.txt", "hello " * 100)
+    return buf.getvalue()
+
+
+class TestWebFetchBinary:
+    """#1452: a body that is neither text nor a PDF is refused before extraction.
+
+    The text route decoded it with replacement characters, and the extraction
+    model answered from that noise.
+    """
+
+    @staticmethod
+    def _fetch(body: bytes, content_type: str | None) -> tuple[str, MagicMock, MagicMock]:
+        from turnstone.core.providers._protocol import CompletionResult
+
+        session = _make_session()
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_guarded_fetch_response(body, content_type),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                return_value=CompletionResult(content="Extracted answer."),
+            ) as utility,
+            patch.object(session, "_report_tool_result") as report,
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "binary", "url": "https://example.com/file", "question": "What is it?"}
+            )
+        return answer, utility, report
+
+    @pytest.mark.parametrize(
+        ("make_body", "content_type", "mime"),
+        [
+            (opaque_png, "image/png", "image/png"),
+            # Typed by its bytes, whatever the server calls it.
+            (_jpeg_bytes, "application/octet-stream", "image/jpeg"),
+            (_jpeg_bytes, None, "image/jpeg"),
+        ],
+    )
+    def test_image_is_refused_with_its_type_and_size(
+        self, make_body: Any, content_type: str | None, mime: str
+    ) -> None:
+        body = make_body()
+
+        answer, utility, report = self._fetch(body, content_type)
+
+        expected = (
+            f"Error: fetched content is an image ({mime}, {len(body):,} bytes); "
+            "web_fetch reads web pages, text and PDFs"
+        )
+        assert answer == expected
+        utility.assert_not_called()
+        report.assert_called_once_with("binary", "web_fetch", expected, is_error=True)
+
+    @pytest.mark.parametrize(
+        ("content_type", "served_as"),
+        [
+            ("application/zip", "served as application/zip, "),
+            ("Application/ZIP; name=notes.zip", "served as application/zip, "),
+            # A server that calls binary content a page is named as it said.
+            ("text/html; charset=utf-8", "served as text/html, "),
+            # Header text that isn't a media type never reaches the model.
+            ("not a media type", ""),
+            ("application/" + "x" * 128, ""),
+            (None, ""),
+        ],
+    )
+    def test_other_binary_is_refused_with_its_declared_type(
+        self, content_type: str | None, served_as: str
+    ) -> None:
+        body = _zip_bytes()
+
+        answer, utility, _ = self._fetch(body, content_type)
+
+        assert answer == (
+            f"Error: fetched content is binary ({served_as}{len(body):,} bytes); "
+            "web_fetch reads web pages, text and PDFs"
+        )
+        utility.assert_not_called()
+
+    def test_nul_in_the_first_8192_characters_marks_binary(self) -> None:
+        answer, utility, _ = self._fetch(b"a" * 8191 + b"\x00", "text/plain")
+
+        assert answer.startswith("Error: fetched content is binary (served as text/plain, ")
+        utility.assert_not_called()
+
+    def test_nul_past_the_first_8192_characters_keeps_the_text_route(self) -> None:
+        # Only the start decides, as for read_file, so a stray NUL further
+        # into a page doesn't stop it being read.
+        answer, utility, _ = self._fetch(b"a" * 8192 + b"\x00tail", "text/plain")
+
+        assert answer == "Extracted answer."
+        utility.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("body", "charset"),
+        [
+            ("The answer is 42.".encode("utf-16-le"), "utf-16le"),
+            ("The answer is 42.".encode("utf-16-be"), "utf-16be"),
+            # Its mark begins with the UTF-16 one; the declared charset decides.
+            (codecs.BOM_UTF32_LE + "The answer is 42.".encode("utf-32-le"), "utf-32"),
+        ],
+        ids=["utf-16le", "utf-16be", "utf-32-with-mark"],
+    )
+    def test_text_in_a_declared_wide_charset_is_read(self, body: bytes, charset: str) -> None:
+        # Its bytes hold NULs; the text they decode to holds none.
+        answer, utility, _ = self._fetch(body, f"text/plain; charset={charset}")
+
+        assert answer == "Extracted answer."
+        assert "The answer is 42." in utility.call_args.args[0][1].content[0].text
+
+    @pytest.mark.parametrize(
+        ("bom", "encoding", "content_type"),
+        [
+            (codecs.BOM_UTF16_LE, "utf-16-le", "text/plain"),
+            # Served as a download, with no charset at all.
+            (codecs.BOM_UTF16_BE, "utf-16-be", "application/octet-stream"),
+            # The byte order mark outranks a declared charset, as in browsers.
+            (codecs.BOM_UTF16_LE, "utf-16-le", "text/csv; charset=utf-8"),
+        ],
+        ids=["le-text-plain", "be-octet-stream", "le-declared-utf-8"],
+    )
+    def test_utf16_text_with_a_byte_order_mark_is_read(
+        self, bom: bytes, encoding: str, content_type: str
+    ) -> None:
+        answer, utility, _ = self._fetch(bom + "The answer is 42.".encode(encoding), content_type)
+
+        assert answer == "Extracted answer."
+        assert "The answer is 42." in utility.call_args.args[0][1].content[0].text
+
+    @pytest.mark.parametrize("content_type", ["text/html; charset=utf-8", "TEXT/HTML"])
+    def test_html_is_stripped_to_text(self, content_type: str) -> None:
+        answer, utility, _ = self._fetch(
+            b"<html><body><p>The answer is <b>42</b>.</p></body></html>", content_type
+        )
+
+        assert answer == "Extracted answer."
+        sent = utility.call_args.args[0][1].content[0].text
+        assert "The answer is 42." in sent
+        assert "<p>" not in sent
+
+    def test_pdf_with_binary_streams_keeps_the_pdf_route(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = _make_session()
+        replace_session_lane(
+            session,
+            capabilities=ModelCapabilities(supports_pdf=True),
+        )
+        captured: dict[str, Any] = {}
+        body = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\nstream\x00\x01\x02endstream"
+
+        with (
+            patch(
+                "turnstone.core.session.fetch_with_ssrf_guard",
+                return_value=_guarded_fetch_response(body, "application/pdf"),
+            ),
+            patch.object(
+                session,
+                "_utility_completion",
+                side_effect=_capture_pdf_utility(captured),
+            ),
+        ):
+            _, answer = session._exec_web_fetch(
+                {"call_id": "pdf-binary", "url": "https://example.com/report.pdf"}
+            )
+
+        assert answer == "PDF answer."
+        assert base64.b64decode(captured["content"]["document"]["data"]) == body
+
+
 def test_web_fetch_final_report_is_atomic_against_successor_claim():
     """A final fetch report cannot straddle a force-successor handoff.
 
@@ -15461,7 +15650,6 @@ class TestRehydrateQueuesNoWakeEligibleNudge:
         first._title_generated = True
         with (
             patch.object(first, "_stream_response", return_value=make_result("ok")),
-            patch.object(first, "_visible_memory_count", return_value=0),
             patch.object(first, "_emit_state"),
             patch.object(first, "_print_status_line"),
             patch.object(first, "_update_token_table"),
@@ -15469,8 +15657,7 @@ class TestRehydrateQueuesNoWakeEligibleNudge:
             first.send("hello")
 
         second = _make_session(ws_id=first._ws_id)
-        with patch.object(second, "_visible_memory_count", return_value=3):
-            assert second.rehydrate() is True
+        assert second.rehydrate() is True
         assert second._nudge_queue.pending() == []
         assert not second._nudge_queue.has_pending(WAKE_PENDING)
 
@@ -15498,7 +15685,6 @@ class TestRehydrateQueuesNoWakeEligibleNudge:
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
         ):
             session.deliver_wake_nudge_from_queue()
         sources = [t.source for t in session.messages if t.role is Role.SYSTEM]

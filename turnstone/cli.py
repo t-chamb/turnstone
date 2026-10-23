@@ -233,6 +233,7 @@ class TerminalUI(SessionUI):
                 policy_name = it.get("approval_label", "") or it.get("func_name", "")
                 if verdicts is None or verdicts.get(policy_name) == "deny":
                     it["denied"] = True
+                    it["_refused_by"] = "policy"
                     it["error"] = (
                         POLICIES_UNREADABLE_DENIAL
                         if verdicts is None
@@ -312,6 +313,7 @@ class TerminalUI(SessionUI):
                 return True, None
 
             # Prompt
+            no_input = False
             try:
                 if len(pending) == 1:
                     label = pending[0].get("approval_label", pending[0]["func_name"])
@@ -326,9 +328,13 @@ class TerminalUI(SessionUI):
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
                     )
                 resp = input(prompt_text).strip()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt) as exc:
                 self._write_terminal("\n")
                 resp = "n"
+                # End of input (stdin closed or exhausted, or Ctrl+D, which the banner offers as
+                # quit) answers nothing about the batch: it is refused as unanswered, not as the
+                # person's no. A Ctrl-C at the prompt stays the person's no.
+                no_input = isinstance(exc, EOFError)
 
             # A Stop (Ctrl-C, a close) can retire the batch while its prompt
             # waits, and the line typed next then lands here: use none of it.
@@ -365,6 +371,8 @@ class TerminalUI(SessionUI):
                 for item in pending:
                     item["denied"] = True
                     item["denial_msg"] = denial_msg
+                    if no_input:
+                        item["_refused_by"] = "no_input"
                 return False, None
 
     def on_tool_result(
@@ -842,7 +850,7 @@ def _handle_ws_command(
 
 def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
     """Handle /cluster subcommands querying the turnstone-console API."""
-    import httpx
+    import httpx2
 
     if not console_url:
         print(red("No console URL configured. Use --console-url or set [console] url in config."))
@@ -867,7 +875,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
 
     try:
         if sub == "status":
-            resp = httpx.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
+            resp = httpx2.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
             data = resp.json()
             states = data.get("states", {})
             agg = data.get("aggregate", {})
@@ -889,7 +897,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
 
         elif sub == "nodes":
             limit = 20
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/nodes?sort=activity&limit={limit}",
                 timeout=5,
                 headers=headers,
@@ -939,7 +947,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                         params += f"&{key}={val}"
                 else:
                     params += f"&state={arg}"
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/workstreams?{params}",
                 timeout=5,
                 headers=headers,
@@ -976,7 +984,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
                 print(red("Usage: /cluster node <node_id>"))
                 return
             node_id = parts[2]
-            resp = httpx.get(
+            resp = httpx2.get(
                 f"{console_url}/v1/api/cluster/node/{node_id}", timeout=5, headers=headers
             )
             data = resp.json()
@@ -1003,7 +1011,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None) -> None:
             print(f"Unknown /cluster subcommand: {sub}")
             print("Usage: /cluster [status|nodes|workstreams [state|node=X]|node <id>]")
 
-    except httpx.ConnectError:
+    except httpx2.ConnectError:
         print(red(f"Cannot connect to console at {console_url}"))
     except Exception as e:
         print(red(f"Cluster command failed: {e}"))

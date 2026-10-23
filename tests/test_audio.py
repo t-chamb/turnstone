@@ -10,6 +10,8 @@ from __future__ import annotations
 import shutil
 from unittest.mock import MagicMock
 
+import httpx2
+import openai
 import pytest
 
 from turnstone.core import audio
@@ -402,32 +404,63 @@ class TestTranscribe:
         response.parse.assert_not_called()
 
 
+# What ``synthesize`` clones the lane's client with: one attempt, bounded.
+_ONE_BOUNDED_ATTEMPT = {
+    "max_retries": 0,
+    "timeout": httpx2.Timeout(audio._TTS_BACKEND_TIMEOUT_S, connect=5.0),
+}
+
+
+def _tts_client() -> tuple[MagicMock, MagicMock]:
+    """An SDK client and the clone ``synthesize`` must send its request through.
+
+    A real clone is its own client with its own ``audio`` resource, so a request
+    sent on the original would ignore the clone's options.
+    """
+    client = MagicMock()
+    return client, client.with_options.return_value
+
+
 class TestSynthesize:
+    def test_sends_one_bounded_attempt_through_the_clone(self):
+        client, clone = _tts_client()
+        manager, _response = _response_manager(body=b"a")
+        clone.audio.speech.with_streaming_response.create.return_value = manager
+        audio.synthesize(
+            registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client),
+            alias="voice",
+            text="hi",
+            voice="nova",
+        )
+        client.with_options.assert_called_once_with(**_ONE_BOUNDED_ATTEMPT)
+        clone.audio.speech.with_streaming_response.create.assert_called_once()
+        client.audio.speech.with_streaming_response.create.assert_not_called()
+
     def test_calls_audio_speech_and_returns_bytes(self):
-        client = MagicMock()
+        client, clone = _tts_client()
         manager, _response = _response_manager(body=b"RIFF...wavbytes")
-        client.audio.speech.with_streaming_response.create.return_value = manager
+        clone.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         res = audio.synthesize(registry=reg, alias="voice", text="hi", voice="nova")
         assert res.audio_bytes == b"RIFF...wavbytes"
         assert res.media_type == "audio/mpeg"
         assert res.model_alias == "voice"
-        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
+        kwargs = clone.audio.speech.with_streaming_response.create.call_args.kwargs
         assert kwargs["voice"] == "nova"
         assert kwargs["input"] == "hi"
 
     def test_default_voice_when_empty(self):
-        client = MagicMock()
+        client, clone = _tts_client()
         manager, _response = _response_manager(body=b"a")
-        client.audio.speech.with_streaming_response.create.return_value = manager
+        clone.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         audio.synthesize(registry=reg, alias="voice", text="hi", voice="")
-        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
+        kwargs = clone.audio.speech.with_streaming_response.create.call_args.kwargs
         assert kwargs["voice"] == "alloy"
 
     def test_backend_failure_raises_backend_error(self):
-        client = MagicMock()
-        client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("down")
+        client, clone = _tts_client()
+        clone.audio.speech.with_streaming_response.create.side_effect = RuntimeError("down")
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         with pytest.raises(audio.AudioBackendError):
             audio.synthesize(registry=reg, alias="voice", text="hi", voice="nova")
@@ -436,8 +469,9 @@ class TestSynthesize:
         base_client = MagicMock()
         call_client = MagicMock()
         base_client.with_options.return_value = call_client
+        bounded = call_client.with_options.return_value
         manager, _response = _response_manager(body=b"voice")
-        call_client.audio.speech.with_streaming_response.create.return_value = manager
+        bounded.audio.speech.with_streaming_response.create.return_value = manager
         cfg = _Cfg("gpt-4o-mini-tts")
         resolver = MagicMock(return_value="minted-token")
 
@@ -452,12 +486,14 @@ class TestSynthesize:
         assert result.audio_bytes == b"voice"
         resolver.assert_called_once_with("voice", cfg)
         base_client.with_options.assert_called_once_with(api_key="minted-token")
+        call_client.with_options.assert_called_once_with(**_ONE_BOUNDED_ATTEMPT)
         base_client.audio.speech.with_streaming_response.create.assert_not_called()
+        call_client.audio.speech.with_streaming_response.create.assert_not_called()
         base_client.close.assert_not_called()
         call_client.close.assert_not_called()
 
     def test_abort_after_speech_manager_creation_prevents_dispatch(self):
-        client = MagicMock()
+        client, clone = _tts_client()
         ref = StreamAbortRef()
         manager, response = _response_manager(body=b"too late")
 
@@ -465,7 +501,7 @@ class TestSynthesize:
             ref.abort()
             return manager
 
-        client.audio.speech.with_streaming_response.create.side_effect = _create_manager
+        clone.audio.speech.with_streaming_response.create.side_effect = _create_manager
 
         with pytest.raises(DeadlineCancelledError):
             audio.synthesize(
@@ -478,6 +514,33 @@ class TestSynthesize:
 
         manager.__enter__.assert_not_called()
         response.read.assert_not_called()
+
+
+class TestSynthesizeOnTheWire:
+    """``synthesize`` through the real SDK client, against a mock backend, so the
+    deadline and retry count are the ones the transport actually sees."""
+
+    def test_a_failed_call_is_not_retried_and_carries_the_bound(self):
+        seen: list[dict[str, float]] = []
+
+        def backend(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx2.Response(503, json={"error": "overloaded"})
+
+        client = openai.OpenAI(
+            api_key="sk-test",
+            base_url="http://speech.example.com/v1",
+            http_client=httpx2.Client(transport=httpx2.MockTransport(backend)),
+        )
+        with pytest.raises(audio.AudioBackendError):
+            audio.synthesize(
+                registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client),
+                alias="voice",
+                text="hi",
+                voice="nova",
+            )
+        bound = audio._TTS_BACKEND_TIMEOUT_S
+        assert seen == [{"connect": 5.0, "read": bound, "write": bound, "pool": bound}]
 
 
 class TestOpenAIAudioModelsKnown:

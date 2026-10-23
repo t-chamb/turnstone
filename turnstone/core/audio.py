@@ -20,6 +20,8 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import httpx2
+
 from turnstone.core.log import get_logger
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.model_turn import (
@@ -85,6 +87,15 @@ _MEDIA_TYPES: dict[str, str] = {
 }
 
 _DEFAULT_VOICE = "alloy"
+
+# Longest silence a synthesis call waits through: for headers from a backend that
+# answers only when the clip is done, or between chunks from one that streams.  It
+# covers a full-cap clip at the slowest backend measured (_TTS_TEXT_CAP in
+# server.py, ~75 s) and ends before the console stops waiting
+# (_TTS_PROXY_READ_TIMEOUT_S, 90 s), so the node frees the call's capacity and
+# answers with its own error first.  test_the_console_outwaits_a_full_cap_clip
+# pins the three numbers.
+_TTS_BACKEND_TIMEOUT_S = 80.0
 
 # Default instruction for transcribing via an omni *chat* model (one that accepts
 # audio in chat but doesn't serve the dedicated /audio/transcriptions endpoint).
@@ -700,7 +711,13 @@ def synthesize(
         raise AudioUnavailableError(f"TTS model alias {alias!r} cannot synthesize speech")
     refuse_aborted_request(cancel_ref)
     try:
-        client = lane_call_client(lane, cancel_ref=cancel_ref)
+        # One bounded attempt.  A retry repeats the whole clip, which would outlast
+        # the console's wait, and the timeout covers the wait for headers, which an
+        # abort can't cut short because no response handle exists yet.
+        client = lane_call_client(lane, cancel_ref=cancel_ref).with_options(
+            max_retries=0,
+            timeout=httpx2.Timeout(_TTS_BACKEND_TIMEOUT_S, connect=5.0),
+        )
         manager = client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice or _DEFAULT_VOICE,

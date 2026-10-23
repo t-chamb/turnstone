@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -32,8 +32,10 @@ from tests._coord_test_helpers import (
     _build_mgr_with_factory,
     _fake_registry,
     _FakeConfigStore,
+    _rehydrate_with_children_down,
     _seed_children,
 )
+from tests._helpers import opaque_png
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     COORDINATOR_MODEL_WORDING,
@@ -744,12 +746,7 @@ def test_create_non_string_model_fields_collapse_to_none(storage):
     assert captured == {"model_alias": None, "judge_model": None}
 
 
-_PNG_1X1 = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xfc\xcf"
-    b"\xc0\xc0\xc0\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND"
-    b"\xaeB`\x82"
-)
+_PNG_1X1 = opaque_png()
 
 
 def test_create_with_multipart_attachments_stages_to_buffer(storage):
@@ -1903,6 +1900,58 @@ def test_history_load_messages_exception_returns_non_authoritative_503(storage):
     assert resp.json() == {"error": "History temporarily unavailable"}
 
 
+def test_history_lookup_failing_after_the_tenant_check_is_503(storage):
+    """A row read that starts failing between the tenant check and the
+    handler's own lookup answers the 503 a failed history load does, not
+    404: an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    assert mgr.get("storage-only-coord") is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/history", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "History temporarily unavailable"}
+
+
+def test_export_lookup_failing_after_the_tenant_check_is_503(storage):
+    """Export answers the same race as history: a row read that starts
+    failing between the tenant check and the handler's own lookup is a
+    503, not a 404, since an outage is not a missing workstream."""
+    from unittest.mock import patch
+
+    mgr = _build_history_mgr(storage)
+    storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    real_get = storage.get_workstream
+    calls: list[str] = []
+
+    def _fail_after_the_tenant_check(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        if len(calls) == 1:
+            return real_get(ws_id)
+        raise RuntimeError("db gone")
+
+    with patch.object(storage, "get_workstream", side_effect=_fail_after_the_tenant_check):
+        resp = client.get("/v1/api/workstreams/storage-only-coord/export", headers=_COORD_HEADERS)
+    assert len(calls) == 2  # the tenant check read, then the handler's lookup failed
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "Export temporarily unavailable"}
+
+
 def test_history_clamps_limit_query_param(storage):
     """Pre-lift coord clamped ``?limit=`` to [1, 500]. The lifted factory
     preserves the same bounds. Out-of-range / unparseable values
@@ -2279,6 +2328,47 @@ def test_coord_cancel_cascades_to_children(storage):
     ]
     assert len(events) == 1
     assert set(json.loads(events[0]["detail"])["cancelled"]) == {"child-1", "child-2"}
+
+
+def test_coord_cancel_cascade_records_children_it_could_not_read(storage, monkeypatch):
+    """A coordinator rehydrated while its children query fails can't reach its
+    children: the owner's cancel still answers 200, and the cascade audit says
+    the children couldn't be read instead of recording an empty cascade."""
+    import json
+
+    from turnstone.console.server import _cascade_cancel_to_children
+    from turnstone.core.session_routes import SessionEndpointConfig, make_cancel_handler
+
+    mgr, ws, coord_id, _down = _rehydrate_with_children_down(
+        storage, monkeypatch, ["c" * 32, "d" * 32]
+    )
+    coord_client = MagicMock()
+    ws.session = MagicMock()
+    ws.session._coord_client = coord_client
+    cfg = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=lambda r: (mgr, None),
+        tenant_check=None,
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+    )
+    handler = make_cancel_handler(cfg, post_cancel=_cascade_cancel_to_children)
+    app = Starlette(routes=[Route("/v1/api/workstreams/{ws_id}/cancel", handler, methods=["POST"])])
+    app.state.coord_adapter = mgr._adapter
+    app.state.auth_storage = storage
+    app.add_middleware(_AuthMiddleware)
+
+    resp = TestClient(app).post(f"/v1/api/workstreams/{coord_id}/cancel", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    ws.session.cancel.assert_called_once()
+    coord_client.cancel.assert_not_called()
+    events = [
+        e for e in storage.list_audit_events() if e["action"] == "coordinator.cancel_cascaded"
+    ]
+    assert len(events) == 1
+    detail = json.loads(events[0]["detail"])
+    assert detail["error"] == "the coordinator's children could not be read"
+    assert detail["cancelled"] == []
 
 
 def test_coord_cancel_cascade_denied_for_service_token_without_grant(storage):
@@ -2744,6 +2834,81 @@ def test_tasks_corrupt_envelope_returns_empty(storage):
     assert resp.json() == {"version": 1, "tasks": []}
 
 
+def test_tasks_failed_read_is_503(storage, monkeypatch):
+    """A failed storage read answers 503, never an empty list (#1416), so
+    the pane keeps the list it last rendered."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_workstream_config", _broken)
+    resp = client.get(f"/v1/api/workstreams/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "task list could not be read"}
+
+
+def test_unloaded_coordinator_whose_row_cannot_be_read_is_denied(storage, monkeypatch):
+    """When the coordinator isn't loaded and its row read fails, its own
+    routes and the shared ones behind the tenant check (history here) deny
+    it as they deny an unknown id, rather than answer a 500."""
+    mgr = _build_mgr(storage)
+    ws_id = "c" * 32
+    storage.register_workstream(ws_id, kind="coordinator", user_id="user-1")
+    assert mgr.get(ws_id) is None
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    routes = ("tasks", "children", "history")
+    for route in routes:  # the unloaded row resolves while reads work
+        before = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert before.status_code == 200, route
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "get_workstream", _broken)
+    for route in routes:
+        resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=_COORD_HEADERS)
+        assert resp.status_code == 404, route
+        assert resp.json() == {"error": "coordinator not found"}
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [
+        ("get_workstream",),
+        ("get_project", "is_project_member"),
+        ("get_workstream", "get_project", "is_project_member"),
+    ],
+    ids=["rows", "projects", "both"],
+)
+def test_an_outage_tells_a_non_member_nothing_about_coordinators(storage, monkeypatch, failing):
+    """Whichever reads fail, a caller outside a private project gets the same
+    404 for a loaded coordinator in that project, an unloaded one and an id
+    that names nothing, so an outage is no existence oracle."""
+    storage.create_project("proj-secret", "Secret", "alice")
+    mgr = _build_mgr(storage)
+    loaded = mgr.create(user_id="alice", project_id="proj-secret")
+    unloaded_id = "e" * 32
+    storage.register_workstream(
+        unloaded_id, kind="coordinator", user_id="alice", project_id="proj-secret"
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    stranger = {"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"}
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    for method in failing:
+        monkeypatch.setattr(storage, method, _broken)
+    for route in ("tasks", "history"):
+        for ws_id in (loaded.id, unloaded_id, "d" * 32):
+            resp = client.get(f"/v1/api/workstreams/{ws_id}/{route}", headers=stranger)
+            assert resp.status_code == 404, (route, ws_id)
+            assert resp.json() == {"error": "coordinator not found"}
+
+
 def test_tasks_any_admin_coordinator_caller_can_read(storage):
     # Trusted-team visibility: any ``admin.coordinator`` caller can
     # read the tasks envelope.
@@ -2778,6 +2943,26 @@ def test_cluster_inspect_unknown_ws_id_404(storage):
     client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
     resp = client.get("/v1/api/cluster/ws/" + ("a" * 32) + "/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 404
+
+
+def test_cluster_inspect_failed_message_read_is_503(storage, monkeypatch):
+    """A failed read of the message tail is not an empty one: the route
+    answers 503 rather than a detail with ``messages: []``."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    url = f"/v1/api/cluster/ws/{ws.id}/detail"
+    assert client.get(url, headers=_CLUSTER_HEADERS).status_code == 200
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(storage, "load_messages", _broken)
+    resp = client.get(url, headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "workstream messages could not be read"}
+    # A caller that asks for no messages reads none, so it still gets its detail.
+    assert client.get(url + "?limit=0", headers=_CLUSTER_HEADERS).status_code == 200
 
 
 def test_cluster_inspect_invalid_ws_id_400(storage):
@@ -2922,8 +3107,8 @@ def test_cluster_inspect_unloaded_coordinator_live_null(storage):
     assert body["persisted"]["kind"] == "coordinator"
 
 
-def _install_proxy_client(client: TestClient, transport: httpx.MockTransport) -> None:
-    """Attach an httpx.AsyncClient backed by a MockTransport to the app state.
+def _install_proxy_client(client: TestClient, transport: httpx2.MockTransport) -> None:
+    """Attach an httpx2.AsyncClient backed by a MockTransport to the app state.
 
     cluster_ws_detail's node-backed branch reads
     ``request.app.state.proxy_client`` + ``request.app.state.collector``
@@ -2931,7 +3116,7 @@ def _install_proxy_client(client: TestClient, transport: httpx.MockTransport) ->
     tests short-circuit by injecting a proxy client here and stubbing
     the collector's node lookup with a MagicMock.
     """
-    client.app.state.proxy_client = httpx.AsyncClient(transport=transport)
+    client.app.state.proxy_client = httpx2.AsyncClient(transport=transport)
 
 
 def _install_collector_with_node(client: TestClient, node_id: str, server_url: str) -> None:
@@ -2979,13 +3164,13 @@ def test_cluster_inspect_node_backed_success(storage):
         ]
     }
 
-    def _handler(req: httpx.Request) -> httpx.Response:
+    def _handler(req: httpx2.Request) -> httpx2.Response:
         assert req.url.path == "/v1/api/dashboard"
-        return httpx.Response(200, json=payload)
+        return httpx2.Response(200, json=payload)
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(_handler))
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
 
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
@@ -3044,7 +3229,9 @@ def test_cluster_inspect_node_backed_pending_approval_detail_passes_through(stor
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     live = resp.json()["live"]
@@ -3070,24 +3257,26 @@ def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"]["pending_approval"] is True
 
 
 def test_cluster_inspect_node_unreachable_live_null(storage):
-    """httpx connect/timeout error → live: null, status 200."""
+    """httpx2 connect/timeout error → live: null, status 200."""
     mgr = _build_mgr(storage)
     ws_id = "de" * 16
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
 
-    def _handler(req: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("node down")
+    def _handler(req: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("node down")
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(_handler))
+    _install_proxy_client(client, httpx2.MockTransport(_handler))
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None
@@ -3100,7 +3289,7 @@ def test_cluster_inspect_node_5xx_live_null(storage):
     _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(503, text="down")))
+    _install_proxy_client(client, httpx2.MockTransport(lambda r: httpx2.Response(503, text="down")))
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None
@@ -3118,7 +3307,9 @@ def test_cluster_inspect_node_missing_entry_live_null(storage):
     }
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     _install_collector_with_node(client, "node-a", "http://node-a")
-    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    _install_proxy_client(
+        client, httpx2.MockTransport(lambda r: httpx2.Response(200, json=payload))
+    )
     resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["live"] is None

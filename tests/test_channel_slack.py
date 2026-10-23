@@ -86,14 +86,14 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     client.conversations_history = AsyncMock(return_value={"ok": True, "messages": []})
     client.views_open = AsyncMock(return_value={"ok": True})
 
-    # Patch httpx.AsyncClient so each test doesn't open a real client that
-    # leaks an unclosed-warning at GC time.  The bot's _http_client is only
-    # used by the SDK router (which we replace with a MagicMock below), so
-    # an AsyncMock standin is enough for every test that uses this factory.
+    # Patch httpx2.AsyncClient so each test doesn't open a real client that leaks an
+    # unclosed-warning at GC time.  The bot's _http_client is only used by the SSE listener (which
+    # we replace with an AsyncMock below), so an AsyncMock standin is enough for every test that
+    # uses this factory.
     with (
         patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
         patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
-        patch("turnstone.channels.slack.bot.httpx.AsyncClient", return_value=AsyncMock()),
+        patch("turnstone.channels.slack.bot.httpx2.AsyncClient", return_value=AsyncMock()),
     ):
         bot = TurnstoneSlackBot(
             config,
@@ -830,7 +830,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -913,7 +913,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1057,7 +1057,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1078,7 +1078,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1468,3 +1468,47 @@ class TestChannelModel:
         _run(bot._on_message(event, say))  # type: ignore[attr-defined]
 
         assert say.await_args.kwargs["text"] == "Sorry, something went wrong routing your message."
+
+
+def test_a_static_token_rides_the_sse_connection_not_the_shared_client(monkeypatch):
+    """The bot's shared client carries no credential; each SSE connection adds the server
+    token itself, as it does with a rotating token."""
+    import functools
+
+    import httpx2
+
+    from turnstone.channels.slack.bot import TurnstoneSlackBot
+    from turnstone.channels.slack.config import SlackConfig
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx2.Response(404)
+
+    monkeypatch.setattr(
+        "turnstone.channels.slack.bot.httpx2.AsyncClient",
+        functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+    )
+    with (
+        patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
+        patch("turnstone.channels.slack.bot.AsyncWebClient", MagicMock()),
+    ):
+        bot = TurnstoneSlackBot(
+            SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
+            server_url="http://localhost:8080",
+            storage=MagicMock(),
+            api_token="static-token",
+        )
+
+    async def listen():
+        try:
+            await asyncio.wait_for(bot._sse_listener("abcdef0123456789", "C1"), 2)
+        finally:
+            await bot.router.aclose()
+            await bot._http_client.aclose()
+
+    assert "authorization" not in bot._http_client.headers
+    _run(listen())
+    assert [r.url.path for r in requests] == ["/v1/api/workstreams/abcdef0123456789/events"]
+    assert requests[0].headers["authorization"] == "Bearer static-token"

@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
@@ -47,6 +47,7 @@ from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.console.coordinator_client import _serialize_messages, load_task_envelope
+from turnstone.console.log_preview import bounded_body_preview, bounded_stream_preview
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.console.schedule_timing import (
@@ -72,6 +73,11 @@ from turnstone.core.avatar_routes import (
     upload_own_avatar_picture,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.http_failures import (
+    REQUEST_FAILURES,
+    UPSTREAM_NO_REPLY_CODE,
+    may_have_reached_server,
+)
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
@@ -140,6 +146,7 @@ from turnstone.core.storage import (
 )
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
+    WORKSTREAM_UNREADABLE_CODE,
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
     lease_refusal_response,
@@ -297,60 +304,23 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
+# How long the console waits for a node's ``tts`` answer, and only for that
+# wait: connecting, writing and the pool keep _PROXY_CLIENT_TIMEOUT_S.
+#
+# The node answers only once the whole clip is synthesized, so ordinary request
+# latency does not describe this route.  The node accepts up to _TTS_TEXT_CAP
+# (8,000) characters, ~75 s at the slowest backend measured (~107 chars/s), and
+# bounds its own backend call at _TTS_BACKEND_TIMEOUT_S (80 s) so that it answers
+# first.  test_the_console_outwaits_a_full_cap_clip pins the three numbers.  A
+# proxy in front of the console has to allow this long without data; the
+# repository's AWS module sets its load balancer's idle timeout to 120 s.
+_TTS_PROXY_READ_TIMEOUT_S = 90.0
+
+# How often a forwarded ``tts`` call checks whether the browser is still there.
+_TTS_DEPARTURE_POLL_S = 1.0
+
+
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
-
-
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-async def _bounded_stream_preview(response: httpx.Response, cap: int = 200) -> str:
-    """Streaming counterpart of :func:`_bounded_body_preview`.
-
-    Iterates ``response.aiter_bytes`` up to ``cap * 1.3`` bytes (enough
-    for ``cap`` chars post-UTF-8 decode) so a compromised / oversized
-    upstream can't force the proxy to buffer an arbitrary error page
-    just to populate a preview.  Shares the control-char scrub with
-    the non-streaming helper so the output shape is identical across
-    sites.
-    """
-    preview_chunks: list[bytes] = []
-    read = 0
-    byte_cap = int(cap * 1.3) + 1
-    try:
-        async for chunk in response.aiter_bytes():
-            if not chunk:
-                continue
-            remaining = byte_cap - read
-            if remaining <= 0:
-                break
-            preview_chunks.append(chunk[:remaining])
-            read += len(preview_chunks[-1])
-            if read >= byte_cap:
-                break
-    except Exception:
-        return "<unreadable>"
-    decoded = b"".join(preview_chunks).decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", decoded)[:cap]
-
-
-def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
-    """Return a body preview for 4xx logs capped at ``cap`` chars.
-
-    Body is already in memory on a non-streaming httpx response; this
-    helper exists so every call-site produces the same shape.
-
-    Control characters (CR, LF, NUL, ...) are replaced with spaces
-    before the cap: the preview flows into both ``log.warning`` records
-    and the operator-facing 503 ``collector_scope_error`` body, and
-    upstream-controlled newlines in either surface would let a
-    compromised node forge additional log lines or masquerade as
-    embedded remediation text.
-    """
-    if not text:
-        return ""
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
 
 
 def _dispatch_failed(node_id: str) -> JSONResponse:
@@ -541,7 +511,7 @@ async def cluster_nodes(request: Request) -> JSONResponse:
                 try:
                     _mf_json.loads(mv)
                     encoded[mk] = mv
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     encoded[mk] = _mf_json.dumps(mv)
             try:
                 node_ids = storage.filter_nodes_by_metadata(encoded)
@@ -818,7 +788,7 @@ class _NodeDashboardCache:
         self,
         node_id: str,
         server_url: str,
-        client: httpx.AsyncClient,
+        client: httpx2.AsyncClient,
         headers: dict[str, str],
     ) -> dict[str, Any] | None:
         now = time.monotonic()
@@ -843,14 +813,14 @@ class _NodeDashboardCache:
                     headers=headers,
                     timeout=2.0,
                 )
-            except (httpx.HTTPError, TimeoutError):
+            except (*REQUEST_FAILURES, TimeoutError):
                 resp = None
             if resp is not None:
                 status = resp.status_code
                 if 200 <= status < 300:
                     try:
                         raw = resp.json()
-                    except (ValueError, json.JSONDecodeError):
+                    except (ValueError, json.JSONDecodeError, RecursionError):
                         raw = None
                     if isinstance(raw, dict):
                         payload = raw
@@ -868,7 +838,7 @@ class _NodeDashboardCache:
                         node_id,
                         status,
                         server_url,
-                        _bounded_body_preview(resp.text),
+                        bounded_body_preview(resp.content),
                     )
                     return None
             self._cache[node_id] = (time.monotonic(), payload)
@@ -966,7 +936,7 @@ async def _fetch_live_block(
     server_url = _get_server_url(request, row_node_id)
     if not server_url:
         return None
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     # Route through the per-node dashboard cache — N concurrent
     # cluster_ws_detail calls to children on the same node collapse
     # to one upstream GET per 2s TTL window instead of N full
@@ -983,7 +953,7 @@ async def _fetch_live_block(
                 headers=_proxy_auth_headers(request),
                 timeout=2.0,
             )
-        except (httpx.HTTPError, TimeoutError):
+        except (*REQUEST_FAILURES, TimeoutError):
             return None
         status = resp.status_code
         if 400 <= status < 500:
@@ -995,14 +965,14 @@ async def _fetch_live_block(
                 row_node_id,
                 status,
                 server_url,
-                _bounded_body_preview(resp.text),
+                bounded_body_preview(resp.content),
             )
             return None
         if not (200 <= status < 300):
             return None
         try:
             raw = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, *REQUEST_FAILURES, RecursionError):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -1044,10 +1014,12 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
     - ``persisted`` — the full ``get_workstream`` row (never ``None``).
     - ``live`` — live fields merged from the owning node, or ``null`` when
       the node is unreachable / the workstream isn't on its roster / the
-      coordinator isn't in memory.  The caller always sees ``persisted``
-      populated and a 200 response; node unreachability is signalled by
-      ``live=null`` rather than an error status.
-    - ``messages`` — tail-N conversation messages, default 20, capped at 200.
+      coordinator isn't in memory.  Node unreachability is signalled by
+      ``live=null`` rather than an error status: once the row and the
+      requested tail are read, the caller sees ``persisted`` populated and
+      a 200 response.
+    - ``messages`` — tail-N conversation messages, default 20, capped at
+      200; ``limit=0`` skips the read, and a read that fails answers 503.
 
     404 masks ownership failures (match :func:`make_detail_handler`).
     Correlation-id masks unexpected exceptions in the merge path.
@@ -1143,7 +1115,9 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
                 await asyncio.to_thread(storage.load_messages, ws_id, limit=limit, repair=False)
             )
         except Exception:
-            log.debug("cluster_ws_detail.load_messages_failed", exc_info=True)
+            # An empty tail would read as a workstream with no messages.
+            log.warning("cluster_ws_detail.load_messages_failed ws_id=%s", ws_id[:8], exc_info=True)
+            return JSONResponse({"error": "workstream messages could not be read"}, status_code=503)
 
     return JSONResponse(
         {
@@ -1308,18 +1282,18 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is not None:
         try:
-            raw = storage.get_node_metadata(node_id)
-            entries = []
-            for r in raw:
-                try:
-                    val = _nd_json.loads(r["value"])
-                except (ValueError, TypeError):
-                    val = r["value"]
-                entries.append({"key": r["key"], "value": val, "source": r["source"]})
-            detail["metadata"] = entries
+            raw = await asyncio.to_thread(storage.get_node_metadata, node_id)
         except Exception:
             log.warning("cluster.node_metadata_load_failed node_id=%s", node_id, exc_info=True)
-            detail["metadata"] = []
+            return JSONResponse({"error": "node metadata could not be read"}, status_code=503)
+        entries = []
+        for r in raw:
+            try:
+                val = _nd_json.loads(r["value"])
+            except (ValueError, TypeError, RecursionError):
+                val = r["value"]
+            entries.append({"key": r["key"], "value": val, "source": r["source"]})
+        detail["metadata"] = entries
     else:
         detail["metadata"] = []
     return JSONResponse(detail)
@@ -1891,7 +1865,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "project_id": project_id,
     }
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     node_url = f"{server_url.rstrip('/')}/v1/api/workstreams/new"
     try:
@@ -1910,8 +1884,11 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
+        # A create that outlasted the timeout may have made the workstream, which the mask hides.
+        if may_have_reached_server(exc):
+            return _upstream_failure(exc, f"node {node_id}")
         return _dispatch_failed(node_id)
 
     # Preserve the coded project-required and wrong-executor refusals. Mask
@@ -1930,7 +1907,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     # actionable attach-denied 403 and factory-misconfig 503 are also masked
     # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
     # re-checking the leak. Branch on the explicit success range (not
-    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # raise_for_status) so a future httpx2 that lets a 3xx through still cannot
     # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
     # would otherwise raise a JSONDecodeError → console 500 → operator retry →
     # orphan/duplicate ws).
@@ -1950,7 +1927,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "Workstream dispatch to %s: unparseable %s success body: %s",
                 node_id,
                 resp.status_code,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _dispatch_failed(node_id)
         return JSONResponse(
@@ -2015,7 +1992,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "Workstream dispatch to %s failed: node status %s: %s",
         node_id,
         resp.status_code,
-        _bounded_body_preview(resp.content),
+        bounded_body_preview(resp.content),
     )
     return _dispatch_failed(node_id)
 
@@ -2033,6 +2010,44 @@ def _record_route(
     if cm is not None:
         cm.record_route(method, status, time.monotonic() - t0)
     return resp
+
+
+def _upstream_failure(exc: Exception, node: str, *, unreachable: str = "") -> JSONResponse:
+    """The 502 for a request forwarded to *node*, a phrase like ``upstream node n1``, that failed in
+    transport. It says unreachable (*unreachable*, if given) only when the request never reached the
+    node: after that the node may have acted on it, a create that outlasted the proxy's timeout
+    say, so the reply says the request may have been processed and carries
+    ``UPSTREAM_NO_REPLY_CODE`` for the caller to check before retrying.
+    """
+    if not may_have_reached_server(exc):
+        return JSONResponse({"error": unreachable or f"{node} unreachable"}, status_code=502)
+    return JSONResponse(
+        {
+            "error": f"no reply was read from {node}, so the request may have been processed",
+            "code": UPSTREAM_NO_REPLY_CODE,
+        },
+        status_code=502,
+    )
+
+
+async def _refresh_unready_router(
+    request: Request, router: ConsoleRouter, method: str, t0: float
+) -> Response | None:
+    """Reload the node list of a router that knows no live node; a recorded 503 when that fails."""
+    if router.is_ready():
+        return None
+    try:
+        await asyncio.to_thread(router.refresh_cache)
+    except Exception:
+        log.warning("route.refresh_failed method=%s", method, exc_info=True)
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+    return None
 
 
 async def route_create(request: Request) -> Response:
@@ -2067,12 +2082,13 @@ async def route_create(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "create", t0)
+    if refused is not None:
+        return refused
 
     raw_content_type = request.headers.get("content-type") or ""
     is_multipart = raw_content_type.lower().startswith("multipart/form-data")
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     pin = False
     body: dict[str, Any] = {}
@@ -2201,16 +2217,9 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                "create",
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, "create", 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         parsed_body = (
@@ -2339,16 +2348,13 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except httpx.HTTPError:
+            except REQUEST_FAILURES as exc:
                 return _record_route(
                     request,
                     "create",
                     502,
                     t0,
-                    JSONResponse(
-                        {"error": f"upstream node {ref.node_id} unreachable"},
-                        status_code=502,
-                    ),
+                    _upstream_failure(exc, f"upstream node {ref.node_id}"),
                 )
 
             # The console chooses the destination id before routing, so the
@@ -2360,7 +2366,7 @@ async def route_create(request: Request) -> Response:
                 collision = resp.status_code == 409 and resp.json() == {
                     "error": "Workstream already exists"
                 }
-            except ValueError:
+            except (ValueError, RecursionError):
                 collision = False
             if (
                 collision
@@ -2457,7 +2463,7 @@ async def route_create(request: Request) -> Response:
             log.warning(
                 "route_create.invalid_success_body node=%s body=%s",
                 ref.node_id,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
         destination_ws_id = raw_data.get("ws_id")
@@ -2489,7 +2495,7 @@ async def route_create(request: Request) -> Response:
         storage = getattr(request.app.state, "auth_storage", None)
         if storage is not None:
             try:
-                row = storage.get_workstream(destination_ws_id)
+                row = await asyncio.to_thread(storage.get_workstream, destination_ws_id)
                 stored_node = row.get("node_id") if isinstance(row, dict) else None
                 if isinstance(stored_node, str) and stored_node:
                     bound_node_id = stored_node
@@ -2558,8 +2564,9 @@ async def route_attachment_proxy(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, method, t0)
+    if refused is not None:
+        return refused
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -2593,7 +2600,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     if request.url.query:
         upstream_path += f"?{request.url.query}"
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_headers: dict[str, str] = dict(headers)
     if request.method in ("POST", "PUT", "DELETE"):
@@ -2608,21 +2615,14 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                method,
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, method, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         try:
             resp = await client.get(f"{ref.url}{upstream_path}", headers=upstream_headers)
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 method,
@@ -2658,13 +2658,13 @@ async def route_attachment_proxy(request: Request) -> Response:
     )
 
 
-def _lease_refusal_holder(resp: httpx.Response) -> str | None:
+def _lease_refusal_holder(resp: httpx2.Response) -> str | None:
     """The holder a node's owner-lease refusal names ("" when unknown); None otherwise."""
     if resp.status_code != WorkstreamLeaseHeldError.status_code:
         return None
     try:
         body = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or body.get("code") != WorkstreamLeaseHeldError.code:
         return None
@@ -2672,15 +2672,27 @@ def _lease_refusal_holder(resp: httpx.Response) -> str | None:
     return holder if isinstance(holder, str) else ""
 
 
-def _is_lease_refusal(resp: httpx.Response) -> bool:
+def _is_lease_refusal(resp: httpx2.Response) -> bool:
     """A node refused because another process owns the workstream's lease."""
     return _lease_refusal_holder(resp) is not None
 
 
-async def _prepare_reroute(router: ConsoleRouter, resp: httpx.Response, ref: NodeRef) -> bool:
-    """Ready a re-route after a 404 or a lease refusal; False when it cannot move.
+def _is_unreadable_refusal(resp: httpx2.Response) -> bool:
+    """A node's access check could not read the workstream's row (a coded 503)."""
+    if resp.status_code != 503:
+        return False
+    try:
+        body = resp.json()
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(body, dict) and body.get("code") == WORKSTREAM_UNREADABLE_CODE
 
-    A 404 may come from stale membership or overrides, so refresh first. A
+
+async def _prepare_reroute(router: ConsoleRouter, resp: httpx2.Response, ref: NodeRef) -> bool:
+    """Ready a re-route after a 404, an unreadable-row 503 or a lease refusal.
+
+    Returns False when the route cannot move.  A 404 or an unreadable-row
+    503 may come from stale membership or overrides, so refresh first. A
     lease refusal names the holder: the refusing node itself means the route
     cannot move, so its 409 stands. An empty holder or a node the router
     already knows needs no refresh, because ``route()`` re-reads the holder
@@ -2707,20 +2719,20 @@ async def _resend_if_route_moved(
     verb: str,
     t0: float,
     ref: NodeRef,
-    resp: httpx.Response,
-    send: Callable[[NodeRef], Awaitable[httpx.Response]],
-) -> tuple[NodeRef, httpx.Response] | Response:
+    resp: httpx2.Response,
+    send: Callable[[NodeRef], Awaitable[httpx2.Response]],
+) -> tuple[NodeRef, httpx2.Response] | Response:
     """Re-route once after ``resp`` and resend when the route moved.
 
     The caller decides which responses warrant this. Returns the node and
     response to report (unchanged when the route cannot move or stays the
     same, so there is no loop and no scan), or a finished response when the
-    workstream's durable node requirement refuses the new route or the new
-    node is unreachable.
+    workstream's durable node requirement refuses the new route, the new
+    node is unreachable, or a 404 can't be checked again.
     """
-    if not await _prepare_reroute(router, resp, ref):
-        return ref, resp
     try:
+        if not await _prepare_reroute(router, resp, ref):
+            return ref, resp
         new_ref = await _request_route(request, router, ws_id)
     except NodeAffinityError as exc:
         return _record_route(
@@ -2730,22 +2742,27 @@ async def _resend_if_route_moved(
             t0,
             JSONResponse(exc.as_dict(), status_code=exc.status_code),
         )
-    except (NoAvailableNodeError, ValueError):
-        return ref, resp
+    except Exception:
+        # Membership or the route couldn't be read again. A 404 passed on
+        # here would read as closed to a channel, so it becomes the proxy's
+        # 503; any other answer passes through.
+        log.warning("route.reroute_unresolved ws=%s verb=%s", ws_id[:8], verb, exc_info=True)
+        if resp.status_code != 404:
+            return ref, resp
+        return _record_route(
+            request,
+            verb,
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
     if (new_ref.node_id, new_ref.url) == (ref.node_id, ref.url):
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except httpx.HTTPError:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"retry node {new_ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"retry node {new_ref.node_id}")
         )
 
 
@@ -2905,8 +2922,9 @@ async def route_proxy(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, verb, t0)
+    if refused is not None:
+        return refused
 
     try:
         body = await request.json()
@@ -2982,32 +3000,27 @@ async def route_proxy(request: Request) -> Response:
     path = request.url.path
     upstream_path = path.replace("/api/route/", "/api/", 1)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     http_method = request.method
     try:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except httpx.HTTPError:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
         )
 
     # Transparent retry on 404 (at most once): the selected node doesn't
     # have the workstream loaded. Refresh membership + overrides and
     # re-route; ``route()`` rereads the lease holder from the row, so a moved
     # workstream routes to its new owner. These verbs act on a loaded
-    # workstream, so a node that does not host it answers 404, never a lease
-    # refusal; such a 409 passes through unchanged.
-    if resp.status_code == 404:
+    # workstream, so a node that does not host it answers 404, or 503 with
+    # the unreadable-row code when its access check can't read the row
+    # (refused before the verb acts), never a lease refusal; such a 409
+    # passes through unchanged.
+    if resp.status_code == 404 or _is_unreadable_refusal(resp):
         moved = await _resend_if_route_moved(
             request,
             router,
@@ -3101,8 +3114,9 @@ async def route_workstream_delete(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "delete", t0)
+    if refused is not None:
+        return refused
     try:
         ref = await _request_route(request, router, ws_id, known_row=known_row)
     except NodeAffinityError as exc:
@@ -3122,21 +3136,18 @@ async def route_workstream_delete(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except httpx.HTTPError:
+    except REQUEST_FAILURES as exc:
         return _record_route(
             request,
             "delete",
             502,
             t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            _upstream_failure(exc, f"upstream node {ref.node_id}"),
         )
 
     # Only the node owning the workstream's lease may delete it (after its
@@ -3268,8 +3279,9 @@ async def route_lookup(request: Request) -> JSONResponse:
                 status_code=503,
             ),
         )  # type: ignore[return-value]
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "route", t0)
+    if refused is not None:
+        return refused  # type: ignore[return-value]
 
     ws_id = request.query_params.get("ws_id", "")
     if not ws_id:
@@ -3339,8 +3351,9 @@ async def route_workstream_live(request: Request) -> Response:
                 status_code=503,
             ),
         )
-    if not router.is_ready():
-        await asyncio.to_thread(router.refresh_cache)
+    refused = await _refresh_unready_router(request, router, "live", t0)
+    if refused is not None:
+        return refused
 
     ws_id = request.path_params.get("ws_id", "").strip()
     if not ws_id:
@@ -3371,7 +3384,7 @@ async def route_workstream_live(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
 
     async def _active_rows(route_ref: NodeRef) -> tuple[list[Any] | None, Response | None]:
@@ -3380,7 +3393,7 @@ async def route_workstream_live(request: Request) -> Response:
                 f"{route_ref.url}/v1/api/workstreams",
                 headers=headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return None, JSONResponse(
                 {"error": f"upstream node {route_ref.node_id} unreachable"},
                 status_code=502,
@@ -3395,7 +3408,7 @@ async def route_workstream_live(request: Request) -> Response:
 
         try:
             payload = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, RecursionError, *REQUEST_FAILURES):
             payload = None
         rows = payload.get("workstreams") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
@@ -3464,35 +3477,35 @@ async def proxy_index(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     safe_node = urllib.parse.quote(node_id, safe="")
     prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/", headers=_proxy_auth_headers(request))
-        if resp.status_code < 200 or resp.status_code >= 300:
-            log.debug("Upstream %s returned status %s", node_id, resp.status_code)
-            return JSONResponse(
-                {"error": "Upstream server error", "status_code": resp.status_code},
-                status_code=resp.status_code,
-            )
-        page = resp.text
-        # Rewrite static asset paths
-        page = page.replace('href="/static/', f'href="{prefix}/static/')
-        page = page.replace('src="/static/', f'src="{prefix}/static/')
-        page = page.replace('href="/shared/', f'href="{prefix}/shared/')
-        page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + back-to-console) after
-        # <body>.  prefix is built from a node_id already validated against
-        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
-        # needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
-        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
-        html_resp = HTMLResponse(page)
-        html_resp.headers["Cache-Control"] = "no-cache"
-        return html_resp
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    if resp.status_code < 200 or resp.status_code >= 300:
+        log.debug("Upstream %s returned status %s", node_id, resp.status_code)
+        return JSONResponse(
+            {"error": "Upstream server error", "status_code": resp.status_code},
+            status_code=resp.status_code,
+        )
+    page = resp.text
+    # Rewrite static asset paths
+    page = page.replace('href="/static/', f'href="{prefix}/static/')
+    page = page.replace('src="/static/', f'src="{prefix}/static/')
+    page = page.replace('href="/shared/', f'href="{prefix}/shared/')
+    page = page.replace('src="/shared/', f'src="{prefix}/shared/')
+    # Inject the proxy shim (prefix rewriting + back-to-console) after
+    # <body>.  prefix is built from a node_id already validated against
+    # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+    # needs.
+    shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+    page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
+    html_resp = HTMLResponse(page)
+    html_resp.headers["Cache-Control"] = "no-cache"
+    return html_resp
 
 
 def _proxy_static_request_headers(request: Request) -> dict[str, str]:
@@ -3505,7 +3518,7 @@ def _proxy_static_request_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _proxy_static_response(resp: httpx.Response, path: str) -> Response:
+def _proxy_static_response(resp: httpx2.Response, path: str) -> Response:
     """Preserve upstream validators and apply the local static cache policy."""
     cache_control = "no-store"
     if resp.status_code in (200, 304):
@@ -3535,16 +3548,16 @@ async def _proxy_static_mount(request: Request, mount: str) -> Response:
         return _static_proxy_error("Node not found", 404)
 
     encoded_path = "/".join(urllib.parse.quote(segment, safe="") for segment in path.split("/"))
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     try:
         resp = await client.get(
             f"{server_url}/{mount}/{encoded_path}",
             headers=_proxy_static_request_headers(request),
         )
-        return _proxy_static_response(resp, path)
-    except httpx.HTTPError as exc:
-        log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy %s error for %r: %s", mount, f"{node_id}/{path}", exc)
         return _static_proxy_error("Node unreachable", 502)
+    return _proxy_static_response(resp, path)
 
 
 async def proxy_static(request: Request) -> Response:
@@ -3666,6 +3679,8 @@ async def proxy_api(request: Request) -> Response:
         )
 
     if request.method in ("POST", "PUT", "DELETE"):
+        if path == "tts":
+            return await _proxy_tts(request, server_url, path, api_prefix=api_prefix)
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
     return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
@@ -3696,56 +3711,99 @@ _PROXY_PASS_HEADERS = (
 )
 
 
-def _proxy_pass_headers(resp: httpx.Response) -> dict[str, str]:
+def _proxy_pass_headers(resp: httpx2.Response) -> dict[str, str]:
     return {h: resp.headers[h] for h in _PROXY_PASS_HEADERS if h in resp.headers}
 
 
 async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     """Forward a GET request to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     target = f"{server_url}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
     try:
         resp = await client.get(target, headers=_proxy_auth_headers(request))
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-            headers=_proxy_pass_headers(resp),
-        )
-    except httpx.HTTPError as exc:
-        log.debug("Proxy GET error for %s: %s", target, exc)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy GET error for %r: %s", target, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers=_proxy_pass_headers(resp),
+    )
 
 
 async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
     """Forward a non-GET request (POST/PUT/DELETE) to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
+    headers = {"Content-Type": content_type}
+    headers.update(_proxy_auth_headers(request))
+    # The tts wait is extended from the client's own timeout rather than
+    # rebuilt from a constant, so connect/write/pool keep whatever bound the
+    # pool was actually constructed with (startup, or the mTLS re-create).
+    timeout = (
+        httpx2.Timeout(**{**client.timeout.as_dict(), "read": _TTS_PROXY_READ_TIMEOUT_S})
+        if path == "tts"
+        else client.timeout
+    )
     try:
-        headers = {"Content-Type": content_type}
-        headers.update(_proxy_auth_headers(request))
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
+            timeout=timeout,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx.HTTPError as exc:
-        log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
+    # A busy node's 429 names its wait in Retry-After, and the browser's
+    # authFetch waits that long before retrying.  Only delta-seconds pass.
+    retry_after = resp.headers.get("retry-after", "")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers=(
+            {"Retry-After": retry_after}
+            if retry_after.isascii() and retry_after.isdigit()
+            else None
+        ),
+    )
+
+
+async def _proxy_tts(request: Request, server_url: str, path: str, *, api_prefix: str) -> Response:
+    """Forward a speech-synthesis call, and drop it if the browser leaves.
+
+    Starlette doesn't cancel a handler whose client has gone, so the console
+    would otherwise hold the node request until the clip is done or
+    _TTS_PROXY_READ_TIMEOUT_S passes, and the node would keep synthesizing for
+    nobody.  Cancelling the forwarded call closes the node connection, which the
+    node's own watcher turns into an abort of its backend call.
+    """
+    # Read the body first: is_disconnected() would otherwise swallow it.
+    await request.body()
+    call = asyncio.create_task(_proxy_post(request, server_url, path, api_prefix=api_prefix))
+    try:
+        while True:
+            done, _ = await asyncio.wait({call}, timeout=_TTS_DEPARTURE_POLL_S)
+            if done:
+                return call.result()
+            if await request.is_disconnected():
+                call.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await call
+                return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
+    finally:
+        call.cancel()
 
 
 async def _proxy_sse(
@@ -3775,7 +3833,7 @@ async def _proxy_sse(
     if request.url.query:
         target += f"?{request.url.query}"
 
-    sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
+    sse_client: httpx2.AsyncClient = request.app.state.proxy_sse_client
     sse_auth: dict[str, str]
     if use_service_auth:
         proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
@@ -3823,30 +3881,32 @@ async def _proxy_sse(
                 "GET",
                 target,
                 headers=upstream_headers,
-                timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
+                timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
                     status = response.status_code
-                    body_preview = await _bounded_stream_preview(response)
+                    body_preview = await bounded_stream_preview(response)
                     # Non-200 from a service-auth-backed SSE path is
                     # operator-actionable: 4xx = scope/tenant drift,
                     # 5xx = upstream outage.  Raise the log floor to
                     # WARNING so it surfaces in ops logs; the browser
                     # also receives the error event for UX.
                     log.warning(
-                        "proxy.sse.non_200 status=%d url=%s body=%s",
+                        "proxy.sse.non_200 status=%d url=%r body=%s",
                         status,
                         target,
                         body_preview,
                     )
                     yield f"event: error\ndata: Upstream returned status {status}\n\n".encode()
                     return
+                # No per-chunk disconnect check: under ASGI spec < 2.4, which uvicorn reports for
+                # HTTP, the StreamingResponse cancels this generator when the browser goes away,
+                # which closes the upstream stream. Under 2.4 or later the response learns of the
+                # disconnect only when a send fails, at the next upstream byte.
                 async for chunk in response.aiter_bytes():
-                    if await request.is_disconnected():
-                        return
                     yield chunk
-        except httpx.HTTPError:
-            log.debug("SSE proxy stream ended for %s", target)
+        except REQUEST_FAILURES:
+            log.debug("SSE proxy stream ended for %r", target)
 
     return StreamingResponse(
         raw_stream(),
@@ -3910,95 +3970,55 @@ def _require_admin_coordinator(
 async def _resolve_coordinator_or_404(
     request: Request,
     coord_mgr: Any,
-    storage: Any,
     ws_id: str,
-    user_id: str,
 ) -> tuple[Any, JSONResponse | None]:
-    """Resolve a coordinator workstream by id.
+    """Resolve a coordinator workstream by id for the coord-only verbs.
 
-    Returns ``(ws, None)`` on success — ``ws`` is the in-memory
+    Runs :func:`_coordinator_tenant_check`, the gate the shared verbs
+    (history, detail, ...) use, off the event loop, so every coordinator
+    route answers the same id the same way.  Returns ``(None, 404)`` when
+    the gate refuses, else ``(ws, None)``: ``ws`` is the in-memory
     ``Workstream`` when present, ``None`` when the coordinator is
     persisted but not loaded (callers may then fall through to
-    ``storage`` directly or trigger lazy rehydration).  Returns
-    ``(None, 404)`` on missing row / wrong kind / storage unavailable.
-
-    Centralises the manager-first, storage-fallback, 404-mask ladder
-    used by the coord-only verbs (``coordinator_children`` /
-    ``coordinator_tasks``).  The shared verbs (history, detail, ...)
-    route through :func:`_coordinator_tenant_check` instead (wired onto
-    ``coord_endpoint_config.tenant_check``).  Turnstone is a trusted-team
-    tool — ``user_id`` is metadata, not an ownership boundary, so this
-    helper does not gate on row ownership; ``admin.coordinator`` upstream
-    gates the surface.  It DOES enforce project tenancy, though: a
-    coordinator attached to a PRIVATE project stays confidential to its
-    members, so a non-member (even an ``admin.coordinator`` holder) is
-    404-masked, same as a missing row.
+    ``storage`` directly or trigger lazy rehydration).
     """
-    del user_id  # retained in signature for caller-site clarity; not consulted here
-    from turnstone.core.auth import WorkstreamProjectVisibility
-
-    miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
-    visibility = WorkstreamProjectVisibility.for_request(request, storage=storage)
-    ws = coord_mgr.get(ws_id) if coord_mgr is not None else None
-    if ws is None:
-        if storage is None:
-            return None, miss
-        try:
-            # Cold-cache path (every console restart, eviction, console
-            # proxy hop) — offload the sync DB call so the coord
-            # children/tasks handlers don't block the event loop on the
-            # same DB the rest of the handler is unblocking.
-            row = await asyncio.to_thread(storage.get_workstream, ws_id)
-        except Exception:
-            log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
-            return None, miss
-        if (
-            row is None
-            or row.get("state") == "creating"
-            or row.get("kind") != WorkstreamKind.COORDINATOR
-        ):
-            return None, miss
-        # Project tenancy — the predicate may resolve a project row +
-        # membership, so judge it off the event loop.
-        if not await asyncio.to_thread(
-            visibility.ws_visible, row.get("project_id") or "", row.get("user_id") or ""
-        ):
-            return None, miss
-        return None, None
-    if not await asyncio.to_thread(
-        visibility.ws_visible, getattr(ws, "project_id", "") or "", ws.user_id or ""
-    ):
-        return None, miss
-    return ws, None
+    err404 = await asyncio.to_thread(_coordinator_tenant_check, request, ws_id, coord_mgr)
+    if err404 is not None:
+        return None, err404
+    return (coord_mgr.get(ws_id) if coord_mgr is not None else None), None
 
 
 def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONResponse | None:
-    """Project-tenancy gate for the lifted coordinator verbs.
+    """The coordinator gate: project tenancy for every coordinator route.
 
     Wired onto ``coord_endpoint_config.tenant_check`` (invoked SYNC in a
     thread) so history / export / detail / set_title / send / approve / …
-    all enforce it.  ``admin.coordinator`` gates the coordinator surface
-    cluster-wide, so row OWNERSHIP is not enforced (any operator may drive
-    any coordinator) — but a coordinator attached to a PRIVATE project stays
-    confidential to its members.
+    all enforce it, and :func:`_resolve_coordinator_or_404` runs it for the
+    coord-only verbs.  Turnstone is a trusted-team tool: ``admin.coordinator``
+    gates the coordinator surface cluster-wide, so row OWNERSHIP is not
+    enforced (any operator may drive any coordinator) — but a coordinator
+    attached to a PRIVATE project stays confidential to its members, so a
+    non-member (even an ``admin.coordinator`` holder) is 404-masked, same as
+    a missing row.
 
-    Sync mirror of :func:`_resolve_coordinator_or_404`'s manager-first,
-    storage-fallback, coordinator-kind ladder (the in-memory manager is the
-    existence/kind authority; a storage row covers saved/closed
-    coordinators) plus the project-visibility gate.  Everything that fails —
-    unknown id, wrong kind, or a private project the caller can't see —
-    404-masks identically, so the surface is neither an existence nor a
-    private-project oracle.  Reusing the manager-first + kind ladder also
+    The ladder is manager-first, storage-fallback, coordinator-kind (the
+    in-memory manager is the existence/kind authority; a storage row covers
+    saved/closed coordinators) plus the project-visibility gate.  Everything
+    that fails — unknown id, wrong kind, a private project the caller can't
+    see, or a read that fails — 404-masks identically, so the surface is
+    neither an existence nor a private-project oracle, during an outage too:
+    an unloaded coordinator's failed row read denies just as a loaded one's
+    failed project read does.  Reusing the manager-first + kind ladder also
     preserves the coord kind-isolation that :func:`make_set_title_handler`
     previously got from the ``tenant_check is None`` manager-lookup guard.
     """
     from turnstone.core.auth import WorkstreamProjectVisibility
 
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
-    # Use the request's configured storage (like cluster_ws_detail /
-    # _resolve_coordinator_or_404) — NOT the global registry, which can
-    # resolve a different/auto-init'd backend and evaluate the tenancy
-    # decision against the wrong DB (fail-open on a missing project row).
+    # Use the request's configured storage (like cluster_ws_detail) — NOT
+    # the global registry, which can resolve a different/auto-init'd
+    # backend and evaluate the tenancy decision against the wrong DB
+    # (fail-open on a missing project row).
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
         return miss
@@ -4008,7 +4028,11 @@ def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONRes
         project_id = getattr(ws, "project_id", "") or ""
         owner = ws.user_id or ""
     else:
-        row = storage.get_workstream(ws_id)
+        try:
+            row = storage.get_workstream(ws_id)
+        except Exception:
+            log.warning("coordinator_tenant_check.storage_failed ws=%s", ws_id[:8], exc_info=True)
+            return miss
         if (
             row is None
             or row.get("state") == "creating"
@@ -4475,8 +4499,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
@@ -4583,6 +4606,8 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
 
     Ownership / authz: same gate as :func:`make_detail_handler` —
     404-mask rows the caller doesn't own (no existence-oracle leak).
+    A read that fails answers 503 rather than zeros, which would read
+    as a healthy, idle coordinator.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -4599,8 +4624,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
@@ -4621,34 +4645,21 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
             parent_ws_id=ws_id,
             user_id=None,
         )
-    except Exception:
-        log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
-        state_counts = {}
-    spawns_total = sum(state_counts.values())
-    try:
         spawns_last_hour = await asyncio.to_thread(
             storage.count_workstreams_since,
             hour_ago_iso,
             parent_ws_id=ws_id,
             user_id=None,
         )
-    except Exception:
-        log.debug(
-            "coordinator_metrics.spawns_last_hour_failed ws=%s",
-            ws_id[:8],
-            exc_info=True,
-        )
-        spawns_last_hour = 0
-
-    # Intent verdicts — scoped to the coordinator itself (child verdicts
-    # would require iterating every child's verdicts; deferred).  Small
-    # cap (last 200) keeps this a cheap query; enough to compute a
-    # meaningful rate for a busy coordinator.
-    try:
+        # Intent verdicts — scoped to the coordinator itself (child
+        # verdicts would require iterating every child's verdicts;
+        # deferred).  Small cap (last 200) keeps this a cheap query;
+        # enough to compute a meaningful rate for a busy coordinator.
         verdicts = await asyncio.to_thread(storage.list_intent_verdicts, ws_id=ws_id, limit=200)
     except Exception:
-        log.debug("coordinator_metrics.list_verdicts_failed ws=%s", ws_id[:8], exc_info=True)
-        verdicts = []
+        log.warning("coordinator_metrics.read_failed ws=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "coordinator metrics could not be read"}, status_code=503)
+    spawns_total = sum(state_counts.values())
     total_verdicts = len(verdicts)
     fallback_count = 0
     for v in verdicts:
@@ -4785,7 +4796,7 @@ async def _resolve_coord_session(
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
     user_id = _auth_user_id(request)
-    ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
     if ws is None or ws.session is None:
@@ -4957,10 +4968,41 @@ async def _cascade_cancel_to_children(
     if _require_admin_coordinator(request, allow_service_bypass=False) is not None:
         log.debug("coordinator.cancel_cascade.skipped_unauthorized ws=%s", ws_id[:8])
         return None
+    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
+
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None:
         return None
-    child_ids = list(coord_adapter.children_snapshot(ws_id))
+    try:
+        child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
+    except ChildrenUnreadableError:
+        # The coordinator's own cancel already happened. Its children can't
+        # be reached without their ids, so record that instead of skipping
+        # them quietly.
+        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
+        audit_storage, _audit_err = require_storage_or_503(request)
+        if audit_storage is None:
+            return None
+        audit_user_id = _auth_user_id(request)
+        audit_host = request.client.host if request.client else ""
+
+        async def _record_unreadable() -> None:
+            await _emit_coord_audit(
+                audit_storage,
+                audit_user_id,
+                "coordinator.cancel_cascaded",
+                ws_id,
+                {
+                    "src": "coordinator",
+                    "error": "the coordinator's children could not be read",
+                    "cancelled": [],
+                    "failed": [],
+                    "skipped": [],
+                },
+                audit_host,
+            )
+
+        return BackgroundTask(_record_unreadable)
     if not child_ids:
         return None
     session = getattr(ws, "session", None)
@@ -5040,7 +5082,22 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
+    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
+
+    child_ids: list[str] = []
+    if coord_adapter is not None:
+        try:
+            child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
+        except ChildrenUnreadableError:
+            return JSONResponse(
+                {
+                    "error": (
+                        "the coordinator's children could not be read, so none was "
+                        "closed; retry after storage recovers"
+                    )
+                },
+                status_code=503,
+            )
 
     coord_client: Any = getattr(session, "_coord_client", None)
     closed, failed, skipped = await _fanout_on_children(
@@ -5081,9 +5138,11 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     ``tasks(action="list")`` tool returns (less the list-tool's
     client-side 200-row slice; the UI handles its own pagination).
 
-    Corrupt envelopes return an empty list for UI resilience.  The
-    ``tasks`` tool remains the authoritative write path and surfaces
-    corruption errors to the model on mutation attempts.
+    Corrupt envelopes return an empty list for UI resilience.  A failed
+    storage read answers 503 instead, so the pane keeps the list it last
+    rendered rather than showing an empty one.  The ``tasks`` tool
+    remains the authoritative write path; it surfaces corruption errors
+    to the model on mutation attempts and a failed read on every action.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -5100,12 +5159,15 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not _VALID_WS_ID_RE.match(ws_id):
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
-    user_id = _auth_user_id(request)
-    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
     if err404 is not None:
         return err404
 
-    envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    try:
+        envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    except Exception:
+        log.warning("coordinator.tasks_read_failed ws_id=%s", ws_id[:8], exc_info=True)
+        return JSONResponse({"error": "task list could not be read"}, status_code=503)
     envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
 
@@ -5298,7 +5360,7 @@ async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[
         log.warning("collector_scope_probe.candidate_refused node=%s", nid)
 
 
-async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
+async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncClient) -> None:
     """Probe one upstream node to confirm the collector token's scopes.
 
     The console's :class:`ClusterCollector` authenticates to upstream
@@ -5367,7 +5429,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
             headers=headers,
             timeout=_PROBE_TIMEOUT_SECONDS,
         )
-    except (httpx.HTTPError, TimeoutError) as exc:
+    except (*REQUEST_FAILURES, TimeoutError) as exc:
         log.warning(
             "collector_scope_probe.transient_error node=%s url=%s — %s",
             probe_node,
@@ -5381,7 +5443,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
         # accepted and the handler got as far as the node_id check.
         log.info("collector_scope_probe.ok node=%s url=%s", probe_node, probe_target)
         return
-    body_preview = _bounded_body_preview(resp.text)
+    body_preview = bounded_body_preview(resp.content)
     if 400 <= status < 500:
         # 403 = missing ``service`` scope on the collector token; 401 =
         # JWT rejected outright (secret mismatch / audience drift).
@@ -5389,7 +5451,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
         # fixes it.  Upstream body is attacker-controllable so we
         # delimit it explicitly in the 503 error text; the preview
         # already passed through the control-char scrub in
-        # _bounded_body_preview.
+        # bounded_body_preview.
         app.state.collector_scope_error = (
             f"collector token rejected by {probe_node} ({probe_target}): "
             f"HTTP {status} — upstream_body=<<<{body_preview}>>>. "
@@ -6042,17 +6104,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     _proxy_ssl = _tls_mgr.get_client_ssl_context() if _tls_mgr and _tls_mgr.ca_initialized else None
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
-    app.state.proxy_client = httpx.AsyncClient(
+    app.state.proxy_client = httpx2.AsyncClient(
         timeout=_PROXY_CLIENT_TIMEOUT_S,
-        limits=httpx.Limits(
+        limits=httpx2.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
         ),
         verify=_proxy_verify,
     )
-    app.state.proxy_sse_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-        limits=httpx.Limits(
+    app.state.proxy_sse_client = httpx2.AsyncClient(
+        timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+        limits=httpx2.Limits(
             max_connections=1100, max_keepalive_connections=100, keepalive_expiry=30
         ),
         verify=_proxy_verify,
@@ -6194,24 +6256,24 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             if client_ctx:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
-                app.state.proxy_client = httpx.AsyncClient(
+                app.state.proxy_client = httpx2.AsyncClient(
                     timeout=_PROXY_CLIENT_TIMEOUT_S,
-                    limits=httpx.Limits(
+                    limits=httpx2.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
                     ),
                     verify=client_ctx,
                 )
-                app.state.proxy_sse_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-                    limits=httpx.Limits(
+                app.state.proxy_sse_client = httpx2.AsyncClient(
+                    timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+                    limits=httpx2.Limits(
                         max_connections=1100,
                         max_keepalive_connections=100,
                         keepalive_expiry=30,
                     ),
                     verify=client_ctx,
                 )
-                # Upgrade collector httpx client for mTLS node polling
+                # Upgrade collector httpx2 client for mTLS node polling
                 app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
@@ -6472,9 +6534,15 @@ async def admin_create_user(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
+    username = body.get("username", "")
+    display_name = body.get("display_name", "")
     password = body.get("password", "")
+    if not all(isinstance(v, str) for v in (username, display_name, password)):
+        return JSONResponse(
+            {"error": "username, display_name and password must be strings"}, status_code=400
+        )
+    username = username.strip()
+    display_name = display_name.strip()
 
     from turnstone.core.auth import is_valid_username
 
@@ -6633,14 +6701,15 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if storage.get_user(user_id) is None:
         return JSONResponse({"error": "User not found"}, status_code=404)
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     name = body.get("name", "")
     scopes = body.get("scopes", "read,write,approve")
     expires_days = body.get("expires_days")
+    if not isinstance(name, str) or not isinstance(scopes, str):
+        return JSONResponse({"error": "name and scopes must be strings"}, status_code=400)
 
     # Validate scopes — ``service`` is NOT user-assignable (it bypasses
     # private-project tenancy; only ServiceTokenManager / the JWT secret
@@ -6655,9 +6724,18 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if expires_days is not None:
         from datetime import UTC, datetime, timedelta
 
-        expires = (datetime.now(UTC) + timedelta(days=int(expires_days))).strftime(
-            "%Y-%m-%dT%H:%M:%S"
+        # Not bool, which is an int: false made a token that had already expired.
+        bad_days = JSONResponse(
+            {"error": "expires_days must be a whole number of days, at least 1"}, status_code=400
         )
+        if isinstance(expires_days, bool) or not isinstance(expires_days, int) or expires_days < 1:
+            return bad_days
+        try:
+            expires = (datetime.now(UTC) + timedelta(days=expires_days)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        except OverflowError:
+            return bad_days
 
     raw = generate_token()
     tid = uuid.uuid4().hex
@@ -7059,7 +7137,7 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     raw_nt = task.get("notify_targets", "[]")
     try:
         task["notify_targets"] = _json.loads(raw_nt) if isinstance(raw_nt, str) else raw_nt
-    except (_json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         task["notify_targets"] = []
     return task
 
@@ -7622,7 +7700,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
         return err
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -7663,7 +7741,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
 _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
 
 # Max concurrent outbound requests when fanning out to cluster nodes.
-# Must stay below the httpx pool limit (set in _lifespan) to leave
+# Must stay below the httpx2 pool limit (set in _lifespan) to leave
 # headroom for non-fan-out proxy traffic (UI proxying, SSE streams).
 _NODE_FAN_OUT_LIMIT = 200  # fallback; prefer cluster.node_fan_out_limit from storage
 
@@ -7697,7 +7775,7 @@ async def admin_cancel_watch(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = {"Content-Type": "application/json"}
     headers.update(_proxy_auth_headers(request))
     try:
@@ -7706,13 +7784,13 @@ async def admin_cancel_watch(request: Request) -> Response:
             content=b"{}",
             headers=headers,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx.HTTPError:
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    except REQUEST_FAILURES as exc:
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8325,7 +8403,7 @@ async def admin_update_org(request: Request) -> JSONResponse:
         settings_str = str(body["settings"]).strip()
         try:
             json.loads(settings_str)
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "settings must be valid JSON"}, status_code=400)
         updates["settings"] = settings_str
 
@@ -8580,7 +8658,7 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     if candidate.startswith("["):
         try:
             parsed = _json.loads(candidate)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return "[]"
         if not isinstance(parsed, list):
             return "[]"
@@ -8621,7 +8699,7 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
     import json as _json
 
     tags: list[str] = []
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, RecursionError):
         tags = _json.loads(r.get("tags", "[]"))
     return {
         "template_id": r.get("template_id", ""),
@@ -8751,7 +8829,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     variables = str(body.get("variables", "[]")).strip()
     try:
         _json.loads(variables)
-    except (_json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
@@ -8766,7 +8844,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         tags_str = str(raw_tags).strip()
         try:
             _json.loads(tags_str)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             tags_str = "[]"
 
     # SKILL.md spec ``paths:`` — glob patterns gating autoload.
@@ -8915,7 +8993,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         var_str = str(body["variables"]).strip()
         try:
             _json.loads(var_str)
-        except (_json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
     if "author" in body:
@@ -8934,7 +9012,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             tag_str = str(raw_tags).strip()
             try:
                 _json.loads(tag_str)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 tag_str = "[]"
             updates["tags"] = tag_str
     if "paths" in body and body["paths"] is not None:
@@ -10308,7 +10386,7 @@ async def _publish_config_change(request: Request) -> None:
     collector = getattr(request.app.state, "collector", None)
     if not collector:
         return
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -10998,7 +11076,7 @@ def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
     """Why *headers* cannot go out on an MCP server's requests, or None when they can.
 
     Names must be HTTP tokens and values printable ASCII with no space or tab at either end:
-    httpx refuses to send anything else, so the server could never connect, and its error would
+    httpx2 refuses to send anything else, so the server could never connect, and its error would
     quote the value. Shared like :func:`_mcp_url_error`. The message names a valid header, never
     its value, and never an invalid name, which can be a pasted ``Name: value`` line.
     """
@@ -11021,7 +11099,7 @@ def _json_object(raw: Any) -> dict[str, Any]:
         return raw
     try:
         value = json.loads(raw or "{}")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -11426,7 +11504,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             env_dict = {}
         # A stored value that is not an object (hand-edited rows) shows as empty.
         s["env"] = json.dumps({k: "***" for k in env_dict} if isinstance(env_dict, dict) else {})
@@ -11435,7 +11513,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
 
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             hdr_dict = {}
         # A secret:// reference is not itself a secret; it stays visible. A
         # stored value that is not an object (hand-edited rows) shows as empty.
@@ -11618,7 +11696,7 @@ async def _collect_mcp_status(
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12489,7 +12567,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12505,7 +12583,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # A non-2xx reply is a failed reload, not a reached node (httpx2
                 # does not raise on status); surface it as an error so _run warns.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -12669,7 +12747,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
     safe_name = urllib.parse.quote(name, safe="")
@@ -12686,7 +12764,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed action, not a reached node (httpx
+                # A non-2xx reply is a failed action, not a reached node (httpx2
                 # does not raise on status); surface it as an error to the operator.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -13304,7 +13382,9 @@ _SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characte
 
 
 def _canonical_capabilities(raw: Any) -> str | None:
-    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+    """Canonical form of a ``capabilities`` blob.
+
+    Return ``None`` when parsing or canonicalization fails.
 
     Canonicalized through ``canonical_caps_value`` — the ONE normalization
     this column's two comparators share, so this guard and the calibrate
@@ -13315,9 +13395,9 @@ def _canonical_capabilities(raw: Any) -> str | None:
     """
     try:
         parsed = json.loads(str(raw or "") or "{}")
-    except ValueError:
+        return canonical_caps_value(parsed)
+    except (ValueError, RecursionError):
         return None
-    return canonical_caps_value(parsed)
 
 
 def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
@@ -13328,9 +13408,9 @@ def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
     test_reserialized_capabilities_do_not_defeat_pure_disable and
     test_capabilities_value_change_still_gates_dynamic_row.
 
-    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
-    exception is the update twin's pure-disable derivation, which treats it
-    as not-blocking (see :func:`_derive_auth_gate`).
+    A stored blob that cannot be parsed or canonicalized compares as CHANGED (fail closed).
+    The ONE exception is the update twin's pure-disable derivation, which treats it as
+    not-blocking (see :func:`_derive_auth_gate`).
     """
     stored_canonical = _canonical_capabilities(stored)
     return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)
@@ -13765,7 +13845,7 @@ def _stored_workspace_id(row: dict[str, Any], provider: str) -> str:
         return ""
     try:
         caps = json.loads(row.get("capabilities") or "{}")
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return ""
     sc = caps.get("server_compat") if isinstance(caps, dict) else None
     raw = sc.get("anthropic_workspace_id") if isinstance(sc, dict) else None
@@ -13800,7 +13880,7 @@ async def _collect_model_status(
     """Query all nodes for model status. Returns {node_id: {alias: info}}."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -14071,7 +14151,7 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read model definitions from DB and rebuild registry."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -14160,7 +14240,7 @@ def _row_serves_chat(row: dict[str, Any]) -> bool:
     raw = row.get("capabilities") or "{}"
     try:
         caps = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         caps = {}
     return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
 
@@ -14894,7 +14974,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         # impossible to re-save, so the switch is refused until it is cleared.
         try:
             stored_caps = json.loads(existing.get("capabilities") or "{}")
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             stored_caps = {}
         err_msg = _validate_anthropic_workspace_id(stored_caps, str(updates["provider"]))
         if err_msg:
@@ -16367,6 +16447,41 @@ async def admin_delete_judge_setting(request: Request) -> JSONResponse:
 # -- Heuristic rules -------------------------------------------------------
 
 
+def _reload_judge_rules(request: Request) -> str | None:
+    """Reload local rules, reporting invalid configuration without dropping the cache."""
+    from turnstone.core.rule_registry import InvalidRuleConfigError, RuleRegistry
+
+    registry = getattr(request.app.state, "rule_registry", None)
+    try:
+        if registry is not None:
+            registry.reload()
+        else:
+            config_store = getattr(request.app.state, "config_store", None)
+            if config_store is not None:
+                request.app.state.rule_registry = RuleRegistry(storage=config_store.storage)
+    except InvalidRuleConfigError as exc:
+        log.warning("Failed to reload rule configuration: %s", exc)
+        return str(exc)
+    return None
+
+
+async def _judge_write_response(
+    request: Request, payload: dict[str, Any], *, status_code: int = 200
+) -> JSONResponse:
+    """Acknowledge a persisted edit even when other corrupt rules prevent its reload."""
+    error = _reload_judge_rules(request)
+    await _publish_config_change(request)
+    if error:
+        payload = {
+            **payload,
+            "warning": (
+                f"Change saved, but rule configuration could not be loaded: {error}. "
+                "Repair the rule before starting new sessions."
+            ),
+        }
+    return JSONResponse(payload, status_code=status_code)
+
+
 async def admin_list_heuristic_rules(request: Request) -> JSONResponse:
     """GET /v1/api/admin/judge/heuristic-rules — list merged heuristic rules."""
     from turnstone.core.auth import require_permission
@@ -16498,12 +16613,14 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
     if isinstance(arg_patterns, str):
         try:
             arg_patterns = _json.loads(arg_patterns)
-        except _json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
     if not isinstance(arg_patterns, list):
         return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
     for i, pat in enumerate(arg_patterns):
-        err_msg = _validate_regex_pattern(str(pat))
+        if not isinstance(pat, str):
+            return JSONResponse({"error": f"arg_patterns[{i}] must be a string"}, status_code=400)
+        err_msg = _validate_regex_pattern(pat)
         if err_msg:
             return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
 
@@ -16536,13 +16653,9 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
         storage, audit_uid, "heuristic_rule.create", "heuristic_rule", rule_id, {"name": name}, ip
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_heuristic_rule(rule_id) or {}, status_code=201
+    )
 
 
 async def admin_get_heuristic_rule(request: Request) -> JSONResponse:
@@ -16641,12 +16754,16 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         if isinstance(ap, str):
             try:
                 ap = _json.loads(ap)
-            except _json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
         if not isinstance(ap, list):
             return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
         for i, pat in enumerate(ap):
-            err_msg = _validate_regex_pattern(str(pat))
+            if not isinstance(pat, str):
+                return JSONResponse(
+                    {"error": f"arg_patterns[{i}] must be a string"}, status_code=400
+                )
+            err_msg = _validate_regex_pattern(pat)
             if err_msg:
                 return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
         fields["arg_patterns"] = _json.dumps(ap)
@@ -16679,12 +16796,7 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {})
+    return await _judge_write_response(request, storage.get_heuristic_rule(rule_id) or {})
 
 
 async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
@@ -16718,12 +16830,7 @@ async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "rule_id": rule_id})
+    return await _judge_write_response(request, {"status": "ok", "rule_id": rule_id})
 
 
 # -- Output guard patterns --------------------------------------------------
@@ -16920,13 +17027,9 @@ async def admin_create_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_output_guard_pattern(pattern_id) or {}, status_code=201
+    )
 
 
 async def admin_get_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17077,12 +17180,7 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {})
+    return await _judge_write_response(request, storage.get_output_guard_pattern(pattern_id) or {})
 
 
 async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17116,12 +17214,7 @@ async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "pattern_id": pattern_id})
+    return await _judge_write_response(request, {"status": "ok", "pattern_id": pattern_id})
 
 
 # -- Judge utility endpoints ------------------------------------------------
@@ -17135,9 +17228,9 @@ async def admin_judge_reload(request: Request) -> JSONResponse:
     if err:
         return err
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
+    error = _reload_judge_rules(request)
+    if error:
+        return JSONResponse({"error": error}, status_code=409)
 
     await _publish_config_change(request)
     return JSONResponse({"status": "ok"})
@@ -17193,7 +17286,7 @@ async def admin_get_all_node_metadata(request: Request) -> JSONResponse:
         for r in rows:
             try:
                 val = _anm_json.loads(r["value"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 val = r["value"]
             entries.append({"key": r["key"], "value": val, "source": r["source"]})
         result[nid] = entries
@@ -17222,7 +17315,7 @@ async def admin_get_node_metadata(request: Request) -> JSONResponse:
     for r in rows:
         try:
             val = _nm_json.loads(r["value"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             val = r["value"]
         metadata.append({"key": r["key"], "value": val, "source": r["source"]})
     return JSONResponse({"node_id": node_id, "metadata": metadata})

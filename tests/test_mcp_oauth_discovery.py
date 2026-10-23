@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+import urllib.parse
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._oauth_runtime_helpers import make_oauth_context
@@ -33,6 +34,9 @@ from turnstone.core.mcp_oauth import (
 )
 from turnstone.core.oauth.http import ASMetadata
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -43,8 +47,8 @@ def _mk_response(
     json_body: Any = None,
     headers: dict[str, str] | None = None,
 ) -> MagicMock:
-    """Build a MagicMock that quacks like ``httpx.Response``."""
-    resp = MagicMock(spec=httpx.Response)
+    """Build a MagicMock that quacks like ``httpx2.Response``."""
+    resp = MagicMock(spec=httpx2.Response)
     resp.status_code = status_code
     resp.headers = headers or {}
     resp.content = (str(json_body) if json_body is not None else "").encode("utf-8")
@@ -120,7 +124,7 @@ def _discover(
     cached_issuer: str | None = None,
 ) -> tuple[ASMetadata, MagicMock]:
     """Run discovery with a mocked client whose ``get`` is *get*; return (metadata, client)."""
-    client = MagicMock(spec=httpx.AsyncClient)
+    client = MagicMock(spec=httpx2.AsyncClient)
     client.get = AsyncMock(side_effect=get)
     storage = _mk_storage_mock()
 
@@ -148,7 +152,7 @@ def _discover_error(
     override_url: str | None = None,
 ) -> MagicMock:
     """Run discovery expecting ``MCPOAuthDiscoveryError`` matching *match*; return the client."""
-    client = MagicMock(spec=httpx.AsyncClient)
+    client = MagicMock(spec=httpx2.AsyncClient)
     client.get = AsyncMock(side_effect=get)
     storage = _mk_storage_mock()
 
@@ -199,7 +203,7 @@ def _discover_private(
     addr: str = "192.168.1.50",
 ) -> tuple[ASMetadata, MagicMock]:
     """Run discovery against private-resolving hosts; return (metadata, client)."""
-    client = MagicMock(spec=httpx.AsyncClient)
+    client = MagicMock(spec=httpx2.AsyncClient)
     client.get = AsyncMock(side_effect=get)
     storage = _mk_storage_mock()
 
@@ -270,7 +274,7 @@ class TestParsePRMUrl:
 
 class TestDiscoveryOverride:
     def test_override_url_skips_prm(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         storage = _mk_storage_mock()
 
@@ -310,7 +314,7 @@ class TestDiscoveryPRM:
                 return _mk_response(200, _good_as_metadata_doc())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -362,7 +366,7 @@ class TestDiscoveryPRM:
                 return _mk_response(200, path_issuer_as_doc)
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -406,7 +410,7 @@ class TestDiscoveryPRM:
                 return _mk_response(200, _good_as_metadata_doc())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -605,7 +609,7 @@ class TestDiscoveryPRM:
 
         async def _get(url: str, *args: Any, **kwargs: Any) -> Any:
             if url == _PATH_PRM:
-                raise httpx.ConnectError("refused")
+                raise httpx2.ConnectError("refused")
             return await routes(url, *args, **kwargs)
 
         meta, client = _discover(_SERVER, _get)
@@ -614,7 +618,7 @@ class TestDiscoveryPRM:
 
     def test_transport_error_on_every_candidate_reports_the_first(self) -> None:
         async def _get(url: str, *args: Any, **kwargs: Any) -> Any:
-            raise httpx.ConnectError("refused")
+            raise httpx2.ConnectError("refused")
 
         client = _discover_error(_SERVER, _get, "PRM fetch failed")
         assert _urls(client) == [_PATH_PRM, _ROOT_PRM]
@@ -786,7 +790,7 @@ class TestDiscoveryPRM:
                 return _mk_response(200, _good_as_metadata_doc())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -810,7 +814,7 @@ class TestDiscoveryPRM:
         async def _get(url, *args, **kwargs):
             return _mk_response(401, headers={"www-authenticate": "Basic realm=x"})
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -841,7 +845,7 @@ class TestASMetadataValidation:
         doc = _good_as_metadata_doc()
         doc["code_challenge_methods_supported"] = ["plain"]
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -865,7 +869,7 @@ class TestASMetadataValidation:
         doc = _good_as_metadata_doc()
         del doc["token_endpoint"]
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -889,7 +893,7 @@ class TestASMetadataValidation:
         doc = _good_as_metadata_doc()
         doc["token_endpoint"] = "https://attacker.example.com/token"
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -910,7 +914,7 @@ class TestASMetadataValidation:
             asyncio.run(_run())
 
     def test_ssrf_on_override_rejected(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -964,7 +968,7 @@ class TestS256PerDocumentAndOIDCFallback:
                 return _mk_response(200, self._doc_without_code_challenge())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -994,7 +998,7 @@ class TestS256PerDocumentAndOIDCFallback:
                 return _mk_response(200, self._doc_without_code_challenge())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -1032,7 +1036,7 @@ class TestS256PerDocumentAndOIDCFallback:
                 return _mk_response(200, oidc_doc)
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -1066,7 +1070,7 @@ class TestS256PerDocumentAndOIDCFallback:
 
 class TestMetadataCache:
     def test_cache_miss_then_hit(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         storage = _mk_storage_mock()
         cache: dict[str, tuple[ASMetadata, float]] = {}
@@ -1107,7 +1111,7 @@ class TestMetadataCache:
         storage.update_mcp_server.assert_not_called()
 
     def test_cache_expiry_refetches(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         storage = _mk_storage_mock()
         # Pre-populate cache with a very stale entry.
@@ -1148,7 +1152,7 @@ class TestMetadataCache:
     def test_failed_metadata_fetch_does_not_persist_issuer(self, cached_issuer: str | None) -> None:
         doc = _good_as_metadata_doc()
         doc["code_challenge_methods_supported"] = []
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(
             side_effect=_router(
                 {
@@ -1195,7 +1199,7 @@ class TestMetadataCache:
                 )
             return _mk_response(200, _good_as_metadata_doc())
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -1219,7 +1223,7 @@ class TestMetadataCache:
         )
 
     def test_persistent_cache_skip_when_already_cached(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, _good_as_metadata_doc()))
         storage = _mk_storage_mock()
 
@@ -1267,7 +1271,7 @@ class TestCachedIssuerSSRFRevalidation:
                 return _mk_response(200, _good_as_metadata_doc())
             raise AssertionError(f"unexpected URL: {url}")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(side_effect=_get)
         storage = _mk_storage_mock()
 
@@ -1317,7 +1321,7 @@ class TestASMetadataRevocationEndpoint:
         doc = _good_as_metadata_doc()
         doc["revocation_endpoint"] = "https://as.example.com/revoke"
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -1341,7 +1345,7 @@ class TestASMetadataRevocationEndpoint:
         doc = _good_as_metadata_doc()
         doc.pop("revocation_endpoint", None)
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -1365,7 +1369,7 @@ class TestASMetadataRevocationEndpoint:
         doc = _good_as_metadata_doc()
         doc["revocation_endpoint"] = "https://attacker.example.com/revoke"
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(return_value=_mk_response(200, doc))
         storage = _mk_storage_mock()
 
@@ -1582,7 +1586,7 @@ class TestASMetadataCandidates:
 
         async def _get(url: str, *args: Any, **kwargs: Any) -> Any:
             if url == self._CANDIDATES[0]:
-                raise httpx.ReadTimeout("stalled")
+                raise httpx2.ReadTimeout("stalled")
             return await routes(url, *args, **kwargs)
 
         meta, client = _discover(_SERVER, _get, override_url=self._ISSUER)
@@ -1614,14 +1618,14 @@ class TestASMetadataCandidates:
         assert timeouts == [10.0, 4.0]
 
     def test_outer_timeout_bounds_work_outside_the_request_timeouts(self) -> None:
-        # httpx timeouts bound per-phase inactivity, and DNS, SSRF and
+        # httpx2 timeouts bound per-phase inactivity, and DNS, SSRF and
         # endpoint validation run outside them entirely, so the budget is
         # enforced by an outer deadline over the whole resolution.
         async def _slow_validate(url: str, **kwargs: Any) -> Any:
             await asyncio.sleep(0.05)
             raise AssertionError("should have been cancelled by the outer deadline")
 
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -1849,7 +1853,7 @@ class TestPrivateNetworkOptIn:
         return doc
 
     def test_setting_off_refuses_the_typed_server_with_a_hint(self) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -1876,7 +1880,7 @@ class TestPrivateNetworkOptIn:
     def test_non_destination_address_never_reaches_http(
         self, address: str, allow_private_network: bool
     ) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
 
         async def _run() -> None:
@@ -1909,7 +1913,7 @@ class TestPrivateNetworkOptIn:
 
     def _private_server_public_issuer(self, *, allow_private_network: bool):
         """Private MCP server, public issuer — the feature's headline lane."""
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(
             side_effect=_router(
                 {
@@ -1955,7 +1959,7 @@ class TestPrivateNetworkOptIn:
     def test_mixed_public_and_private_records_are_refused(self) -> None:
         # The name answers with both, so the request may land on either and
         # the opt-in would not describe where it goes.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -1982,7 +1986,7 @@ class TestPrivateNetworkOptIn:
         # typed adds no reach, so refusing it would strand an internal
         # server that points at its own alternate metadata location.
         challenge_target = "https://mcp.example.com/custom/prm"
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(
             side_effect=_router(
                 {
@@ -2016,7 +2020,7 @@ class TestPrivateNetworkOptIn:
         # The load-bearing boundary: the resource server is private and
         # typed by the operator, but the issuer it names is not, so it is
         # validated strictly even with the setting on.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(
             side_effect=_router(
                 {
@@ -2049,7 +2053,7 @@ class TestPrivateNetworkOptIn:
     def test_challenge_url_never_inherits_the_opt_in(self) -> None:
         # Same rule one layer down: the challenge target is named by the
         # server, so it is validated strictly and the loop moves on.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock(
             side_effect=_router(
                 {
@@ -2082,7 +2086,7 @@ class TestPrivateNetworkOptIn:
 
     @pytest.mark.parametrize("addr", ["169.254.169.254", "224.0.0.1", "0.0.0.0"])
     def test_always_refused_lanes_stay_refused_under_the_opt_in(self, addr: str) -> None:
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -2191,7 +2195,7 @@ class TestPrivateNetworkOptIn:
         context = make_oauth_context(
             storage=backend,
             token_store=store,
-            http_client=MagicMock(spec=httpx.AsyncClient),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
         )
         state = SimpleNamespace(config_store=config_store, oauth_context=context)
         with patch.object(mcp_oauth, "discover_authorization_server", discover):
@@ -2252,7 +2256,7 @@ class TestPrivateNetworkOptIn:
         # A metadata address is refused absolutely; reporting it as a mixed
         # private answer would offer a remedy that is already taken and could
         # never apply.
-        client = MagicMock(spec=httpx.AsyncClient)
+        client = MagicMock(spec=httpx2.AsyncClient)
         client.get = AsyncMock()
         storage = _mk_storage_mock()
 
@@ -2273,3 +2277,266 @@ class TestPrivateNetworkOptIn:
         with pytest.raises(MCPOAuthDiscoveryError, match="refused"):
             asyncio.run(_run())
         client.get.assert_not_called()
+
+
+def _discover_through(
+    respond: Callable[[httpx2.Request], httpx2.Response],
+) -> tuple[ASMetadata, list[str]]:
+    """Run discovery over a real client whose transport answers with *respond*; return the
+    metadata and the URLs that reached the transport."""
+    sent: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.append(str(request.url))
+        return respond(request)
+
+    async def _run() -> ASMetadata:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(handler)) as client:
+            with _public_addr_patch():
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=_SERVER,
+                    override_url=None,
+                    cached_issuer=None,
+                    http_client=client,
+                    storage=_mk_storage_mock(),
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+    return asyncio.run(_run()), sent
+
+
+def _challenge_then_origin(challenge_url: str) -> Callable[[httpx2.Request], httpx2.Response]:
+    """The path PRM location challenges with *challenge_url*; the origin location answers."""
+    challenge = f'Bearer resource_metadata="{challenge_url}"'.encode()
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        url = str(request.url)
+        if url == _PATH_PRM:
+            return httpx2.Response(401, headers=[(b"www-authenticate", challenge)])
+        if url == _ROOT_PRM:
+            return httpx2.Response(
+                200,
+                json={
+                    "resource": "https://mcp.example.com",
+                    "authorization_servers": ["https://as.example.com"],
+                },
+            )
+        if url == _AS_META:
+            return httpx2.Response(200, json=_good_as_metadata_doc())
+        raise AssertionError(f"unexpected request to {url}")
+
+    return respond
+
+
+async def _accept_any_url(url: str, **kwargs: Any) -> urllib.parse.ParseResult:
+    return urllib.parse.urlparse(url)
+
+
+class TestURLsTheClientCannotSend:
+    """httpx2 raises ``InvalidURL``, which is not an ``HTTPError``, for a URL it can't send. The
+    guard refuses such URLs; the requests still map one that gets past it."""
+
+    def test_challenge_url_with_a_tab_is_refused_before_any_request(self) -> None:
+        # The client's get fails any URL its router doesn't know, so the guard has to refuse the
+        # TAB URL: a request that failed for it would fail this test too.
+        tab_url = "https://mcp.example.com/prm" + chr(9) + "x"
+        meta, client = _discover(
+            _SERVER,
+            _router(
+                {
+                    _PATH_PRM: _challenge(tab_url),
+                    _ROOT_PRM: _prm("https://mcp.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            ),
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_challenge_url_with_a_non_ascii_zone_is_refused_before_any_request(self) -> None:
+        zone_url = "https://[fe80::1%" + chr(0xFC) + "]/prm"
+        meta, client = _discover(
+            _SERVER,
+            _router(
+                {
+                    _PATH_PRM: _challenge(zone_url),
+                    _ROOT_PRM: _prm("https://mcp.example.com"),
+                    _AS_META: _mk_response(200, _good_as_metadata_doc()),
+                }
+            ),
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_unused_endpoint_with_a_lone_surrogate_is_a_discovery_error(self) -> None:
+        document = _good_as_metadata_doc()
+        document["revocation_endpoint"] = "https://as.example.com/revoke" + chr(0xD800)
+        _discover_error(
+            _SERVER,
+            _router({_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, document)}),
+            "revocation_endpoint",
+        )
+
+    def test_prm_request_past_the_guard_falls_through_to_the_next_candidate(self) -> None:
+        unsendable = "https://" + chr(0x2603) + ".example.com/prm"
+        with patch(
+            "turnstone.core.oauth.ssrf.validate_url_no_ssrf_async", side_effect=_accept_any_url
+        ):
+            meta, sent = _discover_through(_challenge_then_origin(unsendable))
+        assert meta.issuer == "https://as.example.com"
+        assert sent == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_metadata_request_past_the_guard_is_a_discovery_error(self) -> None:
+        unsendable_issuer = "https://" + chr(0x2603) + ".example.com"
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            if str(request.url) == _PATH_PRM:
+                return httpx2.Response(
+                    200, json={"resource": _SERVER, "authorization_servers": [unsendable_issuer]}
+                )
+            raise AssertionError(f"unexpected request to {request.url}")
+
+        with (
+            patch(
+                "turnstone.core.oauth.ssrf.validate_url_no_ssrf_async",
+                side_effect=_accept_any_url,
+            ),
+            pytest.raises(MCPOAuthDiscoveryError, match="AS metadata fetch failed"),
+        ):
+            _discover_through(respond)
+
+
+class TestTheGuardJudgesTheDialedHost:
+    def test_document_named_issuer_never_reaches_the_address_the_client_would_dial(self) -> None:
+        """A PRM document names an issuer whose IDNA 2003 and IDNA 2008 encodings resolve to a
+        public and a private address. The guard judges the name the client dials, so discovery
+        refuses it and no request reaches that host."""
+        issuer = "https://stra" + chr(0xDF) + "e.example.com"
+        addresses = {"xn--strae-oqa.example.com": "10.0.0.12"}
+
+        def getaddrinfo(host: str | bytes, *args: Any, **kwargs: Any) -> list[Any]:
+            # As CPython does: a str host is encoded with the IDNA 2003 codec for the lookup.
+            name = (host.encode("idna") if isinstance(host, str) else host).decode("ascii")
+            return [(2, 1, 6, "", (addresses.get(name, "93.184.216.34"), 0))]
+
+        sent: list[str] = []
+
+        def respond(request: httpx2.Request) -> httpx2.Response:
+            sent.append(str(request.url))
+            if str(request.url) == _PATH_PRM:
+                return httpx2.Response(
+                    200, json={"resource": _SERVER, "authorization_servers": [issuer]}
+                )
+            return httpx2.Response(404)
+
+        async def _run() -> None:
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as client:
+                with patch("socket.getaddrinfo", side_effect=getaddrinfo):
+                    await discover_authorization_server(
+                        server_name="srv-x",
+                        server_url=_SERVER,
+                        override_url=None,
+                        cached_issuer=None,
+                        http_client=client,
+                        storage=_mk_storage_mock(),
+                        server_id="srv-id",
+                        trusted_hosts=frozenset(),
+                    )
+
+        with pytest.raises(MCPOAuthDiscoveryError, match="on a private network"):
+            asyncio.run(_run())
+        assert sent == [_PATH_PRM, _ROOT_PRM]
+
+
+class TestLocalhostLane:
+    """A URL a remote document names gets the localhost development lane only when the server URL
+    the operator typed is itself a localhost URL, so a remote server can't reach the console's own
+    loopback ports. ``localhost`` resolves to loopback here: under the all-public stub the guard
+    would refuse it anyway, and the router fails any request that gets through."""
+
+    @staticmethod
+    def _discover(
+        server_url: str,
+        routes: dict[str, Any],
+        *,
+        cached_issuer: str | None = None,
+        addresses: dict[str, list[str]] | None = None,
+    ) -> tuple[ASMetadata, MagicMock]:
+        client = MagicMock(spec=httpx2.AsyncClient)
+        client.get = AsyncMock(side_effect=_router(routes))
+
+        async def _run() -> ASMetadata:
+            with _addr_map_patch(addresses or {"localhost": ["127.0.0.1"]}):
+                return await discover_authorization_server(
+                    server_name="srv-x",
+                    server_url=server_url,
+                    override_url=None,
+                    cached_issuer=cached_issuer,
+                    http_client=client,
+                    storage=_mk_storage_mock(),
+                    server_id="srv-id",
+                    trusted_hosts=frozenset(),
+                )
+
+        return asyncio.run(_run()), client
+
+    def test_a_remote_server_cannot_challenge_to_a_localhost_location(self) -> None:
+        meta, client = self._discover(
+            _SERVER,
+            {
+                _PATH_PRM: _challenge("http://localhost:6379/anything"),
+                _ROOT_PRM: _prm("https://mcp.example.com"),
+                _AS_META: _mk_response(200, _good_as_metadata_doc()),
+            },
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _ROOT_PRM, _AS_META]
+
+    def test_a_remote_server_cannot_name_a_localhost_issuer(self) -> None:
+        with pytest.raises(MCPOAuthDiscoveryError, match="PRM issuer URL rejected"):
+            self._discover(
+                _SERVER,
+                {
+                    _PATH_PRM: _prm(_SERVER, issuer="http://localhost:9200"),
+                    _ROOT_PRM: _mk_response(404),
+                },
+            )
+
+    def test_a_cached_localhost_issuer_of_a_remote_server_is_dropped(self) -> None:
+        meta, client = self._discover(
+            _SERVER,
+            {_PATH_PRM: _prm(_SERVER), _AS_META: _mk_response(200, _good_as_metadata_doc())},
+            cached_issuer="http://localhost:9200",
+        )
+        assert meta.issuer == "https://as.example.com"
+        assert _urls(client) == [_PATH_PRM, _AS_META]
+
+    def test_a_local_server_may_name_a_localhost_issuer(self) -> None:
+        """The shape of a local development setup, and of the per-user harness."""
+        server = "http://127.0.0.1:8093/mcp"
+        issuer = "http://127.0.0.1:8092/realms/spike"
+        document = _good_as_metadata_doc()
+        document.update(
+            {
+                "issuer": issuer,
+                "authorization_endpoint": issuer + "/protocol/openid-connect/auth",
+                "token_endpoint": issuer + "/protocol/openid-connect/token",
+                "registration_endpoint": issuer + "/clients-registrations/openid-connect",
+                "jwks_uri": issuer + "/protocol/openid-connect/certs",
+            }
+        )
+        meta, client = self._discover(
+            server,
+            {
+                "http://127.0.0.1:8093/.well-known/oauth-protected-resource/mcp": _prm(
+                    server, issuer=issuer
+                ),
+                "http://127.0.0.1:8092/.well-known/oauth-authorization-server/realms/spike": (
+                    _mk_response(200, document)
+                ),
+            },
+            addresses={"127.0.0.1": ["127.0.0.1"]},
+        )
+        assert meta.token_endpoint == issuer + "/protocol/openid-connect/token"

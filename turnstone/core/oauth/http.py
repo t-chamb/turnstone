@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import httpx
+import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.oauth import ssrf as oauth_ssrf
 from turnstone.core.oauth.work import OAuthUnavailableError
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from turnstone.core.oauth.context import OAuthContext
 
 log = get_logger(__name__)
@@ -24,6 +28,14 @@ _DEFAULT_HTTP_TIMEOUT = 10.0
 # Tighter cap for token-endpoint and DCR responses — these never carry
 # JWKS-style payloads and are bounded in well-formed AS implementations.
 _MAX_TOKEN_BODY_BYTES = 64 * 1024
+
+# The most of a response body, decoded, that an OAuth client keeps (see _BoundedClient). It is at
+# least every request site's own cap, so each site's size check still sees an oversized body.
+_MAX_RESPONSE_BODY_BYTES = max(_MAX_TOKEN_BODY_BYTES, 256 * 1024)
+
+# Headers that describe how a body was sent rather than the body. A response rebuilt from bytes
+# already read and decoded drops them, or the body would be decoded a second time.
+_TRANSFER_HEADERS = frozenset({b"content-encoding", b"content-length", b"transfer-encoding"})
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +87,110 @@ class OAuthRefreshError(OAuthError):
         self.failure_class = failure_class
 
 
-def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClient:
+class _WireLimitedStream(httpx2.AsyncByteStream):
+    """A response's raw body, passed through until more than *limit* bytes have arrived."""
+
+    def __init__(self, inner: httpx2.AsyncByteStream, limit: int, request: httpx2.Request) -> None:
+        self._inner = inner
+        self._limit = limit
+        self._request = request
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        received = 0
+        async for chunk in self._inner:
+            received += len(chunk)
+            if received > self._limit:
+                raise httpx2.DecodingError(
+                    f"response body over {self._limit} bytes on the wire", request=self._request
+                )
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class _BoundedClient(httpx2.AsyncClient):
+    """An ``AsyncClient`` that bounds how much of a response body it reads.
+
+    ``post`` and ``get`` read and decode a whole body before returning it, and a few hundred bytes
+    of brotli from a hostile server decode to gigabytes. This client stops reading once more than
+    ``max_body`` bytes have been decoded (httpx2 decodes in pieces of up to 1 MiB, so at most one
+    piece more is held), once more than twice that has arrived on the wire (a body that decodes to
+    nothing, such as bytes after the end of a gzip stream, never reaches the first limit), and once
+    the request's read timeout has passed while reading the body. The response it returns is
+    rebuilt from at most ``max_body + 1`` decoded bytes: the extra byte lets a request site's own
+    size check see an oversized body as such, so the classification it gives one works unchanged.
+    The rebuilt response keeps the original headers apart from the transfer ones (it carries a
+    ``Content-Length`` for the bytes it holds), and has no history, extensions or elapsed time.
+    Going over the wire limit, or the timeout, fails as ``httpx2.DecodingError`` or
+    ``httpx2.ReadTimeout``, which every request site already maps.
+
+    A streamed request (``stream=True``) comes back unread and unbounded, for its caller to cap.
+    Redirects are refused: every URL an OAuth request reaches has to pass the address check first.
+    """
+
+    def __init__(self, *, max_body: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.max_body = max_body
+
+    async def send(
+        self, request: httpx2.Request, *, stream: bool = False, **kwargs: Any
+    ) -> httpx2.Response:
+        if kwargs.get("follow_redirects") is True:
+            raise ValueError("an OAuth client doesn't follow redirects")
+        response = await super().send(request, stream=True, **kwargs)
+        if stream:
+            return response
+        if isinstance(response.stream, httpx2.AsyncByteStream):
+            response.stream = _WireLimitedStream(response.stream, 2 * self.max_body, request)
+        read_timeout = request.extensions.get("timeout", {}).get("read")
+        body = bytearray()
+        try:
+            async with asyncio.timeout(read_timeout):
+                async with contextlib.aclosing(response.aiter_bytes()) as chunks:
+                    async for chunk in chunks:
+                        body += chunk
+                        if len(body) > self.max_body:
+                            break
+        except TimeoutError as exc:
+            raise httpx2.ReadTimeout(
+                f"response body not read within {read_timeout} s", request=request
+            ) from exc
+        finally:
+            await response.aclose()
+        del body[self.max_body + 1 :]
+        return httpx2.Response(
+            response.status_code,
+            headers=[
+                (name, value)
+                for name, value in response.headers.raw
+                if name.lower() not in _TRANSFER_HEADERS
+            ],
+            content=bytes(body),
+            request=request,
+        )
+
+
+def make_http_client(
+    timeout: float = _DEFAULT_HTTP_TIMEOUT,
+    *,
+    headers: dict[str, str] | None = None,
+    max_body: int | None = None,
+) -> httpx2.AsyncClient:
+    """Return an HTTP client for identity-provider and authorization-server requests.
+
+    Every OAuth and OIDC client is built here, so they share one posture. It keeps httpx2's
+    environment defaults rather than setting ``trust_env=False``: the proxy variables and
+    ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` apply to every such request, since a deployment may reach
+    its identity provider only through an egress proxy. With *max_body*, the client bounds how much
+    of a response body it reads (see :class:`_BoundedClient`).
+    """
+    if max_body is None:
+        return httpx2.AsyncClient(timeout=timeout, headers=headers)
+    return _BoundedClient(max_body=max_body, timeout=timeout, headers=headers)
+
+
+def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx2.AsyncClient:
     """Return the JSON-preferring HTTP client used by OAuth consumers.
 
     Every request here consumes a JSON body: discovery documents, dynamic
@@ -83,18 +198,23 @@ def json_http_client(timeout: float = _DEFAULT_HTTP_TIMEOUT) -> httpx.AsyncClien
     grant legs. Some token endpoints content-negotiate and answer a bare
     ``Accept: */*`` with a form-encoded body the parsers cannot read, so
     the JSON preference is the client default rather than a per-call
-    literal that the next call site would forget. httpx applies a
+    literal that the next call site would forget. httpx2 applies a
     per-request ``headers=`` over this default, so a caller can still
     override it.
+
+    These requests reach servers an MCP server names, so the client bounds how much of a response
+    body it reads, keeping at most :data:`_MAX_RESPONSE_BODY_BYTES` (see :class:`_BoundedClient`).
     """
-    return httpx.AsyncClient(timeout=timeout, headers={"Accept": "application/json"})
+    return make_http_client(
+        timeout, headers={"Accept": "application/json"}, max_body=_MAX_RESPONSE_BODY_BYTES
+    )
 
 
 # Cap on individual standard-field length when echoing AS error text.
 _AS_ERROR_FIELD_MAX = 80
 
 
-def _as_error_code(resp: httpx.Response) -> str | None:
+def _as_error_code(resp: httpx2.Response) -> str | None:
     """Return the RFC 6749 ``error`` code from a token-endpoint JSON error body.
 
     Feeds :func:`_classify_refresh_failure`, which maps the code to a handling
@@ -104,7 +224,7 @@ def _as_error_code(resp: httpx.Response) -> str | None:
     """
     try:
         doc = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if isinstance(doc, dict):
         code = doc.get("error")
@@ -113,7 +233,7 @@ def _as_error_code(resp: httpx.Response) -> str | None:
     return None
 
 
-def _format_as_error(resp: httpx.Response) -> str:
+def _format_as_error(resp: httpx2.Response) -> str:
     """Build a safe, redacted summary of an AS error response.
 
     Pulls only the RFC 6749 standard error fields (``error``,
@@ -131,7 +251,7 @@ def _format_as_error(resp: httpx.Response) -> str:
     parts: list[str] = []
     try:
         doc = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         doc = None
     if isinstance(doc, dict):
         for key in ("error", "error_description", "error_uri"):
@@ -181,7 +301,7 @@ _TRANSIENT_AS_ERRORS = frozenset(
 )
 
 
-def _classify_refresh_failure(resp: httpx.Response) -> RefreshFailureClass:
+def _classify_refresh_failure(resp: httpx2.Response) -> RefreshFailureClass:
     """Classify a non-200 refresh response into a handling class.
 
     Conservative by construction — the only path to a PERMANENT
@@ -208,7 +328,7 @@ async def _hardened_token_post(
     *,
     token_endpoint: str,
     data: dict[str, str],
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     request_label: str,
     endpoint_label: str,
     classify_oversized_by_status: bool = False,
@@ -246,7 +366,7 @@ async def _hardened_token_post(
             data=data,
             timeout=_DEFAULT_HTTP_TIMEOUT,
         )
-    except (httpx.HTTPError, RuntimeError) as exc:
+    except (*REQUEST_FAILURES, RuntimeError) as exc:
         if http_client.is_closed:
             raise OAuthUnavailableError("OAuth HTTP client closed during shutdown") from exc
         if isinstance(exc, RuntimeError):
@@ -275,7 +395,7 @@ async def _hardened_token_post(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise OAuthRefreshError(f"{request_label} body is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict):
         raise OAuthRefreshError(f"{request_label} body is not a JSON object")

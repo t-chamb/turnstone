@@ -9,19 +9,22 @@ calls to these helpers and re-raises ``OIDCError`` so its public API is
 unchanged. The MCP OAuth module catches :class:`OAuthSSRFError` directly.
 
 DNS-rebinding limitation: this module resolves the hostname during
-validation, but the subsequent ``httpx`` call resolves again. A hostname
+validation, but the subsequent ``httpx2`` call resolves again. A hostname
 the operator points at could in principle rebind between the two resolves
 to expose an internal address. Callers must ensure the AS / IdP hostname
 is operator-controlled — the SSRF guard prevents private-IP responses for
 hostnames the operator points at, but does not prevent rebinding by a
-hostile DNS authority. Pinning a single resolution into the ``httpx``
-transport is a future hardening step.
+hostile DNS authority. Pinning a single resolution into the client's
+transport, as the guarded fetch's ``PinnedTransport``
+(:mod:`turnstone.core._web_transport`) does, is a future hardening step.
 """
 
 from __future__ import annotations
 
 import asyncio
 import urllib.parse
+
+import httpx2
 
 from turnstone.core.ip_classify import (
     AddressLane,
@@ -101,6 +104,15 @@ def is_localhost(hostname: str) -> bool:
     return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
 
 
+def url_is_localhost(url: str) -> bool:
+    """Return True if *url*'s host is a localhost form, judged on the name the client dials."""
+    try:
+        hostname = urllib.parse.urlparse(str(httpx2.URL(url))).hostname
+    except (httpx2.InvalidURL, ValueError):
+        return False
+    return is_localhost(hostname or "")
+
+
 def sanitize_log_text(text: str, limit: int = 200) -> str:
     """Escape control characters and truncate untrusted text for log/audit inclusion.
 
@@ -125,12 +137,27 @@ def effective_port(parsed: urllib.parse.ParseResult) -> int | None:
     return {"http": 80, "https": 443}.get(parsed.scheme)
 
 
+def _dialed_host(host: str) -> str:
+    """Return a bare *host* as the client dials it, the form :func:`validate_url_no_ssrf` returns.
+
+    An operator may write a trusted host in Unicode or as its ``xn--`` name; both are the host the
+    client dials. An entry httpx2 can't read as a bare host (one holding a port, say) is compared
+    as written.
+    """
+    try:
+        url = httpx2.URL(scheme="https", host=host, path="/")
+        return urllib.parse.urlparse(str(url)).hostname or ""
+    except (httpx2.InvalidURL, ValueError):
+        return host.lower()
+
+
 def validate_url_no_ssrf(
     url: str,
     *,
     allow_http: bool,
     allow_private: bool = False,
     private_requires_all: bool = False,
+    allow_localhost: bool = True,
 ) -> urllib.parse.ParseResult:
     """Run the scheme/userinfo/SSRF checks shared by issuer and discovered URLs.
 
@@ -168,16 +195,43 @@ def validate_url_no_ssrf(
     evidence, and accepting it would put an OIDC token exchange —
     ``client_secret`` and authorization code included — on the wire in the
     clear.
+
+    ``allow_localhost=False`` withholds that localhost development lane (``http://`` on a
+    localhost name, and its loopback addresses) from a URL a remote document named. Such a URL is
+    then judged like any other: https only, and a loopback address refused as non-public unless
+    the private-network opt-in applies.
+
+    A URL the client cannot send is refused before anything else, so a document naming one fails
+    here as a refused endpoint: one holding an ASCII control character, or one httpx2 cannot parse
+    or encode (a host that is not valid IDNA 2008, or a lone surrogate, for example). urllib drops
+    TAB, CR and LF and keeps the other control characters, so the checks below would otherwise
+    judge a different URL from the one sent.
+
+    Every check, and the result returned, reads the URL as httpx2 normalizes it, which is the URL
+    the client sends. Its host is the IDNA 2008 ASCII name the client dials: urllib keeps a Unicode
+    name, which the resolver encodes with IDNA 2003, and the two can name different hosts
+    ("straße" is "strasse" to one and "xn--strae-oqa" to the other), so the addresses checked
+    would not be the ones the client reaches. Callers comparing hosts (same-origin, the localhost
+    lane) compare those dialed names too.
     """
+    if any(ch.isascii() and not ch.isprintable() for ch in url):
+        raise OAuthSSRFError(
+            f"endpoint URL must not contain control characters: {sanitize_log_text(url)}"
+        )
     try:
-        parsed = urllib.parse.urlparse(url)
+        parsed = urllib.parse.urlparse(str(httpx2.URL(url)))
         hostname = parsed.hostname
         _ = parsed.port  # parsed lazily; raises for an out-of-range value
-    except ValueError as exc:
-        # Callers catch OAuthSSRFError only, and the URL can come from a
-        # hostile MCP server's discovery document — a bare ValueError here
-        # would escape discovery instead of becoming a clean refusal.
-        raise OAuthSSRFError(f"endpoint URL is malformed: {url}") from exc
+        # The client sends the host as ASCII. httpx2 keeps a non-ASCII IPv6 zone id in it, which
+        # fails here as it would when the request is built.
+        (hostname or "").encode("ascii")
+    except (httpx2.InvalidURL, ValueError) as exc:
+        # A lone surrogate raises UnicodeError, a ValueError too. Callers catch OAuthSSRFError
+        # only, and the URL can come from a hostile MCP server's document: anything else here would
+        # escape discovery instead of becoming a clean refusal.
+        raise OAuthSSRFError(
+            f"endpoint URL is malformed ({exc}): {sanitize_log_text(url)}"
+        ) from exc
 
     if not hostname:
         raise OAuthSSRFError(f"endpoint URL has no hostname: {url}")
@@ -193,7 +247,7 @@ def validate_url_no_ssrf(
     # clear to whatever address that name happens to return.
     http_pending_loopback_proof = False
     if parsed.scheme != "https":
-        if allow_http and parsed.scheme == "http" and is_localhost(hostname):
+        if allow_localhost and allow_http and parsed.scheme == "http" and is_localhost(hostname):
             http_pending_loopback_proof = True
         else:
             raise OAuthSSRFError(f"endpoint URL must use HTTPS (got {parsed.scheme}://): {url}")
@@ -245,7 +299,7 @@ def validate_url_no_ssrf(
         # than the hostname — and on the same predicate as the cleartext gate,
         # since two spellings of "reaches loopback" disagree for a Teredo
         # wrapper whose server half is loopback and whose client half is not.
-        if is_localhost(hostname) and reaches_only_loopback(addr):
+        if allow_localhost and is_localhost(hostname) and reaches_only_loopback(addr):
             continue
         raise OAuthSSRFPrivateAddressError(
             f"endpoint URL resolves to non-public address ({describe_address(addr)}): {url}"
@@ -261,6 +315,7 @@ def validate_discovered_endpoint(
     allow_http: bool,
     trusted_endpoint_hosts: frozenset[str],
     allow_private: bool = False,
+    allow_localhost: bool = True,
 ) -> None:
     """Validate an endpoint URL pulled from an OIDC/OAuth discovery document.
 
@@ -268,12 +323,14 @@ def validate_discovered_endpoint(
     constraint: the endpoint host must equal the issuer host, be in the
     well-known trust map, or be in the operator-supplied
     ``trusted_endpoint_hosts``.  Effective port (with scheme defaults
-    applied) and scheme must match the issuer.  ``allow_private`` forwards
-    to :func:`validate_url_no_ssrf`.
+    applied) and scheme must match the issuer.  ``allow_private`` and
+    ``allow_localhost`` forward to :func:`validate_url_no_ssrf`.
 
     Raises :class:`OAuthSSRFError` on validation failure.
     """
-    parsed = validate_url_no_ssrf(url, allow_http=allow_http, allow_private=allow_private)
+    parsed = validate_url_no_ssrf(
+        url, allow_http=allow_http, allow_private=allow_private, allow_localhost=allow_localhost
+    )
 
     issuer_hostname = (issuer_parsed.hostname or "").lower()
     endpoint_hostname = (parsed.hostname or "").lower()
@@ -288,7 +345,7 @@ def validate_discovered_endpoint(
     host_allowed = (
         endpoint_hostname == issuer_hostname
         or endpoint_hostname in known_trusted
-        or endpoint_hostname in trusted_endpoint_hosts
+        or any(_dialed_host(host) == endpoint_hostname for host in trusted_endpoint_hosts)
     )
     if not host_allowed:
         raise OAuthSSRFError(
@@ -311,6 +368,7 @@ async def validate_url_no_ssrf_async(
     allow_http: bool,
     allow_private: bool = False,
     private_requires_all: bool = False,
+    allow_localhost: bool = True,
 ) -> urllib.parse.ParseResult:
     """Async variant of :func:`validate_url_no_ssrf` for hot-path callers.
 
@@ -326,6 +384,7 @@ async def validate_url_no_ssrf_async(
         allow_http=allow_http,
         allow_private=allow_private,
         private_requires_all=private_requires_all,
+        allow_localhost=allow_localhost,
     )
 
 
@@ -336,6 +395,7 @@ async def validate_discovered_endpoint_async(
     allow_http: bool,
     trusted_endpoint_hosts: frozenset[str],
     allow_private: bool = False,
+    allow_localhost: bool = True,
 ) -> None:
     """Async variant of :func:`validate_discovered_endpoint`."""
     await asyncio.to_thread(
@@ -345,6 +405,7 @@ async def validate_discovered_endpoint_async(
         allow_http=allow_http,
         trusted_endpoint_hosts=trusted_endpoint_hosts,
         allow_private=allow_private,
+        allow_localhost=allow_localhost,
     )
 
 
@@ -354,6 +415,7 @@ __all__ = [
     "OAuthSSRFPrivateAddressError",
     "effective_port",
     "is_localhost",
+    "url_is_localhost",
     "sanitize_log_text",
     "validate_discovered_endpoint",
     "validate_discovered_endpoint_async",
