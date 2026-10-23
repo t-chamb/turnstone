@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-import httpx
+import httpx2
 
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_oauth import is_user_scoped_auth
@@ -32,7 +32,7 @@ log = get_logger(__name__)
 
 # Max SearxNG results sent to the reranker in one request — the pool re-ordered
 # before the caller's ``max_results`` slice. bm25.py defines the same cap
-# independently (kept separate so bm25 stays httpx-free) — keep the two in sync.
+# independently (kept separate so bm25 imports no HTTP client) — keep the two in sync.
 _RERANK_POOL = 50
 _RESULT_SNIPPET_CHARS = 500
 
@@ -86,7 +86,7 @@ class SearXNGClient:
             params["categories"] = category
         if self._engines:
             params["engines"] = self._engines
-        resp = httpx.get(
+        resp = httpx2.get(
             f"{self._base_url}/search",
             params=params,
             timeout=self._timeout,

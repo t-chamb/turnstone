@@ -32,11 +32,12 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from turnstone.core.attachments import Attachment, classify_upload
 from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
+from turnstone.core.providers._http_client import shutdown_on_close
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
@@ -534,7 +535,7 @@ class HeadlessSession(ChatSession):
                 args: dict[str, Any]
                 try:
                     args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     raw = tc["function"]["arguments"]
                     # Map bare strings to the primary arg key
                     pk = PRIMARY_KEY_MAP.get(func_name)
@@ -838,6 +839,7 @@ def _run_single_test(
             base_url=client.base_url,
             api_key=client.api_key,
             timeout=float(test_timeout),
+            http_client=shutdown_on_close(DefaultHttpxClient()),
         )
 
     def _build_session(run_client: Any) -> tuple[Any, Callable[[], list[dict[str, Any]]]]:

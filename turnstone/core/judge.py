@@ -1271,6 +1271,23 @@ Be precise and evidence-based. Do not hedge — give a clear recommendation. \
 If you used read_file to check a target, cite what you found."""
 
 
+# Two linear searches find what the lazy pattern r"```(?:json)?\s*(\{.*?\})\s*```" captures: the
+# first opening fence whose body starts with "{", then the first "}" closing a fence after that
+# brace. The lazy pattern rescanned the rest of the reply from every unclosed opener, quadratic in
+# a reply that what the judge reads can steer.
+_RE_FENCE_OPENER = re.compile(r"```(?:json)?\s*\{")
+_RE_FENCE_CLOSER = re.compile(r"\}\s*```")
+
+
+def _fenced_object(text: str) -> str | None:
+    """The braces-and-body text of the first fenced JSON object in a judge's reply, or None."""
+    opener = _RE_FENCE_OPENER.search(text)
+    closer = _RE_FENCE_CLOSER.search(text, opener.end()) if opener else None
+    if opener is None or closer is None:
+        return None
+    return text[opener.end() - 1 : closer.start() + 1]
+
+
 # ---------------------------------------------------------------------------
 # IntentJudge — session-scoped LLM judge
 # ---------------------------------------------------------------------------
@@ -1493,7 +1510,7 @@ class IntentJudge:
             if isinstance(func_args, str):
                 try:
                     func_args = json.loads(func_args)
-                except (json.JSONDecodeError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     func_args = {}
             approval_label = item.get("approval_label", func_name)
             call_id = item.get("call_id", item.get("tool_call_id", ""))
@@ -1803,7 +1820,7 @@ class IntentJudge:
         if isinstance(func_args, str):
             try:
                 func_args = json.loads(func_args)
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 func_args = {}
         call_id = item.get("call_id", item.get("tool_call_id", ""))
         # ``func_args_json`` is the verdict's record copy (persisted + streamed,
@@ -1968,7 +1985,7 @@ class IntentJudge:
                         tc_args = (
                             json.loads(tc_args_str) if isinstance(tc_args_str, str) else tc_args_str
                         )
-                    except (json.JSONDecodeError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         tc_args = {}
 
                     tool_result = self._exec_read_only_tool(tc_name, tc_args)
@@ -2058,7 +2075,7 @@ class IntentJudge:
         if isinstance(func_args, str):
             try:
                 func_args = json.loads(func_args)
-            except (json.JSONDecodeError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 func_args = {}
         approval_label = item.get("approval_label", func_name)
 
@@ -2318,17 +2335,17 @@ class IntentJudge:
             data = json.loads(text.strip())
             if isinstance(data, dict):
                 return data
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             pass  # falls through to strategy 2
 
         # Strategy 2: Markdown code block
-        md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if md_match:
+        fenced = _fenced_object(text)
+        if fenced is not None:
             try:
-                data = json.loads(md_match.group(1))
+                data = json.loads(fenced)
                 if isinstance(data, dict):
                     return data
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 pass  # falls through to strategy 3
 
         # Strategy 3: Find first { and matching }
@@ -2345,7 +2362,7 @@ class IntentJudge:
                             data = json.loads(text[start : i + 1])
                             if isinstance(data, dict):
                                 return data
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError, RecursionError):
                             pass  # falls through to regex extraction
                         break
 

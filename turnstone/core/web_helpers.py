@@ -85,7 +85,7 @@ def skill_summary_rows(storage: Any) -> list[dict[str, Any]]:
         if r.get("hidden_from_menu"):
             continue
         tags: list[str] = []
-        with contextlib.suppress(ValueError, TypeError):
+        with contextlib.suppress(ValueError, TypeError, RecursionError):
             tags = json.loads(r.get("tags", "[]"))
         skills.append(
             {
@@ -122,7 +122,7 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
             return _JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
         body: dict[str, Any] = raw
         return body
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return _JSONResponse({"error": "Invalid JSON body"}, status_code=400)
     except Exception:
         import structlog
@@ -261,7 +261,7 @@ async def read_multipart_create_or_400(
         return _JSONResponse({"error": f"Missing '{meta_field}' JSON field"}, status_code=400)
     try:
         meta: dict[str, Any] = json.loads(meta_raw)
-    except (ValueError, json.JSONDecodeError):
+    except (ValueError, json.JSONDecodeError, RecursionError):
         return _JSONResponse({"error": f"'{meta_field}' field must be valid JSON"}, status_code=400)
     if not isinstance(meta, dict):
         return _JSONResponse({"error": f"'{meta_field}' must be a JSON object"}, status_code=400)
@@ -457,6 +457,14 @@ def audit_context(request: Request) -> tuple[str, str]:
     return auth_user_id(request), ip
 
 
+# The ``code`` on the 503 a node answers when it can't read a workstream's
+# row to check access.  The console's route proxy re-routes on it as on a
+# 404: a node that doesn't hold the workstream has to read the row, and the
+# one that holds it may not need to.  When the re-route finds the same node,
+# the 503 passes through.
+WORKSTREAM_UNREADABLE_CODE = "workstream_unreadable"
+
+
 def resolve_workstream_owner(
     request: Request,
     ws_id: str,
@@ -492,15 +500,13 @@ def resolve_workstream_owner(
     workstreams keep the zero-storage fast path.
 
     Failure-mode map, precisely: which error a storage outage produces
-    depends on where it strikes. The ROW lookup is fail-soft
-    (:func:`turnstone.core.memory.get_workstream_row` degrades an
-    exception to ``None``), so a storage-path row fetch that fails
-    surfaces as this function's 404 — pre-existing behaviour shared
-    with the old owner lookup. Only once a row IS resolved (from the
-    manager or storage) does the project gate run, and THAT failure is
-    the fail-closed 403 above. In-memory workstreams therefore 403 on
-    a project-gate blip; not-loaded ones typically 404 at the row
-    fetch first.
+    depends on where it strikes. A storage-path ROW fetch that fails
+    answers 503: an outage is not a missing workstream, and since the
+    failed read says nothing about the id, the 503 is no existence
+    oracle. Only once a row IS resolved (from the manager or storage)
+    does the project gate run, and THAT failure is the fail-closed 403
+    above. In-memory workstreams therefore 403 on a project-gate blip;
+    not-loaded ones answer 503 at the row fetch first.
 
     ``not_found_label`` is the message body the 404 carries — the
     interactive surface uses "Workstream not found"; coord uses
@@ -528,9 +534,20 @@ def resolve_workstream_owner(
 
     if owner is None:
         # Not in memory — storage resolves persisted-but-not-loaded rows.
-        from turnstone.core.memory import get_workstream_row
+        from turnstone.core.storage import get_storage
 
-        row = get_workstream_row(ws_id)
+        try:
+            row = get_storage().get_workstream(ws_id)
+        except Exception:
+            import structlog
+
+            structlog.get_logger(__name__).warning(
+                "resolve_workstream_owner.storage_failed", ws_id=ws_id[:8], exc_info=True
+            )
+            return "", _JSONResponse(
+                {"error": "workstream could not be read", "code": WORKSTREAM_UNREADABLE_CODE},
+                status_code=503,
+            )
         if row is None or row.get("state") == "creating":
             return "", _JSONResponse({"error": not_found_label}, status_code=404)
         owner = row.get("user_id") or ""
@@ -587,9 +604,9 @@ _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 def is_safe_static_asset_path(path: str) -> bool:
     """Return whether *path* is a canonical mount-relative asset path.
 
-    Starlette decodes percent escapes before populating ``{path:path}``, and
-    HTTPX normalizes dot segments when it builds an outbound URL.  Reject the
-    ambiguous forms before a console proxy can leave its static mount.
+    Starlette decodes percent escapes before populating ``{path:path}``, and httpx2 normalizes dot
+    segments when it builds an outbound URL.  Reject the ambiguous forms before a console proxy can
+    leave its static mount.
     """
     return (
         bool(path)

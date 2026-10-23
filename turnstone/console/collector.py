@@ -19,9 +19,10 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import httpx
-import httpx_sse
+import httpx2
 
+from turnstone.console.log_preview import bounded_stream_preview
+from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
 from turnstone.core.workstream import (
     WorkstreamKind,
     WorkstreamState,
@@ -108,7 +109,6 @@ class ClusterCollector:
         http_timeout: float = 30.0,
         token_manager: ServiceTokenManager | None = None,
         tls_verify: Any = True,
-        tls_cert: tuple[str, str] | None = None,
         router: ConsoleRouter | None = None,
         console_metrics: ConsoleMetrics | None = None,
         notify_dispatcher: NotifyDispatcher | None = None,
@@ -120,7 +120,6 @@ class ClusterCollector:
         self._router = router
         self._console_metrics = console_metrics
         self._tls_verify = tls_verify
-        self._tls_cert = tls_cert
         self._notify_dispatcher = notify_dispatcher
         self._notify_unsubscribe: Callable[[], None] | None = None
 
@@ -142,29 +141,27 @@ class ClusterCollector:
         self._sse_loop: asyncio.AbstractEventLoop | None = None
         self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._sse_stop_events: dict[str, asyncio.Event] = {}
-        self._sse_async_client: httpx.AsyncClient | None = None
+        self._sse_async_client: httpx2.AsyncClient | None = None
 
-    def upgrade_tls(self, tls_verify: Any = True, tls_cert: tuple[str, str] | None = None) -> None:
+    def upgrade_tls(self, tls_verify: Any = True) -> None:
         """Update TLS settings for future SSE connections."""
         self._tls_verify = tls_verify
-        self._tls_cert = tls_cert
         # If the async client is running, replace it on the event loop.
         if self._sse_loop is not None and self._sse_loop.is_running():
             asyncio.run_coroutine_threadsafe(self._replace_async_client(), self._sse_loop)
 
     async def _replace_async_client(self) -> None:
-        """Replace the async httpx client (called on the SSE event loop).
+        """Replace the async httpx2 client (called on the SSE event loop).
 
         Closing the old client terminates its underlying connections, which
         causes active ``_node_sse_task`` coroutines to raise and reconnect
         using the new client with updated TLS settings.
         """
         old = self._sse_async_client
-        self._sse_async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
-            limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1500),
+        self._sse_async_client = httpx2.AsyncClient(
+            timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
+            limits=httpx2.Limits(max_connections=2000, max_keepalive_connections=1500),
             verify=self._tls_verify,
-            cert=self._tls_cert,
         )
         if old is not None:
             await old.aclose()
@@ -267,11 +264,10 @@ class ClusterCollector:
 
     async def _sse_manager(self) -> None:
         """Top-level coroutine — runs until collector stops."""
-        self._sse_async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
-            limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1500),
+        self._sse_async_client = httpx2.AsyncClient(
+            timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
+            limits=httpx2.Limits(max_connections=2000, max_keepalive_connections=1500),
             verify=self._tls_verify,
-            cert=self._tls_cert,
         )
         try:
             while self._running:
@@ -333,12 +329,11 @@ class ClusterCollector:
                 break
             base = url.rstrip("/")
             try:
-                async with httpx_sse.aconnect_sse(
-                    self._sse_async_client,
-                    "GET",
+                async with self._sse_async_client.sse(
                     f"{base}/v1/api/events/global",
                     params={"expected_node_id": node_id},
                     headers=self._auth_headers(),
+                    max_event_size=MAX_SSE_EVENT_SIZE,
                 ) as source:
                     status = source.response.status_code
                     if status == 409:
@@ -354,30 +349,9 @@ class ClusterCollector:
                     # "console dashboard is empty" footgun when the
                     # collector token lacked ``service`` scope.
                     if 400 <= status < 500:
-                        # Bounded body read — iterate aiter_bytes() up
-                        # to the preview cap so a malicious / oversized
-                        # upstream can't force the collector to buffer
-                        # an arbitrary HTML error page just to log a
-                        # 200-char preview.  Stops pulling bytes as
-                        # soon as we have enough.
-                        body_preview = ""
-                        try:
-                            preview_cap = 256  # >200 chars after UTF-8 decode
-                            chunks: list[bytes] = []
-                            bytes_read = 0
-                            async for chunk in source.response.aiter_bytes():
-                                if not chunk:
-                                    continue
-                                remaining = preview_cap - bytes_read
-                                if remaining <= 0:
-                                    break
-                                chunks.append(chunk[:remaining])
-                                bytes_read += len(chunks[-1])
-                                if bytes_read >= preview_cap:
-                                    break
-                            body_preview = b"".join(chunks).decode("utf-8", "replace")[:200]
-                        except Exception:
-                            body_preview = "<unreadable>"
+                        # A bounded read with control characters replaced: an oversized
+                        # error page isn't buffered, and a node can't forge log lines.
+                        body_preview = await bounded_stream_preview(source.response)
                         log.warning(
                             "SSE %d from node %s at %s — %s",
                             status,
@@ -390,14 +364,14 @@ class ClusterCollector:
                         backoff = min(backoff * 2, 30)
                         continue
                     source.response.raise_for_status()
-                    async for sse in source.aiter_sse():
+                    async for sse in source:
                         if stop_event.is_set():
                             break
                         if not sse.data:
                             continue  # ping/comment frame
                         try:
                             data = json.loads(sse.data)
-                        except json.JSONDecodeError:
+                        except (ValueError, RecursionError):
                             log.debug("Invalid SSE JSON from node %s", node_id)
                             continue
                         etype = data.get("type", "")
@@ -405,7 +379,7 @@ class ClusterCollector:
                             # Client-side identity check (defense in depth)
                             if data.get("node_id") != node_id:
                                 log.warning(
-                                    "Snapshot node_id mismatch: expected %s, got %s",
+                                    "Snapshot node_id mismatch: expected %s, got %.200r",
                                     node_id,
                                     data.get("node_id"),
                                 )
@@ -418,11 +392,11 @@ class ClusterCollector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Network / timeout / TLS errors. The FIRST failure
-                # (reachable→unreachable) is operator-actionable — a persistent
-                # TLS verify failure, refused connection, or DNS miss would
-                # otherwise be invisible — so surface it at WARNING. Subsequent
-                # retry failures drop to DEBUG to avoid flooding the log on
+                # Network / timeout / TLS errors, and ``httpx2.SSEError`` for a reply that is not an
+                # event stream or an event over ``MAX_SSE_EVENT_SIZE``. The FIRST failure
+                # (reachable→unreachable) is operator-actionable — a persistent TLS verify failure,
+                # refused connection, or DNS miss would otherwise be invisible — so surface it at
+                # WARNING. Subsequent retry failures drop to DEBUG to avoid flooding the log on
                 # every backoff cycle while the node stays down.
                 first_failure = self._mark_unreachable(node_id, reason=type(exc).__name__)
                 (log.warning if first_failure else log.debug)(
@@ -496,7 +470,7 @@ class ClusterCollector:
                 meta: dict[str, Any] = {}
                 raw_meta = svc.get("metadata", "")
                 if raw_meta:
-                    with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    with contextlib.suppress(ValueError, TypeError, RecursionError):
                         meta = json.loads(raw_meta)
                 url = svc.get("url", "")
                 if nid not in self._nodes:

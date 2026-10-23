@@ -709,8 +709,8 @@ class ModelRegistry:
                 raise ModelClientConstructionError(str(exc)) from exc
             except Exception as exc:
                 # SDK construction can fail on environment problems the
-                # config never sees — e.g. httpx resolving a CA-bundle
-                # path that a venv rebuild deleted (FileNotFoundError).
+                # config never sees — e.g. an ``SSL_CERT_FILE`` naming a
+                # bundle that has since been deleted (FileNotFoundError).
                 # Routes map ValueError to a 503 with the message;
                 # anything else surfaces as an opaque 500, so re-type
                 # here where the alias is known.  The message text is
@@ -1719,7 +1719,7 @@ def load_model_registry(
                         parsed = _json.loads(row["capabilities"])
                         if isinstance(parsed, dict):
                             caps = parsed
-                    except (_json.JSONDecodeError, TypeError):
+                    except (ValueError, TypeError, RecursionError):
                         pass  # falls back to empty capabilities
                 defined.setdefault(alias, serves_chat(caps, str(row.get("model") or "")))
                 # Extract server_compat from capabilities (namespaced key)

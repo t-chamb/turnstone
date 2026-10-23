@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._helpers import wait_until
@@ -107,8 +107,8 @@ async def test_restart_retains_association_and_recovers_history(app_client, plat
 
     await bot.router.aclose()
     await bot._http_client.aclose()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app),
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
         base_url="http://server.example",
         headers=_auth("owner"),
     ) as http:

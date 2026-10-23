@@ -309,6 +309,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       },
@@ -362,6 +372,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -433,6 +453,16 @@
           },
           "409": {
             "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -565,6 +595,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -770,6 +810,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -992,6 +1042,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1019,6 +1079,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -1356,6 +1426,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       },
@@ -1398,6 +1478,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -1457,6 +1547,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1502,6 +1602,16 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -1606,7 +1716,7 @@
     },
     "/v1/api/tts": {
       "post": {
-        "summary": "Synthesize text to speech audio for browser playback using the configured TTS model role.  Returns audio bytes; 503 when no TTS role is configured.",
+        "summary": "Synthesize text to speech audio for browser playback using the configured TTS model role.  Returns audio bytes; 429 with Retry-After when the node is already synthesizing as many clips as it runs at once; 503 when no TTS role is configured.",
         "operationId": "v1_api_tts_post",
         "tags": [
           "Chat"
@@ -1627,6 +1737,16 @@
           },
           "400": {
             "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {

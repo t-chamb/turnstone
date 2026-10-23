@@ -12,8 +12,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
+import httpx2
 
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.skill_parser import ParsedSkill, parse_skill_md
 
@@ -25,6 +26,7 @@ _GITHUB_URL_RE = re.compile(
     r"^https?://github\.com/(?P<owner>[a-zA-Z0-9_-]+)/(?P<repo>[a-zA-Z0-9._-]+)"
     r"(?:/(?:tree|blob)/(?P<branch>[^/]+)(?:/(?P<path>.+))?)?$"
 )
+
 
 _MAX_RESOURCE_FILES = 10
 _MAX_RESOURCE_SIZE = 100 * 1024  # 100KB per file
@@ -119,13 +121,13 @@ class SkillsShClient:
         if query:
             params["q"] = query
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        async with httpx2.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             try:
                 resp = await client.get(f"{self._base_url}/api/search", params=params)
                 resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
+            except httpx2.HTTPStatusError as exc:
                 raise SkillSourceError(f"skills.sh returned {exc.response.status_code}") from exc
-            except httpx.HTTPError as exc:
+            except REQUEST_FAILURES as exc:
                 raise SkillSourceError(f"skills.sh request failed: {exc}") from exc
 
         data = resp.json()
@@ -164,10 +166,10 @@ class SkillsShClient:
         owner, repo, name = _split_skills_sh_id(skill_id)
 
         url = f"{self._base_url}/api/download/{owner}/{repo}/{name}"
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        async with httpx2.AsyncClient(follow_redirects=True, timeout=10.0) as client:
             try:
                 resp = await client.get(url)
-            except httpx.HTTPError as exc:
+            except REQUEST_FAILURES as exc:
                 raise SkillSourceError(f"Failed to download skill {skill_id}: {exc}") from exc
 
         if resp.status_code == 404:
@@ -179,7 +181,7 @@ class SkillsShClient:
 
         try:
             payload = resp.json()
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise SkillSourceError(
                 f"skills.sh returned non-JSON for {skill_id}: {resp.text[:200]}"
             ) from exc
@@ -283,7 +285,7 @@ def _find_resource_files(
     return resource_files[:_MAX_RESOURCE_FILES]
 
 
-def _check_rate_limit(resp: httpx.Response) -> None:
+def _check_rate_limit(resp: httpx2.Response) -> None:
     """Raise SkillSourceError with guidance if GitHub rate limit is hit."""
     if resp.status_code == 403:
         remaining = resp.headers.get("x-ratelimit-remaining", "")
@@ -301,7 +303,7 @@ _FETCH_CONCURRENCY = 5
 
 
 async def _fetch_resource_contents(
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     raw_base: str,
     resource_files: list[dict[str, str]],
 ) -> dict[str, str]:
@@ -316,7 +318,7 @@ async def _fetch_resource_contents(
                 resp = await client.get(f"{raw_base}/{rf['full_path']}")
                 if resp.status_code == 200:
                     return rf["path"], resp.text
-            except httpx.HTTPError:
+            except REQUEST_FAILURES:
                 pass  # best-effort fetch, skip on failure
         return None
 
@@ -374,8 +376,8 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
     skill_md_content = ""
     skill_md_dir = ""
     resolved_branch = branch
-    _timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(
+    _timeout = httpx2.Timeout(10.0, connect=5.0)
+    async with httpx2.AsyncClient(
         follow_redirects=True, timeout=_timeout, headers=headers
     ) as client:
         # Try each branch × candidate combination
@@ -393,7 +395,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                         skill_md_dir = parts[0] if len(parts) > 1 else ""
                         resolved_branch = try_branch
                         break
-                except httpx.HTTPError:
+                except REQUEST_FAILURES:
                     continue
             if skill_md_content:
                 break
@@ -418,7 +420,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                 tree_data = tree_resp.json()
                 rf = _find_resource_files(tree_data.get("tree", []), skill_md_dir)
                 resources = await _fetch_resource_contents(client, raw_base, rf)
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             log.debug("Failed to fetch resource tree for %s/%s", owner, repo)
 
     # Build a per-skill source URL pointing to the specific subdirectory
@@ -462,8 +464,8 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
 
     api_base = f"https://api.github.com/repos/{owner}/{repo}"
 
-    _timeout = httpx.Timeout(10.0, connect=5.0)
-    async with httpx.AsyncClient(
+    _timeout = httpx2.Timeout(10.0, connect=5.0)
+    async with httpx2.AsyncClient(
         follow_redirects=True, timeout=_timeout, headers=headers
     ) as client:
         # Find the tree with all SKILL.md files
@@ -480,7 +482,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     tree_data = resp.json()
                     resolved_branch = try_branch
                     break
-            except httpx.HTTPError:
+            except REQUEST_FAILURES:
                 continue
 
         if not tree_data:
@@ -516,7 +518,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     r = await client.get(f"{raw_base}/{p}")
                     if r.status_code == 200 and len(r.content) <= _MAX_SKILL_MD_SIZE:
                         return p, r.text
-                except httpx.HTTPError:
+                except REQUEST_FAILURES:
                     pass  # best-effort fetch, skip on failure
             return None
 

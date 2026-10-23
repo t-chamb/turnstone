@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import http.server
 import json
+import socket
+import threading
 from unittest.mock import MagicMock, PropertyMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from turnstone.console.scheduler import TaskScheduler
@@ -116,6 +119,30 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
+        storage.list_due_tasks.assert_not_called()
+
+    @pytest.mark.parametrize("corruption", ["syntax", "integer", "nesting"])
+    def test_tick_leaves_unreadable_lock_untouched(self, mocks, monkeypatch, corruption):
+        from datetime import UTC, datetime
+
+        from tests._deep_json import overlong_integer, too_deep_to_parse
+
+        collector, storage = mocks
+        lock = json.dumps(
+            {"owner": "other-instance", "acquired": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")}
+        )
+        if corruption == "syntax":
+            lock = "{broken"
+        elif corruption == "integer":
+            lock = lock[:-1] + ', "counter":' + overlong_integer() + "}"
+        else:
+            too_deep_to_parse(monkeypatch, lock)
+        _wire_lock_storage(storage, initial={"value": lock})
+
+        TaskScheduler(collector, storage)._tick()
+
+        storage.upsert_system_setting.assert_not_called()
+        storage.delete_system_setting.assert_not_called()
         storage.list_due_tasks.assert_not_called()
 
     def test_tick_takes_expired_lock(self, mocks):
@@ -539,7 +566,7 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage, retry_interval=0)
         with patch(
             "turnstone.console.scheduler.TurnstoneServer.create_workstream",
-            side_effect=httpx.ConnectError("refused"),
+            side_effect=httpx2.ConnectError("refused"),
         ) as create:
             scheduler._tick()
             scheduler._tick()
@@ -804,16 +831,20 @@ class TestSchedulerTick:
     @pytest.mark.parametrize(
         ("failure", "held"),
         [
-            (httpx.ConnectError("refused"), True),
-            (httpx.ConnectTimeout("no route"), True),
-            (httpx.PoolTimeout("busy"), True),
-            (httpx.ProxyError("refused"), True),
-            (httpx.UnsupportedProtocol("no scheme"), True),
+            (httpx2.ConnectError("refused"), True),
+            (httpx2.ConnectTimeout("no route"), True),
+            (httpx2.PoolTimeout("busy"), True),
+            (httpx2.ProxyError("refused"), True),
+            (httpx2.UnsupportedProtocol("no scheme"), True),
+            (httpx2.InvalidURL("bad location"), True),
+            # Encoding fails before the request is sent; decoding can fail after it was made.
+            (UnicodeEncodeError("ascii", "caf" + chr(0xE9), 3, 4, "out of range"), True),
+            (UnicodeDecodeError("utf-8", bytes([0xFF]), 0, 1, "invalid start byte"), False),
             (TurnstoneAPIError(429, "manager at capacity"), True),
             (TurnstoneAPIError(400, "unknown persona"), True),
             (TurnstoneAPIError(401, "token not yet valid"), True),
             (TurnstoneAPIError(503, "Unknown model alias"), False),
-            (httpx.ReadTimeout("slow node"), False),
+            (httpx2.ReadTimeout("slow node"), False),
             (RuntimeError("unexpected"), False),
         ],
     )
@@ -840,6 +871,78 @@ class TestSchedulerTick:
         if not held:
             assert "last_run" not in storage.update_scheduled_task.call_args.kwargs
 
+    def test_a_failure_after_a_redirect_is_retried(self, mocks, monkeypatch):
+        # Turnstone's create handler never redirects, so a 3xx comes from something in front of the
+        # node that didn't run the create: a refused connection on the next hop means nothing was
+        # made, and the firing is held for retry like any connection that never opened.
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.lower(), raising=False)
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))  # bound, never listening: connections are refused
+            target = f"http://127.0.0.1:{closed.getsockname()[1]}/v1/api/workstreams/new"
+
+            class Redirect(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                    self.send_response(307)
+                    self.send_header("Location", target)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *args):
+                    pass
+
+            node = http.server.HTTPServer(("127.0.0.1", 0), Redirect)
+            serving = threading.Thread(target=node.serve_forever, daemon=True)
+            serving.start()
+            collector, storage = mocks
+            storage.list_due_tasks.return_value = [_make_task()]
+            collector.get_nodes.return_value = ([_make_node()], 1)
+            collector.get_node_detail.return_value = {
+                "server_url": f"http://127.0.0.1:{node.server_address[1]}"
+            }
+            scheduler = TaskScheduler(collector, storage)
+            try:
+                scheduler._tick()
+            finally:
+                scheduler.stop()
+                node.shutdown()
+                node.server_close()
+                serving.join(timeout=5)
+
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [("failed", "node-001 could not be reached (ConnectError)")]
+        storage.update_scheduled_task.assert_not_called()
+
+    def test_a_refused_connection_through_the_real_client_is_held(self, mocks, monkeypatch):
+        # A loopback port nothing listens on, so the error classified is the one the SDK's own
+        # client really raises.
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.lower(), raising=False)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        collector, storage = mocks
+        storage.list_due_tasks.return_value = [_make_task()]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {"server_url": f"http://127.0.0.1:{port}"}
+
+        scheduler = TaskScheduler(collector, storage)
+        try:
+            scheduler._tick()
+        finally:
+            scheduler.stop()
+
+        rows = [
+            (c.kwargs["status"], c.kwargs["error"]) for c in storage.record_task_run.call_args_list
+        ]
+        assert rows == [("failed", "node-001 could not be reached (ConnectError)")]
+        storage.update_scheduled_task.assert_not_called()
+
     def test_an_unresolved_one_shot_is_disabled_without_a_last_run(self, mocks):
         collector, storage = mocks
         storage.list_due_tasks.return_value = [
@@ -851,7 +954,7 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage)
         with patch(
             "turnstone.console.scheduler.TurnstoneServer.create_workstream",
-            side_effect=httpx.ReadTimeout("slow node"),
+            side_effect=httpx2.ReadTimeout("slow node"),
         ):
             scheduler._tick()
 
@@ -883,7 +986,7 @@ class TestSchedulerTick:
         scheduler = TaskScheduler(collector, storage)
         with patch(
             "turnstone.console.scheduler.TurnstoneServer.create_workstream",
-            side_effect=[httpx.ConnectError("refused"), httpx.ReadTimeout("slow node")],
+            side_effect=[httpx2.ConnectError("refused"), httpx2.ReadTimeout("slow node")],
         ):
             scheduler._tick()
 

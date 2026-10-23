@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from aiohttp import web
 from starlette.applications import Starlette
@@ -209,9 +209,9 @@ async def _host(
     return app, tokens
 
 
-async def _disconnect(app: Starlette) -> httpx.Response:
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+async def _disconnect(app: Starlette) -> httpx2.Response:
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://test"
     ) as client:
         return await client.delete("/connections/pool-srv")
 
@@ -550,6 +550,7 @@ def test_node_shutdown_allows_revocation_to_finish_during_manager_drain(
             app.state.rate_limiter = None
             app.state.watch_runner = None
             app.state.registry = None
+            app.state.tts = server._SpeechCapacity()
             entered, finished = threading.Event(), threading.Event()
             observed: list[bool] = []
 

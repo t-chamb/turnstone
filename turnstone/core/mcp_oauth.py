@@ -33,9 +33,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
-import httpx
-
 from turnstone.core.audit import record_audit
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.log import get_logger
 from turnstone.core.mcp_http_parsers import (
     MAX_INSUFFICIENT_SCOPE_REPORTED,
@@ -58,6 +57,7 @@ from turnstone.core.token_store import store as token_store_store
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    import httpx2
     from starlette.requests import Request
     from starlette.responses import Response
 
@@ -80,8 +80,9 @@ MCP_OAUTH_DISCOVERY_CACHE_TTL_SECONDS = 86400
 _PENDING_CLEANUP_INTERVAL_S = 60.0
 
 
-# Limits on PRM/AS body sizes — defensive against runaway responses.
-_MAX_DISCOVERY_BODY_BYTES = 256 * 1024
+# Limits on PRM/AS body sizes — defensive against runaway responses. The OAuth client keeps one
+# byte past this of a body, so the check in ``_json_object_body`` sees an oversized one as such.
+_MAX_DISCOVERY_BODY_BYTES = oauth_http._MAX_RESPONSE_BODY_BYTES
 
 
 # Whole-discovery probe budget. Each candidate location gets the standard
@@ -360,20 +361,20 @@ def _parse_prm_url_from_www_authenticate(header: str) -> str | None:
     return params.get("resource_metadata") or None
 
 
-def _json_object_body(resp: httpx.Response, label: str) -> dict[str, Any]:
+def _json_object_body(resp: httpx2.Response, label: str) -> dict[str, Any]:
     """Return a bounded, parsed JSON-object body, or raise the discovery error."""
     if len(resp.content) > _MAX_DISCOVERY_BODY_BYTES:
         raise MCPOAuthDiscoveryError(f"{label} response body exceeds size limit")
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise MCPOAuthDiscoveryError(f"{label} body is not valid JSON: {exc}") from exc
     if not isinstance(doc, dict):
         raise MCPOAuthDiscoveryError(f"{label} body is not a JSON object")
     return doc
 
 
-def _prm_issuer_from_document(resp: httpx.Response, accepted_resources: frozenset[str]) -> str:
+def _prm_issuer_from_document(resp: httpx2.Response, accepted_resources: frozenset[str]) -> str:
     """Validate one protected-resource metadata response and return its issuer.
 
     Raises :class:`MCPOAuthDiscoveryError` for an oversized, non-JSON, or
@@ -425,19 +426,23 @@ class _PRMCandidate:
     cannot starve another location's challenge. *allow_private* travels the
     same way: a location derived from the operator's own server URL may be
     private when the deployment has opted in, while one a remote document
-    named may never be, whatever the setting says.
+    named may never be, whatever the setting says. *allow_localhost*, the
+    localhost development lane, is decided the same way: a derived location
+    has it, and one a remote document named has it only when the operator's
+    server URL is itself a localhost URL.
     """
 
     url: str
     accepted: frozenset[str]
     hops: int
     allow_private: bool
+    allow_localhost: bool
 
 
 async def _fetch_prm_issuer(
     server_url: str,
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     deadline: float,
     allow_private: bool = False,
     server_name: str = "",
@@ -474,6 +479,8 @@ async def _fetch_prm_issuer(
     remote document named — a challenge target, or the issuer this returns —
     is validated strictly however the setting is set, so a resource server
     can never steer the deployment at an address the operator did not type.
+    The localhost development lane follows the same line: such a URL gets it
+    only when the operator's server URL is a localhost URL too.
 
     The caller is responsible for passing the resulting issuer to
     :func:`_fetch_as_metadata` along with its ``trusted_hosts`` list —
@@ -490,7 +497,10 @@ async def _fetch_prm_issuer(
     origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
     path_prm_url = _well_known_url(canonical, "oauth-protected-resource")
-    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1, allow_private)]
+    # A remote document's URLs get the localhost lane only from a server the operator runs
+    # locally: the console's own loopback ports are otherwise out of its reach.
+    local_server = oauth_ssrf.url_is_localhost(server_url)
+    candidates = [_PRMCandidate(path_prm_url, frozenset({canonical}), 1, allow_private, True)]
     origin_prm_url = _well_known_url(origin, "oauth-protected-resource")
     if origin_prm_url != path_prm_url:
         # RFC 9728 §3.3 binds a document to the identifier its URL was
@@ -500,9 +510,11 @@ async def _fetch_prm_issuer(
         # path-specific location; it fails with the resource-mismatch
         # message and the operator's remedy is the Authorization Server URL
         # override, which skips PRM entirely.
-        candidates.append(_PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private))
+        candidates.append(
+            _PRMCandidate(origin_prm_url, frozenset({origin}), 1, allow_private, True)
+        )
 
-    fetched: dict[tuple[str, bool], httpx.Response] = {}
+    fetched: dict[tuple[str, bool, bool], httpx2.Response] = {}
     document_error: MCPOAuthDiscoveryError | None = None
     private_error: MCPOAuthDiscoveryError | None = None
     first_error: MCPOAuthDiscoveryError | None = None
@@ -520,7 +532,13 @@ async def _fetch_prm_issuer(
         # Keyed by the candidate's verdict as well as its URL: a response
         # fetched under the opt-in must not be reused for a candidate that
         # was denied it, or the verdict the record carries never applies.
-        cached = fetched.get((candidate.url, candidate.allow_private))
+        # The localhost lane counts only where it can change the verdict, on
+        # a localhost URL, so it doesn't split the key for any other URL.
+        verdict = (
+            candidate.allow_private,
+            candidate.allow_localhost and oauth_ssrf.url_is_localhost(candidate.url),
+        )
+        cached = fetched.get((candidate.url, *verdict))
         if cached is not None:
             resp = cached
         else:
@@ -534,6 +552,7 @@ async def _fetch_prm_issuer(
                     allow_http=True,
                     allow_private=candidate.allow_private,
                     private_requires_all=True,
+                    allow_localhost=candidate.allow_localhost,
                 )
             except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
                 private_error = private_error or _private_network_refusal(
@@ -552,10 +571,10 @@ async def _fetch_prm_issuer(
                 continue
             try:
                 resp = await http_client.get(candidate.url, timeout=budget)
-            except httpx.HTTPError as exc:
+            except REQUEST_FAILURES as exc:
                 _record(_discovery_error(f"PRM fetch failed: {exc}", exc))
                 continue
-            fetched[(candidate.url, candidate.allow_private)] = resp
+            fetched[(candidate.url, *verdict)] = resp
 
         if resp.status_code == 401:
             challenge_url = _parse_prm_url_from_www_authenticate(
@@ -580,6 +599,7 @@ async def _fetch_prm_issuer(
                         candidate.accepted,
                         candidate.hops - 1,
                         candidate.allow_private and _same_origin(challenge_url, candidate.url),
+                        local_server,
                     ),
                 )
             else:
@@ -593,7 +613,9 @@ async def _fetch_prm_issuer(
             issuer_url = _prm_issuer_from_document(resp, candidate.accepted)
             # SSRF protection on the issuer URL itself — same-origin / trust-list
             # checks happen in ``_fetch_as_metadata``.
-            await oauth_ssrf.validate_url_no_ssrf_async(issuer_url, allow_http=True)
+            await oauth_ssrf.validate_url_no_ssrf_async(
+                issuer_url, allow_http=True, allow_localhost=local_server
+            )
         except MCPOAuthDiscoveryError as exc:
             document_error = document_error or exc
             continue
@@ -826,10 +848,11 @@ def _as_metadata_from_document(
 async def _fetch_as_metadata(
     issuer: str,
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     trusted_hosts: frozenset[str],
     deadline: float,
     allow_private: bool = False,
+    allow_localhost: bool = False,
 ) -> oauth_http.ASMetadata:
     """Fetch and validate the authorization-server metadata document for *issuer*.
 
@@ -848,11 +871,17 @@ async def _fetch_as_metadata(
     override; an issuer a protected-resource document named is validated
     strictly however the deployment's setting is set. The document's own
     endpoints inherit the issuer's verdict, which is safe because they are
-    already bound same-origin to it.
+    already bound same-origin to it. *allow_localhost* grants the localhost
+    development lane the same way: to an operator-typed issuer, or to one
+    named for a server the operator runs on localhost.
     """
     try:
         issuer_parsed = await oauth_ssrf.validate_url_no_ssrf_async(
-            issuer, allow_http=True, allow_private=allow_private, private_requires_all=True
+            issuer,
+            allow_http=True,
+            allow_private=allow_private,
+            private_requires_all=True,
+            allow_localhost=allow_localhost,
         )
     except oauth_ssrf.OAuthSSRFPrivateAddressError as exc:
         raise _private_network_refusal(
@@ -916,7 +945,7 @@ async def _fetch_as_metadata(
             break
         try:
             r = await http_client.get(metadata_url, timeout=budget)
-        except httpx.HTTPError as exc:
+        except REQUEST_FAILURES as exc:
             first_error = first_error or _discovery_error(f"AS metadata fetch failed: {exc}", exc)
             continue
         if r.status_code != 200:
@@ -968,10 +997,12 @@ async def _fetch_as_metadata(
                     allow_http=allow_http,
                     trusted_endpoint_hosts=trusted_hosts,
                     allow_private=allow_private and _same_origin(endpoint_url, issuer),
+                    allow_localhost=allow_localhost,
                 )
             except oauth_ssrf.OAuthSSRFError as exc:
+                # Escaped: the document's URL may hold the control characters that got it refused.
                 raise MCPOAuthDiscoveryError(
-                    f"AS {name} rejected (url={endpoint_url}): {exc}"
+                    f"AS {name} rejected (url={oauth_ssrf.sanitize_log_text(endpoint_url)}): {exc}"
                 ) from exc
 
         # Which discovery profile answered (rfc8414 vs oidc) is the load-bearing
@@ -993,7 +1024,7 @@ async def discover_authorization_server(
     server_url: str,
     override_url: str | None,
     cached_issuer: str | None,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     storage: StorageBackend,
     server_id: str,
     trusted_hosts: frozenset[str],
@@ -1009,7 +1040,9 @@ async def discover_authorization_server(
     by a fetched document is validated strictly whatever the setting says, so
     a remote server can never expand the deployment's reach into private
     space; the always-refused lanes (link-local, multicast, reserved, cloud
-    metadata) are refused under the opt-in too.
+    metadata) are refused under the opt-in too. The localhost development
+    lane reaches a fetched document's URLs only when the server URL is itself
+    a localhost URL, so a remote server can't name the console's own ports.
 
     Resolution order:
 
@@ -1028,7 +1061,7 @@ async def discover_authorization_server(
     # so a hard-down host cannot spend it twice. The per-request deadline
     # gives each probe an actionable error; the outer timeout in
     # ``_resolve_issuer_and_metadata`` is what makes the budget a real
-    # wall-clock ceiling, since httpx timeouts bound inactivity per phase
+    # wall-clock ceiling, since httpx2 timeouts bound inactivity per phase
     # rather than the whole call, and DNS, SSRF and endpoint validation run
     # outside them entirely.
     deadline = time.monotonic() + _DISCOVERY_TOTAL_BUDGET
@@ -1059,7 +1092,11 @@ async def discover_authorization_server(
                 # we cached it (or the operator edited the row to point at a
                 # private host), drop the cache and fall through to PRM.
                 try:
-                    await oauth_ssrf.validate_url_no_ssrf_async(cached_issuer, allow_http=True)
+                    await oauth_ssrf.validate_url_no_ssrf_async(
+                        cached_issuer,
+                        allow_http=True,
+                        allow_localhost=oauth_ssrf.url_is_localhost(server_url),
+                    )
                 except oauth_ssrf.OAuthSSRFError as exc:
                     log.warning(
                         "mcp_server.oauth.cached_issuer_rejected",
@@ -1114,6 +1151,7 @@ async def discover_authorization_server(
                     trusted_hosts=trusted_hosts,
                     deadline=deadline,
                     allow_private=allow_private_network and bool(override_url),
+                    allow_localhost=bool(override_url) or oauth_ssrf.url_is_localhost(server_url),
                 )
                 if metadata_cache is not None:
                     metadata_cache[issuer] = (metadata, time.monotonic())
@@ -1264,7 +1302,7 @@ async def register_dynamic_client(
     *,
     as_metadata: oauth_http.ASMetadata,
     redirect_uri: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     scopes: str = "",
 ) -> tuple[str, str | None]:
     """Register a public client using RFC 7591 client metadata.
@@ -1296,7 +1334,7 @@ async def register_dynamic_client(
             json=body,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         raise oauth_http.OAuthError(f"DCR request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1309,7 +1347,7 @@ async def register_dynamic_client(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise oauth_http.OAuthError(f"DCR body is not valid JSON: {exc}") from exc
 
     if not isinstance(doc, dict):
@@ -1338,7 +1376,7 @@ async def exchange_code(
     client_id: str,
     client_secret: str | None,
     mcp_server_canonical_url: str,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> dict[str, Any]:
     """Exchange an authorization code for an access (and optional refresh) token.
 
@@ -1366,7 +1404,7 @@ async def exchange_code(
             data=data,
             timeout=oauth_http._DEFAULT_HTTP_TIMEOUT,
         )
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         raise MCPOAuthExchangeError(f"token exchange request failed: {exc}") from exc
 
     if len(resp.content) > oauth_http._MAX_TOKEN_BODY_BYTES:
@@ -1379,7 +1417,7 @@ async def exchange_code(
 
     try:
         doc = resp.json()
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise MCPOAuthExchangeError(f"token body is not valid JSON: {exc}") from exc
 
     if not isinstance(doc, dict):
@@ -1390,7 +1428,7 @@ async def exchange_code(
 async def revoke_token_at_as(
     *,
     as_metadata: oauth_http.ASMetadata,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     refresh_token: str,
     client_id: str,
     client_secret: str | None,
@@ -1431,7 +1469,7 @@ async def revoke_token_at_as(
             )
     except Exception as exc:
         # NOTE: never use ``exc_info=True`` here — chained ``__context__``
-        # may carry an ``httpx.Request`` whose ``Authorization`` header
+        # may carry an ``httpx2.Request`` whose ``Authorization`` header
         # holds a bearer. Structured fields with ``type(exc).__name__``
         # only.
         log.info(
@@ -1507,7 +1545,7 @@ def _validate_token_audience(
     try:
         payload_bytes = base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii"))
         payload = json.loads(payload_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         log.info(
             "mcp_server.oauth.opaque_token_aud_unverified",
             audience=accepted,
@@ -2613,7 +2651,7 @@ async def _register_dynamic_client_if_needed(
     request: Request,
     storage: StorageBackend,
     token_store: MCPTokenStore,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     as_metadata: oauth_http.ASMetadata,
     server_row: dict[str, Any],
     server_id: str,
@@ -2850,7 +2888,7 @@ async def _handle_mcp_oauth_authorize_inner(request: Request) -> Response:
             status_code=400,
         )
 
-    http_client: httpx.AsyncClient | None = getattr(
+    http_client: httpx2.AsyncClient | None = getattr(
         request.app.state, "mcp_oauth_http_client", None
     )
     if http_client is None:
@@ -3092,7 +3130,7 @@ async def _handle_mcp_oauth_callback_inner(request: Request) -> Response:
     if server_row is None:
         return RedirectResponse("/?mcp_oauth_error=server+missing", status_code=302)
 
-    http_client: httpx.AsyncClient | None = getattr(
+    http_client: httpx2.AsyncClient | None = getattr(
         request.app.state, "mcp_oauth_http_client", None
     )
     if http_client is None:
@@ -3420,7 +3458,7 @@ _REVOKE_UPSTREAM_CANCEL_TIMEOUT = 1.0
 
 async def _attempt_upstream_revoke(
     *,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
     metadata_cache: dict[str, Any] | None,
     # Strict unless the caller passes the deployment's opt-in, so a direct
     # caller cannot widen the deployment's reach by omission.
@@ -3453,7 +3491,7 @@ async def _attempt_upstream_revoke(
     ``Task exception was never retrieved`` from asyncio's default handler.
     Catching at the outer boundary keeps the helper's contract honest.
     Bearer-leak invariant: ``exc_info=True`` is forbidden on this path —
-    the chained ``__context__`` may carry an ``httpx.Request`` whose
+    the chained ``__context__`` may carry an ``httpx2.Request`` whose
     ``Authorization`` header holds the per-user bearer.
     """
     try:

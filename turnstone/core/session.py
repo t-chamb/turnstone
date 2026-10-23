@@ -9,6 +9,7 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import base64
+import codecs
 import collections
 import concurrent.futures
 import contextlib
@@ -40,7 +41,6 @@ from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol, cast
 
-import httpx
 import httpx2
 
 from turnstone.core import fence
@@ -103,6 +103,8 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.http_failures import UPSTREAM_NO_REPLY_CODE
+from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -129,7 +131,6 @@ from turnstone.core.media_materialization import (
 from turnstone.core.memory import (
     acquire_memory_index_snapshot,
     clear_last_error,
-    count_structured_memories,
     find_structured_memory_scopes,
     get_attachments,
     get_skill_by_name,
@@ -173,7 +174,6 @@ from turnstone.core.metacognition import (
     sanitize_display,
     sanitize_name,
     sanitize_payload,
-    should_nudge,
     task_too_long_message,
     task_unrenderable_message,
 )
@@ -253,7 +253,7 @@ from turnstone.core.settings_registry import (
     DEFAULT_AUTO_COMPACT_PCT,
     TOOL_TRUNCATION_MAX_CHARS,
 )
-from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
+from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS, read_allowed_tools
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage import (
     AttachmentWrite,
@@ -283,12 +283,14 @@ from turnstone.core.tools import (
     BUILTIN_TOOL_NAMES,
     COORDINATOR_TOOLS,
     INTERACTIVE_TOOLS,
+    MAX_TOOL_ARGUMENT_DEPTH,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
+    nested_deeper_than,
     salvage_tool_arguments,
 )
 from turnstone.core.trajectory import (
@@ -2528,6 +2530,29 @@ def _document_text_budget_chars(
     return min(scaled, hard_char_cap) if hard_char_cap is not None else scaled
 
 
+# A NUL among the first 8192 characters of a fetched body's decoded text marks
+# it as binary.  read_file applies the same test to a file's first 8192 bytes;
+# web_fetch applies it after decoding, so UTF-16 text, whose bytes hold NULs,
+# still reads as text when it starts with a byte order mark or declares its
+# byte order (utf-16le or utf-16be).
+_WEB_FETCH_BINARY_SNIFF_CHARS = 8192
+
+# A media type as RFC 6838 names it: ``type/subtype``, each part a letter or
+# digit followed by at most 126 letters, digits or ``!#$&-^_.+``.
+_MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+
+
+def _declared_media_type(content_type: str) -> str | None:
+    """Return the bare media type a ``Content-Type`` value declares, or ``None``.
+
+    Parameters are dropped and the type is lowercased.  A value that isn't a
+    well-formed ``type/subtype`` gives ``None``, so an error naming the type
+    can't carry other header text into the model's context.
+    """
+    declared = content_type.split(";", 1)[0].strip().lower()
+    return declared if _MEDIA_TYPE_RE.fullmatch(declared) else None
+
+
 _RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
 # endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
 # Per-turn memory rerank makes the long timeout a turn-stall hazard.
@@ -2839,7 +2864,7 @@ def _format_mcp_dispatch_error(prefix: str, exc: Exception) -> str:
     text = str(exc)
     try:
         decoded = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return f"{prefix}: {exc}"
     if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
         code = decoded["error"].get("code")
@@ -3438,10 +3463,13 @@ class ChatSession:
         # Initialize rule registry for configurable judge rules
         self._rule_registry = None
         if config_store is not None:
-            try:
-                from turnstone.core.rule_registry import RuleRegistry
+            from turnstone.core.rule_registry import InvalidRuleConfigError, RuleRegistry
 
+            try:
                 self._rule_registry = RuleRegistry(storage=config_store.storage)
+            except InvalidRuleConfigError:
+                # Falling back to built-ins would discard every configured restriction.
+                raise
             except Exception:
                 log.debug("rule_registry.init_failed", exc_info=True)
         self._memory_config = memory_config or MemoryConfig()
@@ -3573,17 +3601,15 @@ class ChatSession:
         #   - "wake" entries drain ONLY via ``deliver_wake_nudge_from_queue``
         #     (the coordinator idle nudges); invisible to every other seam
         #     and dropped — never demoted — on abandoned generations
-        # Cooldown timestamps live separately in ``_metacog_state`` for
-        # ``should_nudge`` gating.
+        # Cooldown timestamps live separately in ``_metacog_state``: read by
+        # ``nudge_allowed``, written by ``record_nudge`` once a nudge is queued.
         self._metacog_state: dict[str, float] = {}
         self._nudge_queue = NudgeQueue()
-        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
-        # this tag while sending a synthetic empty user turn so that
-        # ``_check_metacognitive_nudge`` and the ``_queue_*_advisory``
-        # producers short-circuit (the wake's nudge text contains
-        # trigger words like "don't" that would otherwise re-fire
-        # correction nudges on top of it) and so the synthesized user
-        # message gets stamped ``_source`` for audit / replay distinction.
+        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets this tag while sending a
+        # synthetic empty user turn so that ``_plan_metacognitive_nudge`` (belt-and-braces: the
+        # empty input matches no detector) and the ``_queue_*_advisory`` producers short-circuit,
+        # and so the synthesized user message gets stamped ``_source`` for audit / replay
+        # distinction.
         self._wake_source_tag: str = ""
         # True between an abandoned generation (cancel / interrupt /
         # fatal error) and the next real (non-wake) ``send`` — the
@@ -4704,7 +4730,7 @@ class ChatSession:
         raw = skill_data.get("arguments") or "[]"
         try:
             parsed = json.loads(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return []
         if not isinstance(parsed, list):
             return []
@@ -9428,12 +9454,12 @@ class ChatSession:
 
         ``ui.on_error`` and the persist BOTH receive the sanitized
         text — a misconfigured ``OPENAI_BASE_URL`` of the form
-        ``https://user:pass@host`` produces an httpx ``ConnectError``
+        ``https://user:pass@host`` produces an httpx2 ``ConnectError``
         whose ``str()`` carries the credentials verbatim, and they'd
         otherwise land in (a) the dashboard via ``on_error`` and (b)
         the coord LLM's prompt via inspect/wait.
 
-        Known backend boundary exceptions (httpx read/connect timeouts,
+        Known backend boundary exceptions (httpx2 read/connect timeouts,
         OpenAI/Anthropic SDK ``APITimeoutError`` / ``APIConnectionError``
         / ``NotFoundError`` / ``AuthenticationError`` / ``RateLimitError``)
         get rewritten into operator-actionable text that includes the
@@ -9553,17 +9579,14 @@ class ChatSession:
     ) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
-        Returns ``None`` for exceptions outside the recognised set so the
-        caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
-        shape.  A context-window overflow is matched first by message *text* (it
-        can arrive as several exception classes); everything else is matched by
+        Returns ``None`` for exceptions outside the recognised set so the caller falls back to the
+        bare ``f"{type(exc).__name__}: {exc}"`` shape. A context-window overflow is matched first by
+        message *text* (it can arrive as several exception classes); everything else is matched by
         class name (see the ``BACKEND_*_EXC_NAMES`` sets in
-        :mod:`turnstone.core.completion_recovery`) so the same
-        helper covers
-        HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
-        ``APITimeoutError`` / ``APIConnectionError`` /
-        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
-        and the Anthropic SDK equivalents (which share names).
+        :mod:`turnstone.core.completion_recovery`) so the same helper covers httpx2 ``ReadTimeout``
+        / ``ConnectError``, OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
+        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``, and the Anthropic SDK
+        equivalents (which share names).
 
         Bad input while reading the binding-derived model label silently
         degrades to a ``"?"`` placeholder rather than failing — this helper
@@ -10610,14 +10633,14 @@ class ChatSession:
             raise GenerationCancelled()
 
     def _check_generation_admission(self, my_generation: int) -> None:
-        """Fence pre-turn setup against Stop, force-successor, and close.
+        """Fence generation-owned work against Stop, force-successor, and close.
 
-        This deliberately does not dispatch through ``_check_cancelled``.
-        That later cooperative probe is an established lightweight-session
-        test seam and also includes task-agent-local cancellation.  The setup
-        path needs the narrower, non-overridable session ownership invariant:
-        once a generation loses its event, number, or publication latch it may
-        not bind an actor, refresh configuration, or admit a user row.
+        This deliberately does not dispatch through ``_check_cancelled``. That later cooperative
+        probe is an established lightweight-session test seam and also includes task-agent-local
+        cancellation. Pre-turn setup and tool-result admission need the narrower, non-overridable
+        session ownership invariant: once a generation loses its event, number, or publication
+        latch it may not bind an actor, refresh configuration, admit a user row, or admit the
+        results of the tools it ran.
         """
 
         if (
@@ -13584,23 +13607,10 @@ class ChatSession:
                         f"{unexpected_ids}"
                     )
 
-                # Tool-error nudge: queues an advisory for the next drain pass.
-                has_tool_error = any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
-                needs_tool_error_memory = self._nudges_enabled("tool_error") and has_tool_error
-                tool_error_memory_count = (
-                    self._visible_memory_count() if needs_tool_error_memory else 0
-                )
-                apply_post_execute_advisories = functools.partial(
-                    self._apply_post_execute_advisories,
-                    has_tool_error=has_tool_error,
-                    tool_error_memory_count=tool_error_memory_count,
-                )
-                if not self._publish_for_generation(
-                    my_generation,
-                    apply_post_execute_advisories,
-                    allow_cancelled=False,
-                ):
-                    raise GenerationCancelled()
+                # A Stop, close or successor that landed while the tools ran: admit none of their
+                # results. ``_check_cancelled`` never reads the publication latch, and close
+                # installs that latch before it sets the cancel event; this fence refuses on either.
+                self._check_generation_admission(my_generation)
 
                 # Map tool_call_id → tool name for logging
                 # Providers may pad a name with whitespace; dispatch strips it,
@@ -14320,12 +14330,11 @@ class ChatSession:
     def _drain_pending_advisories(self) -> None:
         """Drop the abandoned generation's advisory nudges — not external events.
 
-        Tool-channel nudges (``tool_error``, ``denial``)
-        queued earlier in this batch and user-channel nudges
-        (``correction``, …) queued during ``_check_metacognitive_nudge``
-        are commentary ABOUT the generation being abandoned (cancel,
-        KeyboardInterrupt, unexpected exception) — they drop so nothing
-        stale bleeds into the next send's tool loop or user turn.
+        Tool-channel advisories (``denial``, ``skill_hint``) queued earlier in this batch and
+        user-channel nudges (``correction``, …) that ``_plan_metacognitive_nudge`` planned for this
+        send are commentary ABOUT the generation being abandoned (cancel, KeyboardInterrupt,
+        unexpected exception) — they drop so nothing stale bleeds into the next send's tool loop or
+        user turn.
 
         ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
         those are external events (``watch_triggered``,
@@ -18928,11 +18937,10 @@ class ChatSession:
           ``priority`` so the UI can frame important interjections
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
-        - **Metacognitive tool-channel nudges** (``tool_error`` /
-          ``denial``) and any-channel nudges
-          (``watch_triggered`` / ``idle_children``) — drained on the last
-          result.  ``meta`` carries the producer's optional fields
-          (e.g. ``watch_triggered``'s ``watch_name``).
+        - **Tool-channel advisories** (``denial`` / ``skill_hint``) and any-channel nudges
+          (``watch_triggered`` / ``background_shell_exit``) — drained on the last result.
+          ``meta`` carries the producer's optional fields (e.g. ``watch_triggered``'s
+          ``watch_name``).
 
         Empty when no advisories apply (common case).  Guard findings
         attach per-result; queued messages and metacognitive nudges drain
@@ -19009,9 +19017,7 @@ class ChatSession:
                 # retractions accumulate against ids nothing will restore.
                 self._close_pop_window(popped)
 
-            # Metacognitive tool-channel drain.  Queued by
-            # ``_queue_tool_advisory`` from the tool_error / denial
-            # paths just before this loop.
+            # Drain tool-channel advisories queued by the denial and skill-hint paths.
             for nt, text, meta in self._nudge_queue.drain(TOOL_DRAIN):
                 specs.append((nt, text, dict(meta) if meta else {}))
 
@@ -19261,9 +19267,6 @@ class ChatSession:
             jc_live = self._judge_cfg
             if judge_cancel and jc_live and jc_live.cancel_on_approval:
                 judge_cancel.set()
-        denial_memory_count = (
-            self._visible_memory_count() if not approved and self._nudges_enabled("denial") else 0
-        )
         # The post-gate state transition and denial advisory are one owner
         # publication.  Stop/close/force may win while the gate is parked; in
         # that case the witness wakes it, but the old worker must not repaint a
@@ -19333,27 +19336,19 @@ class ChatSession:
                                     else "Denied by user"
                                 )
                     user_feedback = None  # feedback is in the denial_msg
-                    # The nudge says the user rejected a call: only when a person did,
-                    # not when tool policies refused it or nobody answered in time
-                    # (``_refused_by``).
+                    # The nudge says the user rejected a call: only when a person did, not when
+                    # tool policies refused it, nobody answered in time, or a CLI prompt had no
+                    # input left to answer with (``_refused_by``).
                     person_rejected = any(
                         item.get("denied") and not item.get("_refused_by") for item in items
                     )
-                    if (
-                        person_rejected
-                        and self._nudges_enabled("denial")
-                        and should_nudge(
-                            "denial",
-                            self._metacog_state,
-                            message_count=len(self.messages),
-                            memory_count=denial_memory_count,
-                            cooldown_secs=self._mem_cfg.nudge_cooldown,
-                        )
-                    ):
-                        # Tool channel, not user: the denial is a response to THIS
-                        # batch, so the nudge rides ``_collect_advisories`` with
-                        # the denied tool results rather than reaching a later
-                        # user-message seam.
+                    if person_rejected and self._nudges_enabled("denial"):
+                        # Tool channel, not user: the denial is a response to THIS batch, so the
+                        # nudge rides ``_collect_advisories`` with the denied tool results rather
+                        # than reaching a later user-message seam. No cooldown (#924): each nudge
+                        # follows a rejection a person made, and ``_queue_tool_advisory`` does
+                        # nothing during a wake turn, so a stamp taken there would silence the next
+                        # real rejection's nudge.
                         self._queue_tool_advisory("denial", format_nudge("denial"))
 
             if not self._commit_for_generation(
@@ -19647,8 +19642,20 @@ class ChatSession:
 
         try:
             args = json.loads(raw_args)
-        except json.JSONDecodeError as exc:
-            args = salvage_tool_arguments(func_name, raw_args)
+            # Deeper arguments parse, but break code that walks them one level per call.
+            if nested_deeper_than(args, MAX_TOOL_ARGUMENT_DEPTH):
+                raise RecursionError(
+                    f"arguments nested more than {MAX_TOOL_ARGUMENT_DEPTH} levels deep"
+                )
+        except (ValueError, RecursionError) as exc:
+            # Only text that didn't decode is salvaged: valid JSON too deep to use, or holding a
+            # number past the parser's digit limit, has a structure salvage would guess at,
+            # picking a field from anywhere inside it.
+            args = (
+                salvage_tool_arguments(func_name, raw_args)
+                if isinstance(exc, json.JSONDecodeError)
+                else None
+            )
             if args is None:
                 preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
                 # Surface to user so they can see what the model produced
@@ -21152,29 +21159,6 @@ class ChatSession:
             hint += " Project scope is read-only."
         return hint
 
-    def _visible_memory_count(self, access: _MemoryAccess | None = None) -> int:
-        """Count memories visible to this session.
-
-        Coord sessions are isolated to their own coord-scope namespace —
-        they don't see global / workstream / user rows.  The orchestration
-        role doesn't need user-context memory and pulling those rows in
-        would also surface memories from sibling interactive sessions
-        (same user, different workstream) into the coord's system
-        message, which the coord shouldn't be reasoning over.
-        """
-        resolved = access or self._memory_access()
-        total = 0
-        for scope, scope_id in self._visible_scopes(resolved):
-            try:
-                total += count_structured_memories(
-                    scope=scope,
-                    scope_id=scope_id,
-                    acting_principal_id=resolved.principal_id,
-                )
-            except Exception:
-                log.warning("Failed to count structured memories", exc_info=True)
-        return total
-
     def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
@@ -21323,19 +21307,6 @@ class ChatSession:
             notices.append(f"{invalid} legacy entries need authored descriptions")
         return f"\nNotice: {'; '.join(notices)}." if notices else ""
 
-    def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
-        """Check if a metacognitive nudge should fire for *user_message*.
-
-        Called *before* the user turn is appended to ``self.messages``, so
-        ``msg_count`` includes the about-to-be-appended message.
-
-        Returns ``(nudge_type, nudge_text)`` or ``None``.
-        """
-        planned = self._plan_metacognitive_nudge(user_message)
-        if planned:
-            record_nudge(planned[0], self._metacog_state)
-        return planned
-
     def _plan_metacognitive_nudge(
         self,
         user_message: str,
@@ -21392,12 +21363,9 @@ class ChatSession:
         entry queued here can never manufacture a synthetic user turn of
         its own — it waits for the user's real one.
 
-        No-ops while the session is inside a wake-driven turn
-        (``_wake_source_tag`` set) so model behaviour during the wake
-        send (e.g. denying a tool the wake suggested, hitting a
-        tool_error) doesn't queue a nudge that would land on
-        top of the wake's own turn or on the user's next real
-        turn referencing a context the user never saw.
+        No-ops while the session is inside a wake-driven turn (``_wake_source_tag`` set) so
+        advice generated during the wake cannot land on the wake's own turn or on the user's
+        next real turn referencing a context the user never saw.
         """
         if self._wake_source_tag:
             return
@@ -21472,12 +21440,10 @@ class ChatSession:
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
 
-        Drains in ``_collect_advisories`` alongside guard findings, then is
-        emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
-        batch (see the per-result loop in ``_run_loop``).  Used for nudges
-        that respond to a tool batch: ``tool_error`` and ``denial`` (the
-        operator rejected the batch — the nudge belongs next to the denied
-        results it explains).
+        Drains in ``_collect_advisories`` alongside guard findings, then is emitted as a
+        first-class ``{"role": "system"}`` turn AFTER the tool batch (see the per-result loop in
+        ``_run_loop``). Used for ``denial`` (the operator rejected the batch) and ``skill_hint``
+        advisories, which belong next to the results they explain.
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -21501,9 +21467,8 @@ class ChatSession:
         ``_wake_source_tag`` is set for the duration of the synthetic
         send so:
 
-        * ``_check_metacognitive_nudge`` short-circuits (no
-          recursive correction / completion detection on the
-          envelope text)
+        * ``_plan_metacognitive_nudge`` short-circuits (belt-and-braces: the synthetic empty input
+          already matches no correction / completion detector)
         * ``_queue_user_advisory`` / ``_queue_tool_advisory`` short-
           circuit if model behaviour during the wake (e.g. a denied
           tool call) would otherwise queue a fresh nudge on top of
@@ -21757,46 +21722,6 @@ class ChatSession:
                         continue
                     self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
 
-    def _apply_post_execute_advisories(
-        self,
-        *,
-        has_tool_error: bool,
-        tool_error_memory_count: int | None = None,
-    ) -> None:
-        """Queue the tool-error nudge for a freshly-executed batch.
-
-        Updates ``self._nudge_queue`` (via ``_queue_tool_advisory``) and
-        ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
-        The operator-visible signal is the first-class operator-context
-        ``{"role": "system"}`` turn the per-result loop downstream emits
-        after the tool batch when the drained metacog nudges flush.
-
-        ``has_tool_error`` says whether any result in the batch carries a
-        ``_tool_error_flags`` mark, the authoritative is_error signal.  The
-        caller reads the flags; the per-result loop in ``_run_loop``
-        ``.pop``s them after this returns.
-        """
-        # Tool-error nudge — queued so it rides the same _collect_advisories
-        # drain pass as guard findings and is emitted as a system turn after
-        # the tool batch.  Cooldown gating in should_nudge keeps this to one
-        # nudge per batch even with many failing tools.
-        if (
-            self._nudges_enabled("tool_error")
-            and has_tool_error
-            and should_nudge(
-                "tool_error",
-                self._metacog_state,
-                message_count=len(self.messages),
-                memory_count=(
-                    tool_error_memory_count
-                    if tool_error_memory_count is not None
-                    else self._visible_memory_count()
-                ),
-                cooldown_secs=self._mem_cfg.nudge_cooldown,
-            )
-        ):
-            self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
-
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.
     # All six dispatch through ``self._coord_client`` which is None when
@@ -21963,8 +21888,59 @@ class ChatSession:
             return persona, err or f"unknown persona {persona!r}"
         return str(row["name"]), ""
 
+    @staticmethod
+    def _spawn_error(result: dict[str, Any]) -> str:
+        """A failed spawn's error. When no reply was read, or a 5xx came back, the child may have
+        been created (a gateway in front of the node can time out while the node finishes), so the
+        error says to check before spawning it again."""
+        error = str(result["error"])
+        status = result.get("status")
+        if result.get("code") == UPSTREAM_NO_REPLY_CODE or (
+            isinstance(status, int) and status >= 500
+        ):
+            error += "; check with list_workstreams before retrying"
+        return error
+
+    def _tool_stop_check(self, item: dict[str, Any]) -> Callable[[], bool]:
+        """Return a check of whether a Stop, force-cancel or close has reached this tool call.
+
+        Call it on the tool's own thread, where the call's origin generation is set.  The
+        check reads the session's current ``_cancel_event`` (through ``_check_cancelled``)
+        and also the call's approval witness and origin generation, because the event alone
+        can forget a Stop: a force-cancel installs a fresh event for the next turn, and
+        send() clears the event once a Stop unwinds it.
+        """
+        origin_generation = _active_tool_origin_generation.get()
+        witness = item.get("_approval_cancel_witness")
+
+        def stopped() -> bool:
+            if witness is not None and witness.aborted:
+                return True
+            try:
+                self._check_cancelled(origin_generation)
+            except GenerationCancelled:
+                return True
+            return False
+
+        return stopped
+
+    def _cancel_child_created_after_stop(self, ws_id: str) -> bool:
+        """Cancel a child whose create returned after its tool call was stopped.
+
+        The Stop's cascade cancels only the children the console had registered from their
+        creation events when it landed, and this create's reply came after the Stop, so the
+        child is cancelled here; a second cancel of one the cascade reached is harmless.
+        Best effort: returns whether the cancel went through, for the caller's audit.
+        """
+        try:
+            return not self._coord_client.cancel(ws_id).get("error")
+        except Exception:
+            log.warning("coord.child_cancel_failed", ws_id=ws_id[:8], exc_info=True)
+            return False
+
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        stopped = self._tool_stop_check(item)
         try:
             result = self._coord_client.spawn(
                 initial_message=item["initial_message"],
@@ -21976,13 +21952,14 @@ class ChatSession:
                 target_node=item["target_node"],
                 project=item["project"],
                 persona=item["persona"],
+                resend_unless=stopped,
             )
         except Exception as e:
             msg = f"Error: spawn_workstream failed: {e}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         if result.get("error"):
-            msg = f"Error: {result['error']}"
+            msg = f"Error: {self._spawn_error(result)}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         # Defensive: absence of ``error`` is the success signal, but
@@ -21993,9 +21970,23 @@ class ChatSession:
         # ``_exec_spawn_batch`` (denied row on empty ws_id).
         child_ws_id = str(result.get("ws_id") or "")
         if not child_ws_id:
-            msg = "Error: spawn returned no ws_id"
+            msg = (
+                "Error: spawn's reply carried no ws_id, so whether the child was created "
+                "is unknown; check with list_workstreams before retrying"
+            )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
+        if stopped():
+            # Audited as the console's cascade records its own cancels, as spawn_batch does.
+            cancelled = self._cancel_child_created_after_stop(child_ws_id)
+            self._coord_client.emit_audit(
+                "coordinator.cancel_cascaded",
+                {
+                    "src": "spawn_workstream",
+                    "cancelled": [child_ws_id] if cancelled else [],
+                    "failed": [] if cancelled else [child_ws_id],
+                },
+            )
         # Successful spawn — surface child_ws_id + node_id + name +
         # routing strategy so the coordinator can follow up with inspect
         # / send and explain why a given node was chosen.  ``status`` was
@@ -22159,28 +22150,21 @@ class ChatSession:
             {"call_id": call_id, "op": "spawn_batch", "total": total},
         )
 
-        results: dict[str, dict[str, Any]] = {}
-        denied: list[dict[str, Any]] = []
-        for spec in children:
-            idx = spec["idx"]
-            # A cancel mid-batch stops creating the REST of the children —
-            # don't keep spawning workstreams the owner asked to stop.
-            # Cooperative: observed at this safe point between spawns, never
-            # mid-spawn.  Children already spawned this batch stay in
-            # ``results`` and are reported below (their ws_ids must survive —
-            # they are live remote workstreams, also durably parent-linked in
-            # storage); the rest are marked not-spawned.  Checked with the
-            # raw flag, not ``_check_cancelled``, so we fall through to the
-            # normal report path rather than raising and dropping the
-            # already-spawned ws_ids.
-            if self._cancel_event.is_set():
-                denied.append({"idx": idx, "reason": "not spawned: cancelled"})
-                continue
-            # Validation failures from _prepare surface here as denied
-            # rows — partial-success: don't abort the rest of the batch.
-            if "_error" in spec:
-                denied.append({"idx": idx, "reason": spec["_error"]})
-                continue
+        _batch_stopped = self._tool_stop_check(item)
+        # Children whose create returned after the batch was stopped, each
+        # mapped to whether the cancel this batch sent it went through.
+        stop_cancels: dict[str, bool] = {}
+
+        def _spawn_child(spec: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+            """Create one child: ``(results row, "")``, or ``(None, denied reason)``."""
+            # A stopped batch holds back a create not yet sent, and doesn't
+            # resend one the node's rate limiter refused.  Returned as a denied
+            # row rather than raised, so the batch still reports the creates
+            # that were sent; after a Stop, though, the executor admits none of
+            # the turn's results, and the model finds these children with
+            # list_workstreams.
+            if _batch_stopped():
+                return None, "not spawned: cancelled"
             try:
                 result = self._coord_client.spawn(
                     initial_message=spec["initial_message"],
@@ -22191,18 +22175,22 @@ class ChatSession:
                     model=spec["model"],
                     target_node=spec["target_node"],
                     persona=spec["persona"],
+                    resend_unless=_batch_stopped,
                 )
             except Exception as e:
-                denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
-                continue
+                return None, f"spawn failed: {e}"
             if result.get("error"):
-                denied.append({"idx": idx, "reason": str(result["error"])})
-                continue
+                return None, self._spawn_error(result)
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:
-                denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
-                continue
-            results[str(idx)] = {
+                return None, (
+                    "spawn's reply carried no ws_id, so whether the child was "
+                    "created is unknown; check with list_workstreams before retrying"
+                )
+            if _batch_stopped():
+                # The audit below records a cancel that failed.
+                stop_cancels[ws_id] = self._cancel_child_created_after_stop(ws_id)
+            return {
                 # ``child_ws_id`` (not ``ws_id``) — see the matching
                 # comment in ``_exec_spawn_workstream``.
                 "child_ws_id": ws_id,
@@ -22213,7 +22201,73 @@ class ChatSession:
                 # proxy fills it with HTTP 200 on success, which the
                 # model can't usefully act on.  Errors land in
                 # ``denied[]`` instead.
-            }
+            }, ""
+
+        # Every child's create is sent at once (#1457).  Sent one after
+        # another, a stalled console or node made each child wait out its
+        # 30s timeout in turn, holding the call for minutes; at once, the
+        # batch waits about one timeout and the children bound for healthy
+        # nodes are still created.  Validation failures from _prepare are
+        # never sent and surface as denied rows — partial-success: they
+        # don't abort the rest of the batch.
+        sendable = [spec for spec in children if "_error" not in spec]
+        outcomes: dict[int, tuple[dict[str, Any] | None, str]] = {}
+        unsent: list[dict[str, Any]] = []
+        if sendable:
+            futures: dict[int, concurrent.futures.Future[tuple[dict[str, Any] | None, str]]] = {}
+            with _CtrlCSafeThreadPool(
+                max_workers=len(sendable), thread_name_prefix="coord-spawn-batch"
+            ) as pool:
+                for n, spec in enumerate(sendable):
+                    try:
+                        # One context copy per child, as a context runs on one
+                        # thread at a time: each create keeps the coordinator's
+                        # log fields.
+                        futures[spec["idx"]] = pool.submit(
+                            contextvars.copy_context().run, _spawn_child, spec
+                        )
+                    except RuntimeError:
+                        # No thread could start (a process or thread limit).
+                        log.warning("spawn_batch.submit_failed", idx=spec["idx"], exc_info=True)
+                        unsent = sendable[n:]
+                        break
+            outcomes = {idx: future.result() for idx, future in futures.items()}
+        for n, spec in enumerate(unsent):
+            # The submit that failed queued its create before starting a
+            # thread, so a worker already running may still have sent it; the
+            # rest were never sent.
+            if n == 0:
+                reason = (
+                    "the batch could not start a thread after queuing this create, so it "
+                    "may still have been sent; check with list_workstreams before retrying"
+                )
+            else:
+                reason = "not spawned: the batch could not start a thread to send it"
+            outcomes[spec["idx"]] = (None, reason)
+        if stop_cancels:
+            # Recorded as the console's cascade records its own cancels, which
+            # these complete.
+            self._coord_client.emit_audit(
+                "coordinator.cancel_cascaded",
+                {
+                    "src": "spawn_batch",
+                    "cancelled": sorted(ws for ws, ok in stop_cancels.items() if ok),
+                    "failed": sorted(ws for ws, ok in stop_cancels.items() if not ok),
+                },
+            )
+
+        results: dict[str, dict[str, Any]] = {}
+        denied: list[dict[str, Any]] = []
+        for spec in children:
+            idx = spec["idx"]
+            if "_error" in spec:
+                denied.append({"idx": idx, "reason": spec["_error"]})
+                continue
+            row, reason = outcomes[idx]
+            if row is None:
+                denied.append({"idx": idx, "reason": reason})
+            else:
+                results[str(idx)] = row
 
         # ``truncated`` intentionally omitted — the prepare step
         # hard-errors on >10 children rather than silent truncation,
@@ -22477,15 +22531,25 @@ class ChatSession:
                 {"call_id": call_id, "op": "close_all_children", "error": str(e)},
             )
             return call_id, msg
-        if result.get("error"):
-            msg = f"Error: {result['error']}"
+        error = result.get("error")
+        if not error and not all(
+            isinstance(result.get(key), list) for key in ("closed", "failed", "skipped")
+        ):
+            # A reply the client couldn't read as the route's object (it hands
+            # one back raw) says nothing about which children closed.
+            error = (
+                "the close_all_children reply could not be read, so which children closed "
+                "is unknown; check them with list_workstreams before retrying"
+            )
+        if error:
+            msg = f"Error: {error}"
             self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
             self._emit_batch_event(
                 "batch_ended",
                 {
                     "call_id": call_id,
                     "op": "close_all_children",
-                    "error": str(result["error"]),
+                    "error": str(error),
                 },
             )
             return call_id, msg
@@ -23082,7 +23146,7 @@ class ChatSession:
             parsed = json.loads(raw) if isinstance(raw, str) else list(raw)
             if isinstance(parsed, list):
                 return " ".join(str(t) for t in parsed)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             pass
         return raw if isinstance(raw, str) else ""
 
@@ -23095,17 +23159,15 @@ class ChatSession:
         tags_raw = r.get("tags") or "[]"
         try:
             tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             tags = []
-        allowed_raw = r.get("allowed_tools") or "[]"
-        try:
-            allowed_full = (
-                json.loads(allowed_raw) if isinstance(allowed_raw, str) else list(allowed_raw)
-            )
-        except (TypeError, ValueError):
-            allowed_full = []
-        if not isinstance(allowed_full, list):
-            allowed_full = []
+        allowed_raw = r.get("allowed_tools")
+        # Read as workstream create reads it: an unreadable value grants none.
+        allowed_full = (
+            list(allowed_raw)
+            if isinstance(allowed_raw, list)
+            else read_allowed_tools(allowed_raw) or []
+        )
         cap = self._SKILLS_TOOLS_PROJECTION_CAP
         allowed_tools: list[str] = [str(t) for t in allowed_full[:cap]]
         if len(allowed_full) > cap:
@@ -23791,12 +23853,8 @@ class ChatSession:
         # approve — a model-planted critical-tier skill should never be
         # re-enabled by an operator who saw only the name on the card.
         existing_risk = str(existing.get("risk_level") or "")
-        try:
-            existing_allowed = json.loads(existing.get("allowed_tools") or "[]")
-            if not isinstance(existing_allowed, list):
-                existing_allowed = []
-        except (TypeError, ValueError):
-            existing_allowed = []
+        # Read as workstream create reads it, so the card shows what re-enabling grants.
+        existing_allowed = read_allowed_tools(existing.get("allowed_tools"))
         # Re-enabling lets new workstreams send their final output to these targets, so the card
         # and the judge see them whole, as on create and update, read the way workstream create
         # reads them: the same check, with blank, ``{}`` and invalid values applying as none.
@@ -23811,7 +23869,9 @@ class ChatSession:
         ]
         if existing_risk:
             preview_lines.append(f"    risk_level: {existing_risk}")
-        if existing_allowed:
+        if existing_allowed is None:
+            preview_lines.append("    allowed_tools: unreadable, so it grants none")
+        elif existing_allowed:
             preview_lines.append(f"    allowed_tools: {len(existing_allowed)} entries")
         if existing_notify:
             preview_lines.append(f"    notify_on_complete: {existing_notify}")
@@ -24433,6 +24493,7 @@ class ChatSession:
             "last_emit_mono": 0.0,
         }
         progress_heartbeat_s = 5.0
+        origin_generation = _active_tool_origin_generation.get()
 
         def _progress(snap: dict[str, Any], elapsed: float) -> None:
             # Cooperative cancel seam.  ``wait_for_workstream`` holds no
@@ -24444,8 +24505,10 @@ class ChatSession:
             # ``except Exception`` — but ``GenerationCancelled`` is a
             # ``BaseException``, so raising here propagates cleanly out of
             # the wait into the send() cancel handler.  ~2s abort instead of
-            # up to 600s.
-            self._check_cancelled()
+            # up to 600s.  Scoped to the wait's generation: a force-cancel
+            # installs a fresh ``_cancel_event`` for the next turn, so the
+            # event alone reads an abandoned wait as still running.
+            self._check_cancelled(origin_generation)
             now = time.monotonic()
             changed = snap != progress_state["last_snap"]
             heartbeat_due = (now - progress_state["last_emit_mono"]) >= progress_heartbeat_s
@@ -25040,7 +25103,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # exc_info=True would let chained ``__context__`` carry an
-            # ``httpx.Request`` whose ``Authorization`` header holds the
+            # ``httpx2.Request`` whose ``Authorization`` header holds the
             # per-user bearer (Phase 7b pool dispatch path). Use
             # structured fields with ``type(e).__name__`` only.
             log.warning("mcp.resource_read_failed", uri=uri, error=type(e).__name__)
@@ -25140,7 +25203,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # See ``_exec_read_resource`` for the no-``exc_info`` rationale —
-            # bearer-leak via chained ``httpx.Request`` __context__.
+            # bearer-leak via chained ``httpx2.Request`` __context__.
             log.warning("mcp.prompt_invoke_failed", name=name, error=type(e).__name__)
             output = _format_mcp_dispatch_error("MCP prompt error", e)
             mcp_error = True
@@ -25785,9 +25848,12 @@ class ChatSession:
             return call_id, msg
 
         self._current_read_files.add(resolved)
+        # Flattened as it enters the conversation, like an upload: a session stores this image
+        # as sent, and a task agent sends these parts as they are.
+        image = flatten_image(raw, max_bytes=_IMAGE_SIZE_CAP)
         content_parts: list[dict[str, Any]] = [
             {"type": "text", "text": ControllerText(f"Image file: {path} ({len(raw):,} bytes)")},
-            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
+            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(image, mime)}},
         ]
 
         self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
@@ -27949,7 +28015,7 @@ class ChatSession:
                     log.warning("notify.gateway_failed", reason="invalid_url", **gateway_fields)
                     continue
                 try:
-                    resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                    resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                     if resp.status_code < 300:
                         # Check that at least one target was actually delivered
                         try:
@@ -28529,6 +28595,7 @@ class ChatSession:
         # before requesting it: the URL the model named, which the prepare-time
         # check could not resolve if it names a host, and wherever it 302s.
         pdf_data: bytes | None = None
+        binary_kind: str | None = None
         text = ""
         try:
             resp = fetch_with_ssrf_guard(
@@ -28541,10 +28608,23 @@ class ChatSession:
             body = resp.content
             if sniff_pdf_mime(body):
                 pdf_data = body
+            elif image_mime := sniff_image_mime(body):
+                binary_kind = f"an image ({image_mime}, {len(body):,} bytes)"
             else:
-                ct = resp.headers.get("content-type", "")
+                ct = resp.headers.get("content-type", "").lower()
+                # A UTF-16 byte order mark outranks a declared charset, as it
+                # does in browsers; httpx2 ignores it.  The little-endian UTF-32
+                # mark begins with the little-endian UTF-16 one, so it stays
+                # with the declared charset.
+                utf16_mark = body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+                if utf16_mark and not body.startswith(codecs.BOM_UTF32_LE):
+                    resp.encoding = "utf-16"
                 text = resp.text
-                if "html" in ct:
+                if "\x00" in text[:_WEB_FETCH_BINARY_SNIFF_CHARS]:
+                    declared = _declared_media_type(ct)
+                    served_as = f"served as {declared}, " if declared else ""
+                    binary_kind = f"binary ({served_as}{len(body):,} bytes)"
+                elif "html" in ct:
                     text = strip_html(text)
 
         except httpx2.HTTPStatusError as e:
@@ -28565,6 +28645,12 @@ class ChatSession:
             return call_id, msg
 
         _check_fetch_cancelled()
+        if binary_kind is not None:
+            msg = (
+                f"Error: fetched content is {binary_kind}; web_fetch reads web pages, text and PDFs"
+            )
+            _report_fetch_result(msg, is_error=True)
+            return call_id, msg
         if pdf_data is not None and len(pdf_data) > PDF_SIZE_CAP:
             msg = f"Error: fetched PDF is too large ({len(pdf_data):,} bytes; cap {PDF_SIZE_CAP:,})"
             _report_fetch_result(msg, is_error=True)
@@ -28918,7 +29004,7 @@ class ChatSession:
         if kind in ("web", "table", "text", "markdown"):
             # Store text-family content as UTF-8 so legacy charsets render
             # instead of erroring "not previewable": a fetch honors the
-            # response charset (httpx ``resp.text``); local / attachment bytes
+            # response charset (httpx2 ``resp.text``); local / attachment bytes
             # go through the transcode ladder.  Web additionally gains a
             # ``<base href>`` (url targets) and a title fallback.
             text = resp.text if target_kind == "url" else transcode_text(body, mime_hint)

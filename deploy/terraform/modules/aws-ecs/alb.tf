@@ -11,6 +11,10 @@ resource "aws_lb" "this" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.public_subnet_ids
   tags               = local.common_tags
+
+  # Longer than the console's 90 s wait for a node's speech-synthesis answer
+  # (_TTS_PROXY_READ_TIMEOUT_S); the 60 s default would cut it into an HTML 504.
+  idle_timeout = 120
 }
 
 # ---------- Server Target Group + Listeners ----------

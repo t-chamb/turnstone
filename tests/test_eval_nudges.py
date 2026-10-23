@@ -2635,7 +2635,7 @@ class TestRunResourceLifecycle:
 
         assert "raised" not in made, made.get("raised")  # contained, not propagated
         assert made["result"]["pass"] is True
-        assert made["cwd_in_run"] == made["workdir"]  # it really did chdir in
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])  # it really did chdir in
         assert os.getcwd() == cwd_before
         assert not is_storage_initialized()
         assert not os.path.exists(made["workdir"])
@@ -2666,7 +2666,7 @@ class TestRunResourceLifecycle:
         made = self._drive(monkeypatch, close_raises=KeyboardInterrupt)
 
         assert isinstance(made["raised"], KeyboardInterrupt)
-        assert made["cwd_in_run"] == made["workdir"]
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])
         assert os.getcwd() == cwd_before  # survived the abort — it ran first
         # The honest cost of an abort mid-block, asserted rather than
         # implied: everything after the interrupt is skipped.
@@ -2702,7 +2702,8 @@ class TestRunResourceLifecycle:
 
         assert "raised" not in made, made.get("raised")  # contained, not propagated
         assert made["result"]["pass"] is True  # and the measurement survived
-        assert made["cwd_in_run"] == made["workdir"]  # the restore really was the failing call
+        # the restore really was the failing call
+        assert made["cwd_in_run"] == os.path.realpath(made["workdir"])
         # Everything the unguarded chdir used to skip:
         assert made["run_client"].is_closed(), "the per-run OpenAI client leaked its pool"
         assert made["coord_client"]._http.is_closed, "the stub coordinator client leaked its pool"
@@ -2791,12 +2792,10 @@ class TestRunResourceLifecycle:
         made["sessions"][0].close()
 
     def test_a_post_run_storage_fault_is_a_harness_failure(self, monkeypatch):
-        """The post-run envelope read is scoring GROUND TRUTH, and it
-        was the module's only read whose failure was attributed to the
-        body under test: ``load_task_envelope`` fails open, so a
-        transient storage fault came back as an empty envelope and
-        scored as the model having deleted its tasks.  The probe read
-        raises instead, landing in the sweep's ``harness:`` bucket."""
+        """The post-run envelope read is scoring GROUND TRUTH, so a
+        storage fault there is a harness failure in the sweep's
+        ``harness:`` bucket, never an empty envelope scored as the model
+        having deleted its tasks."""
         made = self._drive(monkeypatch, poison="read_raises", fast_retries=True)
 
         assert "result" not in made  # never scored as a model result

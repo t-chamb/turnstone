@@ -18,10 +18,10 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-import httpx
 import structlog
 
 from turnstone.console.schedule_timing import TS_FMT, compute_next_run, no_next_run_reason
+from turnstone.core.http_failures import may_have_reached_server
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.server import TurnstoneServer
 
@@ -35,18 +35,6 @@ log = structlog.get_logger(__name__)
 # The system_settings row of the firings held for retry, beside the
 # scheduler_lock row: one JSON object, task id to hold.
 _HOLDS_KEY = "scheduler_holds"
-
-# Raised before the request is sent, so nothing reached the node: a
-# connection that never opened, a pool or proxy that refused it, a URL httpx
-# will not send to.  A failure after sending may have made the workstream.
-_NEVER_SENT = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.PoolTimeout,
-    httpx.ProxyError,
-    httpx.UnsupportedProtocol,
-    httpx.InvalidURL,
-)
 
 
 class _Outcome(Enum):
@@ -177,8 +165,8 @@ class TaskScheduler:
         if existing is not None:
             try:
                 lock_data = json.loads(existing.get("value", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                lock_data = {}
+            except (ValueError, TypeError, RecursionError):
+                return False  # Unreadable ownership does not authorize takeover.
             owner = lock_data.get("owner", "")
             acquired_str = lock_data.get("acquired", "")
             if owner != self._lock_owner and acquired_str:
@@ -202,7 +190,7 @@ class TaskScheduler:
             return False
         try:
             lock_data = json.loads(existing.get("value", "{}"))
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return False
         return bool(lock_data.get("owner") == self._lock_owner)
 
@@ -404,7 +392,7 @@ class TaskScheduler:
                 )
                 for task_id, h in data.items()
             }
-        except (AttributeError, KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
             log.warning("scheduler.holds_unreadable", exc_info=True)
             return None
 
@@ -516,7 +504,7 @@ class TaskScheduler:
         try:
             client = self._get_sdk_client(server_url)
         except Exception as exc:
-            # A URL httpx will not take, or a token that will not mint:
+            # A URL httpx2 will not take, or a token that will not mint:
             # nothing was sent.  Classified rather than raised, so a fan-out
             # keeps the nodes that already created their workstream.
             log.warning("scheduler.sdk_client_failed", node_id=node_id, exc_info=True)
@@ -546,9 +534,6 @@ class TaskScheduler:
                 client_type="scheduled",
             )
             ws_id = resp.ws_id
-        except _NEVER_SENT as exc:
-            log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
-            return _Outcome.NOT_CREATED, f"{node_id} could not be reached ({type(exc).__name__})"
         except TurnstoneAPIError as exc:
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
             if exc.status_code < 500:
@@ -556,6 +541,12 @@ class TaskScheduler:
             return _Outcome.UNKNOWN, f"{node_id} answered {exc}"
         except Exception as exc:
             log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
+            # The SDK client follows redirects; the rule covers the hop after a 3xx too.
+            if not may_have_reached_server(exc):
+                return (
+                    _Outcome.NOT_CREATED,
+                    f"{node_id} could not be reached ({type(exc).__name__})",
+                )
             return _Outcome.UNKNOWN, f"{node_id} gave no answer ({type(exc).__name__})"
 
         self._write_run(

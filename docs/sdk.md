@@ -347,6 +347,27 @@ except TurnstoneAPIError as e:
     print(e.message)  # "Unknown workstream"
 ```
 
+A request that fails in transport (the server can't be reached or times out, a
+redirect httpx2 can't follow, a TLS alert, an event stream it can't read) raises
+one of `REQUEST_FAILURES`, a tuple of exception classes. It holds httpx2's own
+errors, such as `httpx2.ConnectError`, and those that reach the caller from
+outside that family, such as `httpx2.InvalidURL` for a redirect httpx2 can't
+follow:
+
+```python
+from turnstone.sdk import REQUEST_FAILURES
+
+try:
+    client.send("hi", ws_id)
+except REQUEST_FAILURES as e:
+    print(f"request failed: {e!r}")
+```
+
+The event streams (`stream_events`, `stream_global_events`,
+`stream_node_events` and `stream_cluster_events`) are the exception to the
+`TurnstoneAPIError` rule: a non-2xx reply to one isn't an event stream, so it
+raises `httpx2.SSEError`, one of `REQUEST_FAILURES`.
+
 ---
 
 ## TypeScript SDK
@@ -449,7 +470,7 @@ const client = new TurnstoneServer({
 
 ```
 turnstone/sdk/               Python SDK (sub-package)
-  _base.py                   Shared httpx async client, auth, error handling
+  _base.py                   Shared httpx2 async client, auth, error handling
   _sync.py                   Background event loop for sync wrappers
   _types.py                  TurnResult + TurnstoneAPIError
   events.py                  Typed SSE event dataclasses with type registry
@@ -498,7 +519,7 @@ client.login(token="ts_abc123...")
 - JWTs have a configurable expiry (default: 24 hours).
 - `client.auth_status()` returns the current user identity and scopes without refreshing the token.
 - `client.logout()` clears the stored JWT from the client.
-- If a request returns 401, the SDK raises `TurnstoneAPIError` — the caller is responsible for re-authenticating.
+- If a request returns 401, the SDK raises `TurnstoneAPIError` (`httpx2.SSEError` for an event stream) — the caller is responsible for re-authenticating.
 
 ### Token Types
 

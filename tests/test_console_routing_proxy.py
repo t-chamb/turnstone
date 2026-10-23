@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from starlette.testclient import TestClient
 
+from tests._http_failure_cases import MAYBE_PROCESSED_REPLIES, UNSENT_REPLIES, time_out_reading
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
 from turnstone.core.rendezvous import NoAvailableNodeError
@@ -85,14 +87,14 @@ def _make_proxy_post(
     status_code: int = 200,
     json_data: dict[str, Any] | None = None,
 ) -> MagicMock:
-    """Create a mock for httpx.AsyncClient.post that returns a fixed response."""
+    """Create a mock for httpx2.AsyncClient.post that returns a fixed response."""
     data = json_data or {"ws_id": "abc123", "name": "test"}
 
-    async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
-        return httpx.Response(
+    async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
+        return httpx2.Response(
             status_code,
             json=data,
-            request=httpx.Request("POST", args[0] if args else "http://test"),
+            request=httpx2.Request("POST", args[0] if args else "http://test"),
         )
 
     mock_post = MagicMock(side_effect=_mock_post)
@@ -103,14 +105,14 @@ def _wire_proxy(app: Any, mock_post: MagicMock | None = None) -> None:
     """Attach a mock proxy_client to the app (lifespan doesn't run in TestClient)."""
     if mock_post is None:
         mock_post = _make_proxy_post()
-    mock_proxy = MagicMock(spec=httpx.AsyncClient)
+    mock_proxy = MagicMock(spec=httpx2.AsyncClient)
     mock_proxy.post = mock_post
 
     # route_proxy uses ``client.request(method, url, ...)`` for path-keyed
     # routes (so DELETE on /send proxies through correctly). Wire a
     # request-shim that drops the leading method positional and forwards
     # to the same mock_post for compatibility.
-    async def _request_shim(method: str, *args: Any, **kwargs: Any) -> httpx.Response:
+    async def _request_shim(method: str, *args: Any, **kwargs: Any) -> httpx2.Response:
         return await mock_post(*args, **kwargs)
 
     mock_proxy.request = MagicMock(side_effect=_request_shim)
@@ -126,14 +128,14 @@ def _wire_proxy_get(
 ) -> MagicMock:
     """Attach a proxy client whose GET returns one deterministic response."""
 
-    async def _mock_get(*args: Any, **kwargs: Any) -> httpx.Response:
-        request = httpx.Request("GET", args[0] if args else "http://test")
+    async def _mock_get(*args: Any, **kwargs: Any) -> httpx2.Response:
+        request = httpx2.Request("GET", args[0] if args else "http://test")
         if raw_content is not None:
-            return httpx.Response(status_code, content=raw_content, request=request)
-        return httpx.Response(status_code, json=json_data or {}, request=request)
+            return httpx2.Response(status_code, content=raw_content, request=request)
+        return httpx2.Response(status_code, json=json_data or {}, request=request)
 
     mock_get = MagicMock(side_effect=_mock_get)
-    mock_proxy = MagicMock(spec=httpx.AsyncClient)
+    mock_proxy = MagicMock(spec=httpx2.AsyncClient)
     mock_proxy.get = mock_get
     app.state.proxy_client = mock_proxy
     return mock_get
@@ -209,6 +211,39 @@ class TestRouteCreate:
         assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws"] == "d" * 32
         assert app.state.proxy_client.post.call_args.kwargs["json"]["resume_ws_exact"] is True
         client.close()
+
+    def test_route_create_reads_the_bound_node_off_the_event_loop(self):
+        """After the create, the console reads the new row for the node it is
+        bound to.  The read runs in a worker thread, so a slow or failing read
+        can't stall the console's event loop."""
+        on_loop: list[bool] = []
+
+        def _get_workstream(ws_id: str) -> dict[str, Any]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return {"ws_id": ws_id, "node_id": "node-z"}
+
+        router = _make_mock_router()
+        storage = MagicMock()
+        storage.get_workstream.side_effect = _get_workstream
+        app = _make_app(router=router, auth_storage=storage)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "test"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 200
+        assert resp.json()["node_id"] == "node-z"
+        assert on_loop
+        assert not any(on_loop)
 
     def test_route_create_target_node(self):
         """An explicit target is persisted without constraining the ID hash."""
@@ -289,8 +324,8 @@ class TestRouteCreate:
         router = _make_mock_router()
         app = _make_app(router=router)
         _wire_proxy(app, _make_proxy_post(json_data={"ws_id": _DEST_WS_ID, "name": "sdk"}))
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport,
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,
@@ -427,8 +462,8 @@ class TestRouteCreate:
         app = _make_app(router=_make_mock_router(), auth_storage=storage)
         post = _make_proxy_post(json_data={"ws_id": _FORK_DEST_WS_ID})
         _wire_proxy(app, post)
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app),
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,
         ) as http_client:
@@ -442,23 +477,23 @@ class TestRouteCreate:
     @pytest.mark.parametrize(
         "upstream",
         [
-            httpx.Response(200, content=b"not json"),
-            httpx.Response(200, json=[]),
-            httpx.Response(200, json={"name": "missing id"}),
-            httpx.Response(200, json={"ws_id": "not-a-workstream-id"}),
-            httpx.Response(200, json={"ws_id": _DEST_WS_ID}),
-            httpx.Response(200, json={"ws_id": _DEST_WS_ID, "name": 42}),
+            httpx2.Response(200, content=b"not json"),
+            httpx2.Response(200, json=[]),
+            httpx2.Response(200, json={"name": "missing id"}),
+            httpx2.Response(200, json={"ws_id": "not-a-workstream-id"}),
+            httpx2.Response(200, json={"ws_id": _DEST_WS_ID}),
+            httpx2.Response(200, json={"ws_id": _DEST_WS_ID, "name": 42}),
         ],
     )
     def test_malformed_upstream_success_returns_bounded_502(self, upstream):
         router = _make_mock_router()
         app = _make_app(router=router)
 
-        async def _post(*args: Any, **kwargs: Any) -> httpx.Response:
-            upstream.request = httpx.Request("POST", args[0])
+        async def _post(*args: Any, **kwargs: Any) -> httpx2.Response:
+            upstream.request = httpx2.Request("POST", args[0])
             return upstream
 
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = MagicMock(side_effect=_post)
         app.state.proxy_client = mock_proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -544,22 +579,22 @@ class TestRouteCreate503Retry:
 
         post_count = 0
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
             nonlocal post_count
             post_count += 1
             if post_count == 1:
-                return httpx.Response(
+                return httpx2.Response(
                     503,
                     json={"error": "overloaded"},
-                    request=httpx.Request("POST", args[0] if args else "http://test"),
+                    request=httpx2.Request("POST", args[0] if args else "http://test"),
                 )
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"ws_id": _RETRY_DEST_WS_ID, "name": "retry"},
-                request=httpx.Request("POST", args[0] if args else "http://test"),
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
             )
 
-        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy = MagicMock(spec=httpx2.AsyncClient)
         mock_proxy.post = MagicMock(side_effect=_mock_post)
         app.state.proxy_client = mock_proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -597,6 +632,38 @@ class TestRouteCreate503Retry:
         assert router.route.call_args.args == (_DEST_WS_ID,)
 
 
+class TestRouteCreateRateLimitRelay:
+    """A coordinator resends a create the node's rate limiter refused (#1464), and it sees
+    the wait only if route_create passes the node's 429 and its Retry-After through."""
+
+    def test_a_node_rate_limit_refusal_passes_through_with_its_wait(self):
+        app = _make_app(router=_make_mock_router())
+
+        async def _refused(*args: Any, **kwargs: Any) -> httpx2.Response:
+            return httpx2.Response(
+                429,
+                json={"error": "Rate limit exceeded", "retry_after": 0.1},
+                headers={"Retry-After": "1"},
+                request=httpx2.Request("POST", args[0] if args else "http://test"),
+            )
+
+        post = MagicMock(side_effect=_refused)
+        _wire_proxy(app, post)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "1"
+        assert resp.json() == {"error": "Rate limit exceeded", "retry_after": 0.1}
+        # The console doesn't retry it; the coordinator decides.
+        assert post.call_count == 1
+
+
 class TestRouteCreate409Retry:
     """Generated destination ids retry live collisions at the router."""
 
@@ -632,7 +699,7 @@ class TestRouteCreate409Retry:
         app = _make_app(router=router)
         posted_ids: list[str] = []
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
             posted_ids.append(kwargs["json"]["ws_id"])
             status = 409 if len(posted_ids) == 1 else 200
             payload = (
@@ -640,10 +707,10 @@ class TestRouteCreate409Retry:
                 if status == 409
                 else {"ws_id": second_id, "name": "retry"}
             )
-            return httpx.Response(
+            return httpx2.Response(
                 status,
                 json=payload,
-                request=httpx.Request("POST", args[0]),
+                request=httpx2.Request("POST", args[0]),
             )
 
         _wire_proxy(app, MagicMock(side_effect=_mock_post))
@@ -670,7 +737,7 @@ class TestRouteCreate409Retry:
         app = _make_app(router=router)
         posted_ids: list[str] = []
 
-        async def _mock_post(*args: Any, **kwargs: Any) -> httpx.Response:
+        async def _mock_post(*args: Any, **kwargs: Any) -> httpx2.Response:
             posted_ids.append(kwargs["json"]["ws_id"])
             status = 409 if len(posted_ids) == 1 else 200
             payload = (
@@ -678,10 +745,10 @@ class TestRouteCreate409Retry:
                 if status == 409
                 else {"ws_id": second_id, "name": "targeted-retry"}
             )
-            return httpx.Response(
+            return httpx2.Response(
                 status,
                 json=payload,
-                request=httpx.Request("POST", args[0]),
+                request=httpx2.Request("POST", args[0]),
             )
 
         _wire_proxy(app, MagicMock(side_effect=_mock_post))
@@ -720,6 +787,35 @@ class TestRouteCreate409Retry:
         assert resp.status_code == 409
         assert post.call_count == 1
         assert post.call_args.kwargs["json"]["ws_id"] == _DEST_WS_ID
+
+    def test_a_conflict_too_deep_to_parse_is_not_a_collision(self, monkeypatch):
+        """A 409 body nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It reads as no collision, and the
+        node's 409 passes through without a retry."""
+
+        def _too_deep(*_a: Any, **_kw: Any) -> Any:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+        router = _make_mock_router()
+        app = _make_app(router=router)
+        post = _make_proxy_post(
+            status_code=409,
+            json_data={"error": "Workstream already exists"},
+        )
+        _wire_proxy(app, post)
+        monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 409
+        assert post.call_count == 1
 
     def test_generated_ws_id_collision_retry_is_bounded(self, monkeypatch):
         generated_ids = [f"{value:x}" * 32 for value in range(1, 5)]
@@ -870,8 +966,8 @@ class TestClusterCreate:
 
         mock_post = _make_proxy_post(json_data={"ws_id": "contract-ws"})
         app = self._app_with_node(mock_post)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport,
             base_url="http://test",
             headers=_TEST_AUTH_HEADERS,
@@ -990,6 +1086,206 @@ class TestRouteProxy:
         assert resp.status_code == 200
 
 
+_FORWARDED = pytest.mark.parametrize(
+    ("path", "kwargs", "upstream"),
+    [
+        (
+            "/v1/api/route/workstreams/new",
+            {"json": {"name": "child"}},
+            "/v1/api/workstreams/new",
+        ),
+        (
+            f"/v1/api/route/workstreams/new?ws_id={_DEST_WS_ID}",
+            {
+                "data": {"meta": json.dumps({"ws_id": _DEST_WS_ID})},
+                "files": {"file": ("a.txt", b"hello", "text/plain")},
+            },
+            "/v1/api/workstreams/new",
+        ),
+        (
+            "/v1/api/route/workstreams/abc123/send",
+            {"json": {"message": "hello"}},
+            "/v1/api/workstreams/abc123/send",
+        ),
+        (
+            "/v1/api/route/workstreams/delete",
+            {"json": {"ws_id": "abc123"}},
+            "/v1/api/workstreams/abc123/delete",
+        ),
+        (
+            "/v1/api/route/workstreams/abc123/attachments",
+            {"files": {"file": ("a.txt", b"hello", "text/plain")}},
+            "/v1/api/workstreams/abc123/attachments",
+        ),
+    ],
+    ids=["create", "create-multipart", "send", "delete", "attachment"],
+)
+
+
+class TestRouteUpstreamUnreachable:
+    """A request the proxy couldn't forward is a 502 that names the node. It says unreachable when
+    the node never got the request; otherwise the node may have acted on it, so it says so."""
+
+    @staticmethod
+    def _post(path: str, kwargs: dict[str, Any], reply: Any) -> tuple[Any, list[str]]:
+        seen: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(str(request.url).partition("?")[0])
+            return reply(request)
+
+        app = _make_app(router=_make_mock_router())
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(path, headers=_TEST_AUTH_HEADERS, **kwargs)
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+        return resp, seen
+
+    @UNSENT_REPLIES
+    @_FORWARDED
+    def test_a_node_it_cannot_reach_is_a_502(self, path, kwargs, upstream, reply):
+        resp, seen = self._post(path, kwargs, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "upstream node node-a unreachable"}
+        assert seen == [f"http://a:8080{upstream}"]
+
+    @MAYBE_PROCESSED_REPLIES
+    @_FORWARDED
+    def test_a_request_with_no_reply_may_have_been_processed(self, path, kwargs, upstream, reply):
+        resp, seen = self._post(path, kwargs, reply)
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "no reply was read from upstream node node-a, so the request may have been "
+                "processed"
+            ),
+            "code": "upstream_no_reply",
+        }
+        assert seen == [f"http://a:8080{upstream}"]
+
+    def test_a_path_httpx2_cannot_send_is_a_502(self):
+        # The console decodes %01 into the workstream id it forwards, and httpx2 refuses a
+        # control character in a URL, so nothing is sent.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        app = _make_app(router=_make_mock_router())
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc%01/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "upstream node node-a unreachable"}
+        assert sent == []
+
+    def test_a_body_httpx2_cannot_encode_is_unreachable(self):
+        # A lone surrogate parses from JSON but won't encode, so nothing reaches the node.
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={})
+
+        app = _make_app(router=_make_mock_router())
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                content=('{"message": "' + chr(92) + 'ud83d"}').encode(),
+                headers={**_TEST_AUTH_HEADERS, "Content-Type": "application/json"},
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "upstream node node-a unreachable"}
+        assert sent == []
+
+    def test_a_resend_to_a_node_url_httpx2_cannot_build_is_unreachable(self):
+        router = _make_mock_router()
+        router.route.side_effect = [
+            NodeRef("node-a", "http://a:8080"),
+            NodeRef("node-b", "http://b" + chr(1) + ":8080"),
+        ]
+        sent: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(str(request.url))
+            return httpx2.Response(404, json={"error": "not found"})
+
+        app = _make_app(router=router)
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {"error": "retry node node-b unreachable"}
+        assert sent == ["http://a:8080/v1/api/workstreams/abc123/send"]
+
+    def test_a_resend_with_no_reply_may_have_been_processed(self):
+        # node-a doesn't host the workstream; the route moves to node-b, which never replies.
+        router = _make_mock_router()
+        router.route.side_effect = [
+            NodeRef("node-a", "http://a:8080"),
+            NodeRef("node-b", "http://b:8080"),
+        ]
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.host == "a":
+                return httpx2.Response(404, json={"error": "not found"})
+            return time_out_reading(request)
+
+        app = _make_app(router=router)
+        proxy = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        app.state.proxy_client = proxy
+        client = TestClient(app, raise_server_exceptions=False)
+        try:
+            resp = client.post(
+                "/v1/api/route/workstreams/abc123/send",
+                json={"message": "hello"},
+                headers=_TEST_AUTH_HEADERS,
+            )
+        finally:
+            client.close()
+            asyncio.run(proxy.aclose())
+
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "error": (
+                "no reply was read from retry node node-b, so the request may have been processed"
+            ),
+            "code": "upstream_no_reply",
+        }
+
+
 class TestRouteProxyPermissionGates:
     """``route_proxy`` was pre-existing infra that forwarded blindly —
     any authenticated caller could send/approve/cancel/close.  PR
@@ -1085,7 +1381,7 @@ class TestRouteLookup:
     def client(self):
         router = _make_mock_router()
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
@@ -1143,15 +1439,15 @@ class TestRouteWorkstreamLive:
         router.route.side_effect = [stale_ref, owner_ref]
         app = _make_app(router=router)
 
-        async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+        async def _get(url: str, **_kwargs: Any) -> httpx2.Response:
             payload = (
                 {"workstreams": []}
                 if url.startswith(stale_ref.url)
                 else {"workstreams": [{"ws_id": "ws-live", "state": "idle"}]}
             )
-            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+            return httpx2.Response(200, json=payload, request=httpx2.Request("GET", url))
 
-        proxy = MagicMock(spec=httpx.AsyncClient)
+        proxy = MagicMock(spec=httpx2.AsyncClient)
         proxy.get = MagicMock(side_effect=_get)
         app.state.proxy_client = proxy
         client = TestClient(app, raise_server_exceptions=False)
@@ -1221,6 +1517,31 @@ class TestRouteWorkstreamLive:
         assert resp.status_code == 502
         assert "invalid active list" in resp.json()["error"]
 
+    def test_an_active_list_too_deep_to_parse_fails_closed(self, monkeypatch):
+        """An active list nested deeper than the JSON parser can follow raises
+        ``RecursionError`` (Python 3.13 at about 10,000 levels), so only the
+        patched decoder reaches it here.  It fails closed like any other
+        invalid list: a recorded 502, not a plain-text 500."""
+
+        def _too_deep(*_a: Any, **_kw: Any) -> Any:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+        app = _make_app(router=_make_mock_router())
+        _wire_proxy_get(app, json_data={"workstreams": [{"ws_id": "ws-live", "state": "idle"}]})
+        recorded = MagicMock(wraps=app.state.console_metrics.record_route)
+        app.state.console_metrics.record_route = recorded
+        monkeypatch.setattr(httpx2.Response, "json", _too_deep)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get(
+            "/v1/api/route/workstreams/ws-live/live",
+            headers=_TEST_AUTH_HEADERS,
+        )
+        client.close()
+
+        assert resp.status_code == 502
+        assert "invalid active list" in resp.text
+        assert [c.args[:2] for c in recorded.call_args_list] == [("live", 502)]
+
 
 # ---------------------------------------------------------------------------
 # Tests — not ready / no router -> 503
@@ -1233,7 +1554,7 @@ class TestRouteNotReady:
     @pytest.fixture()
     def client_no_router(self):
         app = _make_app(router=None)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
@@ -1242,7 +1563,7 @@ class TestRouteNotReady:
     def client_empty_cache(self):
         router = _make_mock_router(ready=False)
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
@@ -1315,7 +1636,7 @@ class TestRouteNoNode:
         router = _make_mock_router()
         router.route.side_effect = NoAvailableNodeError("bucket 0 not assigned")
         app = _make_app(router=router)
-        app.state.proxy_client = MagicMock(spec=httpx.AsyncClient)
+        app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
@@ -1349,6 +1670,43 @@ class TestRouteNoNode:
         assert resp.status_code == 503
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "body", "label"),
+    [
+        ("POST", "/v1/api/route/workstreams/new", {"name": "test"}, "create"),
+        ("POST", "/v1/api/route/workstreams/abc/send", {"message": "hi"}, "send"),
+        ("POST", "/v1/api/route/workstreams/delete", {"ws_id": "abc"}, "delete"),
+        ("GET", "/v1/api/route/workstreams/abc/attachments", None, "attach"),
+        ("GET", "/v1/api/route?ws_id=abc", None, "route"),
+        ("GET", "/v1/api/route/workstreams/abc/live", None, "live"),
+    ],
+)
+def test_an_unready_router_whose_refresh_fails_answers_a_recorded_503(
+    method: str, path: str, body: dict[str, Any] | None, label: str
+) -> None:
+    """An unready router loads its node list before routing.  When that read
+    fails, each routed endpoint answers a recorded 503 instead of a
+    plain-text 500."""
+    router = _make_mock_router(ready=False)
+    router.refresh_cache.side_effect = RuntimeError("storage down")
+    app = _make_app(router=router)
+    app.state.proxy_client = MagicMock(spec=httpx2.AsyncClient)
+    recorded = MagicMock(wraps=app.state.console_metrics.record_route)
+    app.state.console_metrics.record_route = recorded
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        resp = client.request(method, path, json=body, headers=_TEST_AUTH_HEADERS)
+    finally:
+        client.close()
+
+    assert resp.status_code == 503
+    assert resp.json() == {"error": "routing failed"}
+    assert [c.args[:2] for c in recorded.call_args_list] == [(label, 503)]
+    # Answered before routing, not by carrying on with an empty node list.
+    router.route.assert_not_called()
+    router.rendezvous_node.assert_not_called()
+
+
 def test_route_proxy_refresh_retries_new_url_for_same_node_identity():
     router = _make_mock_router()
     router.route.side_effect = [
@@ -1360,13 +1718,13 @@ def test_route_proxy_refresh_retries_new_url_for_same_node_identity():
 
     async def upstream(method, url, **kwargs):
         requests.append(url)
-        return httpx.Response(
+        return httpx2.Response(
             404 if len(requests) == 1 else 200,
             json={"status": "ok"},
-            request=httpx.Request(method, url),
+            request=httpx2.Request(method, url),
         )
 
-    proxy = MagicMock(spec=httpx.AsyncClient)
+    proxy = MagicMock(spec=httpx2.AsyncClient)
     proxy.request = MagicMock(side_effect=upstream)
     app.state.proxy_client = proxy
     client = TestClient(app, raise_server_exceptions=False)

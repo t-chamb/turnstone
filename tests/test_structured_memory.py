@@ -3,7 +3,6 @@
 import pytest
 
 from turnstone.core.memory import (
-    count_structured_memories,
     delete_structured_memory,
     get_structured_memory_by_name,
     list_structured_memories,
@@ -194,16 +193,6 @@ class TestGetStructuredMemoryByName:
         mem = get_structured_memory_by_name("My-Key", "global", "")
         assert mem is not None
         assert mem["name"] == "my_key"
-
-
-class TestCountStructuredMemories:
-    def test_count_zero(self, tmp_db):
-        assert count_structured_memories() == 0
-
-    def test_count_after_save(self, tmp_db):
-        _save("a", "1")
-        _save("b", "2")
-        assert count_structured_memories() == 2
 
 
 class TestNormalizeKey:
@@ -400,7 +389,7 @@ class TestSanitizeErrorText:
     def test_strips_url_userinfo(self):
         from turnstone.core.memory import sanitize_error_text
 
-        # Misconfigured OPENAI_BASE_URL → httpx ConnectError carries
+        # Misconfigured OPENAI_BASE_URL → httpx2 ConnectError carries
         # the userinfo verbatim in str(exc).
         msg = "ConnectError: connection failed to https://user:hunter2@api.example.com/v1/chat"
         out = sanitize_error_text(msg)
